@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "litematic-render-bridge",
+  "version": "${version}",
+  "name": "Litematic Render Bridge",
+  "description": "Renders queued Litematica files through Minecraft, Isometric Renders and the active resource packs.",
+  "authors": ["Codex"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.qqbot.renderbridge.RenderBridgeClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "fabric-api": "*",
+    "minecraft": "~1.21.1",
+    "litematica": ">=0.19.0",
+    "isometric-renders": ">=0.4.7",
+    "worldmesher": ">=0.4.6"
+  }
+}

@@ -1,0 +1,917 @@
+// Litematic Viewer API Service
+const { vec3, mat4 } = glMatrix;
+
+class LitematicViewerAPI {
+    constructor() {
+        this.structureLitematic = null;
+        this.viewer = null;
+        this.canvas = null;
+        this.webglContext = null;
+        this.cameraPos = vec3.create();
+        this.cameraPitch = 0.8;
+        this.cameraYaw = 0.5;
+        this.isManualPosition = false; // 添加标记，用于判断是否手动设置过相机位置
+    }
+
+    /**
+     * 从文件加载 Litematic 数据
+     * @param {File} file - Litematic 文件
+     * @returns {Promise<Object>} - 加载的 Litematic 数据
+     */
+    async loadFromFile(file) {
+        if (!deepslateResources) {
+            throw new Error('Deepslate resources not initialized');
+        }
+
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                try {
+                    const nbtData = deepslate.readNbt(new Uint8Array(event.target.result));
+                    this.structureLitematic = readLitematicFromNBTData(nbtData);
+                    resolve(this.structureLitematic);
+                } catch (error) {
+                    reject(error);
+                }
+            };
+            reader.onerror = (error) => reject(error);
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    /**
+     * 从 URL 加载 Litematic 数据
+     * @param {string} url - Litematic 文件的 URL
+     * @returns {Promise<Object>} - 加载的 Litematic 数据
+     */
+    async loadFromURL(url) {
+        if (!deepslateResources) {
+            throw new Error('Deepslate resources not initialized');
+        }
+
+        const proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
+        const response = await fetch(proxyUrl);
+        if (!response.ok) {
+            throw new Error('Failed to fetch file from URL');
+        }
+
+        const blob = await response.blob();
+        return this.loadFromFile(blob);
+    }
+
+    /**
+     * 获取方块统计信息
+     * @returns {Object} - 方块统计信息
+     */
+    getMaterialList() {
+        if (!this.structureLitematic) {
+            throw new Error('No litematic data loaded');
+        }
+        return getMaterialList(this.structureLitematic);
+    }
+
+    /**
+     * 设置查看器视图范围
+     * @param {number} yMin - Y轴最小值
+     * @param {number} yMax - Y轴最大值
+     */
+    setViewRange(yMin, yMax) {
+        if (!this.structureLitematic) {
+            throw new Error('No litematic data loaded');
+        }
+        setStructure(structureFromLitematic(this.structureLitematic, yMin, yMax));
+    }
+
+    /**
+     * 初始化查看器
+     * @param {HTMLElement} container - 查看器容器元素
+     */
+    initViewer(container) {
+        if (!deepslateResources) {
+            throw new Error('Deepslate resources not initialized');
+        }
+
+        // 创建查看器容器
+        const viewer = document.createElement('div');
+        viewer.id = 'viewer';
+        viewer.style.width = '100%';
+        viewer.style.height = '100%';
+        container.appendChild(viewer);
+
+        // 创建渲染画布
+        createRenderCanvas();
+
+        return true;
+    }
+
+    /**
+     * 导出材料列表为 CSV
+     * @returns {string} - CSV 格式的材料列表
+     */
+    exportMaterialListCSV() {
+        const blockCounts = this.getMaterialList();
+        return Object.entries(blockCounts)
+            .sort(([,a], [,b]) => b - a)
+            .map(([key, val]) => `${key},${val}`)
+            .join('\n');
+    }
+
+    /**
+     * 设置相机位置和角度
+     * @param {Object} options - 相机选项
+     * @param {Array<number>} options.position - 相机位置 [x, y, z]
+     * @param {number} options.pitch - 俯仰角（弧度）
+     * @param {number} options.yaw - 偏航角（弧度）
+     */
+    setCameraPosition(options = {}) {
+        const { position, pitch, yaw } = options;
+        
+        // 更新实例状态
+        if (position && position.length === 3) {
+            vec3.set(this.cameraPos, position[0], position[1], position[2]);
+            // 同步更新全局状态
+            if (window.cameraPos) {
+                vec3.set(window.cameraPos, position[0], position[1], position[2]);
+            }
+            this.isManualPosition = true; // 标记为手动设置位置
+        }
+        
+        if (typeof pitch === 'number') {
+            this.cameraPitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, pitch));
+            // 同步更新全局状态
+            if (window.cameraPitch !== undefined) {
+                window.cameraPitch = this.cameraPitch;
+            }
+        }
+        
+        if (typeof yaw === 'number') {
+            this.cameraYaw = yaw % (Math.PI * 2);
+            // 同步更新全局状态
+            if (window.cameraYaw !== undefined) {
+                window.cameraYaw = this.cameraYaw;
+            }
+        }
+
+        // 触发重新渲染
+        if (window.render && typeof window.render === 'function') {
+            requestAnimationFrame(window.render);
+        }
+    }
+
+    /**
+     * 获取当前相机位置和角度
+     * @returns {Object} 相机位置和角度信息
+     */
+    getCameraPosition() {
+        return {
+            position: [this.cameraPos[0], this.cameraPos[1], this.cameraPos[2]],
+            pitch: this.cameraPitch,
+            yaw: this.cameraYaw
+        };
+    }
+
+    /**
+     * 渲染结构并返回图片
+     * @param {Object} options - 渲染选项
+     * @param {number} [options.width=800] - 图片宽度
+     * @param {number} [options.height=600] - 图片高度
+     * @param {number} [options.cameraPitch=0.8] - 相机俯仰角
+     * @param {number} [options.cameraYaw=0.5] - 相机偏航角
+     * @param {boolean} [options.autoPosition=true] - 是否自动定位
+     * @param {boolean} [options.antialias=true] - 是否启用多重采样抗锯齿
+     * @param {string} [options.quality='high'] - 渲染质量选项
+     * @returns {Promise<string>} - 返回 base64 格式的图片数据
+     */
+    async renderToImage(options = {}) {
+        if (!this.structureLitematic) {
+            throw new Error('No litematic data loaded');
+        }
+
+        const {
+            width = 800,
+            height = 600,
+            cameraPitch = this.cameraPitch,
+            cameraYaw = this.cameraYaw,
+            autoPosition = true,
+            antialias = true,
+            quality = 'high', // 新增：渲染质量选项
+            preserveRenderResolution = false,
+            transparentBackground = false,
+            orthographic = false,
+            modelScale = 1,
+            drawGrid = true
+        } = options;
+
+        console.log('开始渲染，参数:', { width, height, cameraPitch, cameraYaw, autoPosition, antialias, quality });
+
+        // 清理旧的画布
+        if (this.canvas && this.canvas.parentNode) {
+            this.canvas.parentNode.removeChild(this.canvas);
+        }
+
+        // 创建新的画布
+        this.canvas = document.createElement('canvas');
+        document.body.appendChild(this.canvas);
+        
+        // 根据质量设置调整实际渲染分辨率
+        let renderWidth = width;
+        let renderHeight = height;
+        if (quality === 'high') {
+            renderWidth = width * 2;
+            renderHeight = height * 2;
+        } else if (quality === 'ultra') {
+            renderWidth = width * 4;
+            renderHeight = height * 4;
+        }
+        
+        this.canvas.width = renderWidth;
+        this.canvas.height = renderHeight;
+        
+        // 创建 WebGL 上下文，增加更多质量相关选项
+        this.webglContext = this.canvas.getContext('webgl', {
+            antialias: antialias,
+            depth: true,
+            preserveDrawingBuffer: true,
+            alpha: true,
+            stencil: true,
+            premultipliedAlpha: true,
+            failIfMajorPerformanceCaveat: false,
+            powerPreference: 'high-performance',  // 优先使用高性能模式
+            desynchronized: false,                // 禁用异步渲染以确保最高质量
+            xrCompatible: false,                  // 禁用XR兼容性以提高性能
+            preserveDrawingBuffer: true,          // 保留绘图缓冲区
+            alpha: true,                          // 启用alpha通道
+            depth: true,                          // 启用深度测试
+            stencil: true,                        // 启用模板测试
+            antialias: true,                      // 启用抗锯齿
+            premultipliedAlpha: true,             // 启用预乘alpha
+            failIfMajorPerformanceCaveat: false   // 即使性能较低也继续
+        });
+
+        if (!this.webglContext) {
+            throw new Error('无法创建 WebGL 上下文');
+        }
+
+        // 设置 WebGL 状态
+        this.webglContext.viewport(0, 0, renderWidth, renderHeight);
+        if (transparentBackground) {
+            this.webglContext.clearColor(0, 0, 0, 0);
+        } else {
+            this.webglContext.clearColor(35/255, 35/255, 35/255, 1.0);
+        }
+        this.webglContext.clear(this.webglContext.COLOR_BUFFER_BIT | this.webglContext.DEPTH_BUFFER_BIT);
+        
+        // 添加背景纹理
+        if (!transparentBackground) {
+            this._renderBackgroundTexture(renderWidth, renderHeight);
+        }
+        
+        this.webglContext.enable(this.webglContext.DEPTH_TEST);
+        this.webglContext.enable(this.webglContext.CULL_FACE);
+        
+        // 启用多重采样抗锯齿
+        if (antialias) {
+            this.webglContext.enable(this.webglContext.SAMPLE_COVERAGE);
+            this.webglContext.sampleCoverage(1.0, false);
+        }
+
+        // 设置纹理过滤质量
+        this.webglContext.texParameteri(this.webglContext.TEXTURE_2D, this.webglContext.TEXTURE_MIN_FILTER, this.webglContext.LINEAR_MIPMAP_LINEAR);
+        this.webglContext.texParameteri(this.webglContext.TEXTURE_2D, this.webglContext.TEXTURE_MAG_FILTER, this.webglContext.LINEAR);
+
+        try {
+            // 创建结构
+            const structure = structureFromLitematic(this.structureLitematic);
+            const size = structure.getSize();
+            console.log('结构大小:', size);
+            console.log('结构坐标范围:');
+            console.log('X: 0 ->', size[0]);
+            console.log('Y: 0 ->', size[1]);
+            console.log('Z: 0 ->', size[2]);
+
+            // 创建渲染器，增加更多渲染选项
+            const renderer = new deepslate.StructureRenderer(
+                this.webglContext, 
+                structure,
+                deepslateResources,
+                {
+                    // 基础渲染设置
+                    chunkSize: 8,                       // 区块大小,影响渲染性能
+                    
+                    // 光照和阴影
+                    enableShadows: true,                // 启用阴影渲染
+                    enableAmbientOcclusion: true,       // 启用环境光遮蔽
+                    
+                    // 纹理和质量设置
+                    textureQuality: quality,            // 纹理质量设置
+                    
+                    // 大气效果
+                    enableFog: true,                    // 启用雾效果
+                    fogDensity: 0.01,                   // 雾的密度
+                    
+                    // 后期处理效果
+                    enableBloom: true,                  // 启用泛光效果
+                    bloomIntensity: 0.5,                // 泛光强度
+                    enableSSAO: true,                   // 启用屏幕空间环境光遮蔽
+                    ssaoRadius: 0.5,                    // SSAO采样半径
+                    enableFXAA: true,                   // 启用快速近似抗锯齿
+                    enableTAA: true,                    // 启用时间性抗锯齿
+                    enableMotionBlur: false,            // 禁用动态模糊
+                    enableDepthOfField: false,          // 禁用景深效果
+                    
+                    // 透明材质优化
+                    transparentSorting: true,           // 启用透明材质排序
+                    transparentDepthWrite: false,       // 禁用透明材质的深度写入
+                    transparentBlending: 'normal',      // 使用标准混合模式
+                    transparentAlphaTest: 0.1,          // 设置透明测试阈值
+                    transparentRefraction: true,        // 启用折射效果
+                    transparentRefractionIndex: 1.5,    // 设置折射率（玻璃的折射率）
+                    transparentReflection: true,        // 启用反射效果
+                    transparentReflectionStrength: 0.8, // 设置反射强度
+                    transparentFresnel: true,           // 启用菲涅尔效应
+                    transparentFresnelBias: 0.1,        // 设置菲涅尔偏差
+                    transparentFresnelScale: 1.0,       // 设置菲涅尔缩放
+                    transparentFresnelPower: 2.0        // 设置菲涅尔幂次
+                }
+            );
+
+            if (orthographic) {
+                const aspectRatio = renderWidth / renderHeight;
+                renderer.projMatrix = mat4.create();
+                mat4.ortho(renderer.projMatrix, -aspectRatio, aspectRatio, -1, 1, -1000, 3000);
+            }
+
+            // 设置WebGL混合模式
+            this.webglContext.enable(this.webglContext.BLEND);
+            this.webglContext.blendFuncSeparate(
+                this.webglContext.SRC_ALPHA,
+                this.webglContext.ONE_MINUS_SRC_ALPHA,
+                this.webglContext.ONE,
+                this.webglContext.ONE_MINUS_SRC_ALPHA
+            );
+
+            // 更新全局相机状态
+            if (window.cameraPitch !== undefined) {
+                window.cameraPitch = cameraPitch;
+            }
+            if (window.cameraYaw !== undefined) {
+                window.cameraYaw = cameraYaw;
+            }
+            
+            // 如果是自动定位且未手动设置位置，计算最佳相机位置
+            if (autoPosition && !this.isManualPosition) {
+                // 计算相机位置
+                // 使用参考结构 (9x9x16) 的比例来计算
+                const refX = 9, refY = 9, refZ = 16;
+                const refCamY = -15, refCamZ = -20;
+                
+                // 根据结构大小计算缩放比例
+                const scaleY = size[1] / refY;
+                const scaleZ = size[2] / refZ;
+                
+                // 计算相机位置
+                const cameraX = 0;  // 保持在中心线上
+                const cameraY = refCamY * scaleY;  // 根据高度缩放Y轴位置
+                const cameraZ = refCamZ * scaleZ;  // 根据深度缩放Z轴位置
+                
+                if (window.cameraPos) {
+                    vec3.set(window.cameraPos, cameraX, cameraY, cameraZ);
+                    console.log('自动计算的相机位置:', [cameraX, cameraY, cameraZ]);
+                }
+                
+                // 同时更新实例的相机位置
+                vec3.set(this.cameraPos, cameraX, cameraY, cameraZ);
+            } else {
+                console.log('使用当前相机位置:', [this.cameraPos[0], this.cameraPos[1], this.cameraPos[2]]);
+            }
+
+            // 创建视图矩阵
+            const view = mat4.create();
+            
+            // 应用相机变换
+            mat4.scale(view, view, [modelScale, modelScale, modelScale]);
+            mat4.rotateX(view, view, cameraPitch);
+            mat4.rotateY(view, view, cameraYaw);
+            mat4.translate(view, view, this.cameraPos);
+
+            // 渲染结构和网格
+            renderer.drawStructure(view);
+            if (drawGrid) renderer.drawGrid(view);
+
+            // 渲染完成后，如果使用了高质量渲染，需要将图像缩放到目标尺寸
+            let finalImageData;
+            if (quality !== 'normal' && !preserveRenderResolution) {
+                // 创建临时画布用于缩放
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = width;
+                tempCanvas.height = height;
+                const tempCtx = tempCanvas.getContext('2d');
+                
+                // 使用高质量缩放
+                tempCtx.imageSmoothingEnabled = true;
+                tempCtx.imageSmoothingQuality = 'high';
+                tempCtx.drawImage(this.canvas, 0, 0, width, height);
+                
+                finalImageData = tempCanvas.toDataURL('image/png');
+            } else {
+                finalImageData = this.canvas.toDataURL('image/png');
+            }
+            
+            // 清理资源
+            if (this.canvas && this.canvas.parentNode) {
+                this.canvas.parentNode.removeChild(this.canvas);
+            }
+            this.canvas = null;
+            this.webglContext = null;
+
+            return finalImageData;
+
+        } catch (error) {
+            console.error('渲染错误:', error);
+            if (this.canvas && this.canvas.parentNode) {
+                this.canvas.parentNode.removeChild(this.canvas);
+            }
+            this.canvas = null;
+            this.webglContext = null;
+            throw error;
+        }
+    }
+
+    /**
+     * 渲染背景纹理
+     * @private
+     * @param {number} width - 画布宽度
+     * @param {number} height - 画布高度
+     */
+    _renderBackgroundTexture(width, height) {
+        const gl = this.webglContext;
+        
+        // 创建着色器程序
+        const vsSource = `
+            attribute vec4 aVertexPosition;
+            attribute vec2 aTextureCoord;
+            varying vec2 vTextureCoord;
+            void main() {
+                gl_Position = aVertexPosition;
+                vTextureCoord = aTextureCoord;
+            }
+        `;
+        
+        const fsSource = `
+            precision mediump float;
+            varying vec2 vTextureCoord;
+            uniform vec2 uResolution;
+            
+            // 网格纹理生成函数
+            float grid(vec2 st, float gridSize, float lineWidth) {
+                vec2 grid = fract(st * gridSize);
+                vec2 smoothGrid = smoothstep(0.0, lineWidth, grid) * 
+                                 (1.0 - smoothstep(1.0 - lineWidth, 1.0, grid));
+                return max(smoothGrid.x, smoothGrid.y);
+            }
+            
+            void main() {
+                // 使用uv坐标生成网格
+                vec2 st = vTextureCoord * uResolution / min(uResolution.x, uResolution.y);
+                
+                // 背景色 (35, 35, 35)
+                vec3 baseColor = vec3(35.0/255.0, 35.0/255.0, 35.0/255.0);
+                
+                // 生成两种不同大小的网格
+                float gridSmall = grid(st, 50.0, 0.02);  // 小网格
+                float gridLarge = grid(st, 10.0, 0.02);  // 大网格
+                
+                // 网格线颜色 (稍亮一点的灰色)
+                vec3 gridColor = vec3(55.0/255.0, 55.0/255.0, 55.0/255.0);
+                
+                // 混合两种网格和背景色
+                vec3 finalColor = mix(baseColor, gridColor, gridSmall * 0.08 + gridLarge * 0.15);
+                
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+        
+        // 创建着色器
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('着色器编译错误:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+        
+        // 创建并链接着色器程序
+        const vertexShader = createShader(gl, gl.VERTEX_SHADER, vsSource);
+        const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+        
+        if (!vertexShader || !fragmentShader) {
+            return;
+        }
+        
+        const shaderProgram = gl.createProgram();
+        gl.attachShader(shaderProgram, vertexShader);
+        gl.attachShader(shaderProgram, fragmentShader);
+        gl.linkProgram(shaderProgram);
+        
+        if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+            console.error('无法初始化着色器程序:', gl.getProgramInfoLog(shaderProgram));
+            return;
+        }
+        
+        // 创建全屏四边形
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        const positions = [
+            -1.0,  1.0,
+             1.0,  1.0,
+             1.0, -1.0,
+            -1.0, -1.0,
+        ];
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+        
+        // 创建纹理坐标
+        const textureCoordBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, textureCoordBuffer);
+        const textureCoordinates = [
+            0.0, 0.0,
+            1.0, 0.0,
+            1.0, 1.0,
+            0.0, 1.0,
+        ];
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(textureCoordinates), gl.STATIC_DRAW);
+        
+        // 创建索引缓冲
+        const indexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+        const indices = [
+            0, 1, 2,
+            0, 2, 3,
+        ];
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+        
+        // 绘制背景
+        gl.useProgram(shaderProgram);
+        
+        // 设置顶点位置属性
+        const vertexPosition = gl.getAttribLocation(shaderProgram, 'aVertexPosition');
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.vertexAttribPointer(vertexPosition, 2, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(vertexPosition);
+        
+        // 设置纹理坐标属性
+        const textureCoord = gl.getAttribLocation(shaderProgram, 'aTextureCoord');
+        gl.bindBuffer(gl.ARRAY_BUFFER, textureCoordBuffer);
+        gl.vertexAttribPointer(textureCoord, 2, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(textureCoord);
+        
+        // 设置分辨率
+        const resolutionLocation = gl.getUniformLocation(shaderProgram, 'uResolution');
+        gl.uniform2f(resolutionLocation, width, height);
+        
+        // 绘制
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+        gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+        
+        // 清除深度缓冲，但保留颜色缓冲
+        gl.clear(gl.DEPTH_BUFFER_BIT);
+    }
+
+    /**
+     * 渲染三视图（正视图、侧视图、俯视图）
+     * @param {Object} options - 渲染选项
+     * @param {number} [options.width=800] - 单个视图的宽度
+     * @param {number} [options.height=600] - 单个视图的高度
+     * @returns {Promise<Object>} - 返回包含三个视图的 base64 图片数据
+     */
+    async renderThreeViews(options = {}) {
+        if (!this.structureLitematic) {
+            throw new Error('没有加载 litematic 数据');
+        }
+
+        const {
+            width = 800,
+            height = 600
+        } = options;
+
+        // 保存当前相机状态
+        const originalPos = vec3.clone(this.cameraPos);
+        const originalPitch = this.cameraPitch;
+        const originalYaw = this.cameraYaw;
+
+        try {
+            // 创建结构
+            const structure = structureFromLitematic(this.structureLitematic);
+            const size = structure.getSize();
+            console.log('结构大小:', size);
+
+            // 计算结构中心点
+            const centerX = size[0] / 2;
+            const centerY = size[1] / 2;
+            const centerZ = size[2] / 2;
+
+            // 计算合适的观察距离
+            const maxDimension = Math.max(size[0], size[1], size[2]);
+            const distance = maxDimension * 2;  // 基础观察距离
+
+            // 渲染正视图 (正面)
+            this.cameraPitch = 0;
+            this.cameraYaw = 0;
+            vec3.set(this.cameraPos, 
+                -centerX,           // X轴对齐中心
+                -centerY,           // Y轴对齐中心
+                -distance/1.8 - centerZ // Z轴在结构前方,距离减半使视角更近
+            );
+            const frontView = await this.renderToImage({
+                width,
+                height,
+                cameraPitch: this.cameraPitch,
+                cameraYaw: this.cameraYaw,
+                autoPosition: false
+            });
+
+            // 渲染侧视图 (右侧)
+            this.cameraPitch = 0;
+            this.cameraYaw = -Math.PI / 2;
+            vec3.set(this.cameraPos, 
+                -distance/1.8 - centerX, // X轴在结构右侧,距离减半使视角更近
+                -centerY,           // Y轴对齐中心
+                -centerZ,           // Z轴对齐中心
+            );
+            const sideView = await this.renderToImage({
+                width,
+                height,
+                cameraPitch: this.cameraPitch,
+                cameraYaw: this.cameraYaw,
+                autoPosition: false
+            });
+
+            // 渲染俯视图 (顶部)
+            this.cameraPitch = Math.PI / 2; // 相机向下看
+            this.cameraYaw = 0;
+            vec3.set(this.cameraPos, 
+                -centerX,                  // X轴对齐中心
+                -distance/1.8 - centerY,   // Y轴在结构上方,距离减半使视角更近
+                -centerZ                   // Z轴对齐中心
+            );
+            const topView = await this.renderToImage({
+                width,
+                height,
+                cameraPitch: this.cameraPitch,
+                cameraYaw: this.cameraYaw,
+                autoPosition: false
+            });
+
+            // 恢复原始相机状态
+            vec3.copy(this.cameraPos, originalPos);
+            this.cameraPitch = originalPitch;
+            this.cameraYaw = originalYaw;
+
+            return {
+                frontView,  // 正视图
+                sideView,   // 侧视图
+                topView     // 俯视图
+            };
+
+        } catch (error) {
+            // 发生错误时也要恢复相机状态
+            vec3.copy(this.cameraPos, originalPos);
+            this.cameraPitch = originalPitch;
+            this.cameraYaw = originalYaw;
+            throw error;
+        }
+    }
+
+    /**
+     * 单独渲染轴测图
+     * @param {Object} options - 渲染选项
+     * @param {number} [options.width=800] - 图片宽度
+     * @param {number} [options.height=600] - 图片高度
+     * @returns {Promise<string>} - 返回轴测图的 base64 图片数据
+     */
+    async renderIsometricView(options = {}) {
+        if (!this.structureLitematic) {
+            throw new Error('没有加载 litematic 数据');
+        }
+
+        const { width = 800, height = 600 } = options;
+        const square = options.isometricSquare !== false;
+        const outputWidth = square ? Math.max(width, height) : width;
+        const outputHeight = square ? outputWidth : height;
+        
+        // 保存当前相机状态
+        const originalPos = vec3.clone(this.cameraPos);
+        const originalPitch = this.cameraPitch;
+        const originalYaw = this.cameraYaw;
+
+        try {
+            // 创建结构
+            const structure = structureFromLitematic(this.structureLitematic);
+            const size = structure.getSize();
+            
+            // 计算结构中心点
+            const centerX = size[0] / 2;
+            const centerY = size[1] / 2;
+            const centerZ = size[2] / 2;
+            
+            // Isometric Renders preset: orthographic projection, 135° rotation and 36° slant.
+            const rotation = Number.isFinite(Number(options.isometricRotation)) ? Number(options.isometricRotation) : 135;
+            const slant = Number.isFinite(Number(options.isometricSlant)) ? Number(options.isometricSlant) : 36;
+            this.cameraPitch = slant * Math.PI / 180;
+            this.cameraYaw = rotation * Math.PI / 180;
+            vec3.set(this.cameraPos, -centerX, -centerY, -centerZ);
+            const modelScale = this._calculateOrthographicScale(
+                size,
+                this.cameraPitch,
+                this.cameraYaw,
+                outputWidth / outputHeight
+            );
+            
+            const isometricView = await this.renderToImage({
+                width: outputWidth,
+                height: outputHeight,
+                cameraPitch: this.cameraPitch,
+                cameraYaw: this.cameraYaw,
+                autoPosition: false,
+                quality: options.quality || 'high', // 使用高质量渲染
+                // 保留高质量模式的超采样结果，裁切后再一次性缩小，避免纹理被重复缩放。
+                preserveRenderResolution: true,
+                // Alpha 通道能准确区分背景和深色方块，最终再合成到纯黑画布。
+                transparentBackground: true,
+                orthographic: true,
+                modelScale,
+                drawGrid: false
+            });
+
+            const centeredView = await this._centerIsometricImage(
+                isometricView,
+                outputWidth,
+                outputHeight,
+                options.isometricFill
+            );
+            
+            // 恢复原始相机状态
+            vec3.copy(this.cameraPos, originalPos);
+            this.cameraPitch = originalPitch;
+            this.cameraYaw = originalYaw;
+            
+            return centeredView;
+        } catch (error) {
+            // 恢复相机状态并传播错误
+            vec3.copy(this.cameraPos, originalPos);
+            this.cameraPitch = originalPitch;
+            this.cameraYaw = originalYaw;
+            throw error;
+        }
+    }
+
+    /**
+     * Fit the rotated structure into Isometric Renders' -1..1 orthographic viewport.
+     * @private
+     */
+    _calculateOrthographicScale(size, pitch, yaw, aspectRatio) {
+        const rotation = mat4.create();
+        mat4.rotateX(rotation, rotation, pitch);
+        mat4.rotateY(rotation, rotation, yaw);
+        let maxX = 0;
+        let maxY = 0;
+        for (const x of [-size[0] / 2, size[0] / 2]) {
+            for (const y of [-size[1] / 2, size[1] / 2]) {
+                for (const z of [-size[2] / 2, size[2] / 2]) {
+                    const point = vec3.fromValues(x, y, z);
+                    vec3.transformMat4(point, point, rotation);
+                    maxX = Math.max(maxX, Math.abs(point[0]));
+                    maxY = Math.max(maxY, Math.abs(point[1]));
+                }
+            }
+        }
+        return Math.min(
+            aspectRatio * 0.9 / Math.max(0.001, maxX),
+            0.9 / Math.max(0.001, maxY)
+        );
+    }
+
+    /**
+     * 按实际渲染像素裁切并居中正二轴测图。
+     * @private
+     */
+    async _centerIsometricImage(dataUrl, width, height, requestedFill) {
+        const image = await new Promise((resolve, reject) => {
+            const element = new Image();
+            element.onload = () => resolve(element);
+            element.onerror = () => reject(new Error('无法读取正二轴测渲染结果'));
+            element.src = dataUrl;
+        });
+
+        const scanCanvas = document.createElement('canvas');
+        scanCanvas.width = image.naturalWidth;
+        scanCanvas.height = image.naturalHeight;
+        const scanContext = scanCanvas.getContext('2d', { willReadFrequently: true });
+        scanContext.drawImage(image, 0, 0);
+
+        const sourceWidth = scanCanvas.width;
+        const sourceHeight = scanCanvas.height;
+        const scanImage = scanContext.getImageData(0, 0, sourceWidth, sourceHeight);
+        const pixels = scanImage.data;
+        const corners = [
+            0,
+            (sourceWidth - 1) * 4,
+            (sourceHeight - 1) * sourceWidth * 4,
+            (sourceHeight * sourceWidth - 1) * 4
+        ];
+        const background = [0, 1, 2].map(channel =>
+            corners.reduce((sum, offset) => sum + pixels[offset + channel], 0) / corners.length
+        );
+        const hasTransparentBackground = corners.every(offset => pixels[offset + 3] === 0);
+
+        let minX = sourceWidth;
+        let minY = sourceHeight;
+        let maxX = -1;
+        let maxY = -1;
+        const threshold = 12;
+        for (let y = 0; y < sourceHeight; y++) {
+            for (let x = 0; x < sourceWidth; x++) {
+                const offset = (y * sourceWidth + x) * 4;
+                const distance = Math.max(
+                    Math.abs(pixels[offset] - background[0]),
+                    Math.abs(pixels[offset + 1] - background[1]),
+                    Math.abs(pixels[offset + 2] - background[2])
+                );
+                const isForeground = hasTransparentBackground
+                    ? pixels[offset + 3] > 8
+                    : pixels[offset + 3] > 0 && distance > threshold;
+                if (!isForeground) {
+                    pixels[offset] = 0;
+                    pixels[offset + 1] = 0;
+                    pixels[offset + 2] = 0;
+                    pixels[offset + 3] = 255;
+                    continue;
+                }
+                minX = Math.min(minX, x);
+                minY = Math.min(minY, y);
+                maxX = Math.max(maxX, x);
+                maxY = Math.max(maxY, y);
+            }
+        }
+        scanContext.putImageData(scanImage, 0, 0);
+
+        const outputCanvas = document.createElement('canvas');
+        outputCanvas.width = width;
+        outputCanvas.height = height;
+        const outputContext = outputCanvas.getContext('2d');
+        outputContext.fillStyle = '#000000';
+        outputContext.fillRect(0, 0, width, height);
+
+        if (maxX >= minX && maxY >= minY) {
+            const margin = 2;
+            minX = Math.max(0, minX - margin);
+            minY = Math.max(0, minY - margin);
+            maxX = Math.min(sourceWidth - 1, maxX + margin);
+            maxY = Math.min(sourceHeight - 1, maxY + margin);
+
+            const cropWidth = maxX - minX + 1;
+            const cropHeight = maxY - minY + 1;
+            const numericFill = Number(requestedFill);
+            const fill = Number.isFinite(numericFill) ? Math.min(0.98, Math.max(0.1, numericFill)) : 0.78;
+            const scale = Math.min(width * fill / cropWidth, height * fill / cropHeight);
+            const drawWidth = Math.max(1, Math.round(cropWidth * scale));
+            const drawHeight = Math.max(1, Math.round(cropHeight * scale));
+            const drawX = Math.round((width - drawWidth) / 2);
+            const drawY = Math.round((height - drawHeight) / 2);
+
+            outputContext.imageSmoothingEnabled = true;
+            outputContext.imageSmoothingQuality = 'high';
+            outputContext.drawImage(
+                scanCanvas,
+                minX, minY, cropWidth, cropHeight,
+                drawX, drawY, drawWidth, drawHeight
+            );
+        }
+
+        return outputCanvas.toDataURL('image/png');
+    }
+
+    /** Render the Isometric Renders preset and the exact 180° reverse angle. */
+    async renderIsometricViews(options = {}) {
+        const rotation = Number.isFinite(Number(options.isometricRotation)) ? Number(options.isometricRotation) : 135;
+        const isometricView = await this.renderIsometricView({ ...options, isometricRotation: rotation });
+        const reverseIsometricView = await this.renderIsometricView({
+            ...options,
+            isometricRotation: (rotation + 180) % 360
+        });
+        return { isometricView, reverseIsometricView };
+    }
+
+    // Compatibility entry point for callers of the previous API.
+    async renderAllViews(options = {}) {
+        return this.renderIsometricViews(options);
+    }
+}
+
+// 创建并导出 API 实例
+const litematicViewerAPI = new LitematicViewerAPI();
+window.litematicViewerAPI = litematicViewerAPI; // 确保在全局作用域中可用 

@@ -1,0 +1,48 @@
+{
+  "name": "koishi-plugin-litematic-renderer",
+  "version": "0.3.8",
+  "description": "Render small Litematica schematics sent in QQ groups.",
+  "author": "halfkite",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/halfkite/koishi-plugin-litematic-renderer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/halfkite/koishi-plugin-litematic-renderer/issues"
+  },
+  "homepage": "https://github.com/halfkite/koishi-plugin-litematic-renderer#readme",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "assets/threeviews",
+    "assets/java-bridge",
+    "assets/standalone-renderer",
+    "README.md"
+  ],
+  "keywords": [
+    "koishi",
+    "qq",
+    "minecraft",
+    "litematic"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "koishi": "^4.18.0"
+  },
+  "devDependencies": {
+    "@koishijs/plugin-adapter-onebot": "^6.0.2",
+    "@types/node": "^22.0.0",
+    "koishi": "^4.18.0",
+    "typescript": "^5.6.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "koishi": {
+    "description": {
+      "zh": "自动渲染群内 Litematica 投影文件。"
+    }
+  }
+}

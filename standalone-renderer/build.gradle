@@ -1,0 +1,31 @@
+plugins {
+    id 'java'
+}
+
+group = 'dev.qqbot'
+version = '0.1.7'
+
+dependencies {
+    implementation files('libs/gson-2.11.0.jar')
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+jar {
+    archiveBaseName = 'litematic-standalone-renderer'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes 'Main-Class': 'dev.qqbot.standalone.Main'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+}

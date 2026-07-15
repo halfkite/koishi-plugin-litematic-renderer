@@ -1,0 +1,118 @@
+var deepslateResources;
+
+function upperPowerOfTwo(x) {
+	x -= 1
+	x |= x >> 1
+	x |= x >> 2
+	x |= x >> 4
+	x |= x >> 8
+	x |= x >> 18
+	x |= x >> 32
+	return x + 1
+}
+
+// Load Deepslate resources from texture atlas image
+// Taken from Deepslate examples
+function loadDeepslateResources(textureImage) {
+  console.log("loading resources...")
+  const blockDefinitions = {};
+  Object.keys(assets.blockstates).forEach(id => {
+    blockDefinitions['minecraft:' + id] = deepslate.BlockDefinition.fromJson(id, assets.blockstates[id]);
+  })
+
+  const blockModels = {};
+  Object.keys(assets.models).forEach(id => {
+    blockModels['minecraft:' + id] = deepslate.BlockModel.fromJson(id, assets.models[id]);
+  })
+  Object.values(blockModels).forEach(m => m.flatten({ getBlockModel: id => blockModels[id] }));
+
+  const atlasCanvas = document.createElement('canvas');
+  const atlasSize = upperPowerOfTwo((textureImage.width >= textureImage.height) ? textureImage.width : textureImage.height);
+  atlasCanvas.width = textureImage.width;
+  atlasCanvas.height = textureImage.height;
+
+  const atlasCtx = atlasCanvas.getContext('2d');
+  atlasCtx.drawImage(textureImage, 0, 0);
+
+  const atlasData = atlasCtx.getImageData(0, 0, atlasSize, atlasSize);
+
+  const idMap = {};
+
+  Object.keys(assets.textures).forEach(id => {
+		const [u, v, du, dv] = assets.textures[id]
+		const dv2 = (du !== dv && id.startsWith('block/')) ? du : dv
+		idMap['minecraft:' + id] = [u / atlasSize, v / atlasSize, (u + du) / atlasSize, (v + dv2) / atlasSize]
+	})
+
+  const textureAtlas = new deepslate.TextureAtlas(atlasData, idMap);
+
+  deepslateResources = {
+    getBlockDefinition(id) { return blockDefinitions[id] },
+    getBlockModel(id) { return blockModels[id] },
+    getTextureUV(id) { return textureAtlas.getTextureUV(id) },
+    getTextureAtlas() { return textureAtlas.getTextureAtlas() },
+    getBlockFlags(id) {
+      return {
+        opaque: OPAQUE_BLOCKS.has(id.toString()),
+        self_culling: !NON_SELF_CULLING.has(id.toString()),
+        semi_transparent: TRANSPARENT_BLOCKS.has(id.toString()),
+      };
+    },
+    getBlockProperties(id) { return null },
+    getDefaultBlockProperties(id) { return null },
+  }
+
+  return deepslateResources;
+}
+
+function structureFromLitematic(litematic, y_min=0, y_max=-1) {
+  const bounds = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+  for (const region of litematic.regions) {
+    const origin = region.position || { x: 0, y: 0, z: 0 };
+    const sizes = [Math.abs(region.width), Math.abs(region.height), Math.abs(region.depth)];
+    const directions = [region.width < 0 ? -1 : 1, region.height < 0 ? -1 : 1, region.depth < 0 ? -1 : 1];
+    const starts = [origin.x, origin.y, origin.z];
+    for (let axis = 0; axis < 3; axis++) {
+      const end = starts[axis] + (sizes[axis] - 1) * directions[axis];
+      bounds.min[axis] = Math.min(bounds.min[axis], starts[axis], end);
+      bounds.max[axis] = Math.max(bounds.max[axis], starts[axis], end);
+    }
+  }
+
+  const structure = new deepslate.Structure(bounds.max.map((value, axis) => value - bounds.min[axis] + 1));
+  let blockCount = 0;
+  console.log("Building blocks from", litematic.regions.length, "regions...");
+  for (const region of litematic.regions) {
+    const blocks = region.blocks;
+    const blockPalette = region.blockPalette;
+    const origin = region.position || { x: 0, y: 0, z: 0 };
+    const directions = [region.width < 0 ? -1 : 1, region.height < 0 ? -1 : 1, region.depth < 0 ? -1 : 1];
+    const maxY = y_max === -1 ? blocks[0].length : Math.min(y_max, blocks[0].length);
+    for (let x = 0; x < blocks.length; x++) {
+      for (let y = Math.max(0, y_min); y < maxY; y++) {
+        for (let z = 0; z < blocks[x][y].length; z++) {
+          const blockID = blocks[x][y][z];
+          if (blockID <= 0) continue;
+          const blockInfo = blockPalette[blockID];
+          const position = [
+            origin.x + x * directions[0] - bounds.min[0],
+            origin.y + y * directions[1] - bounds.min[1],
+            origin.z + z * directions[2] - bounds.min[2],
+          ];
+          if (blockInfo) {
+            blockCount++;
+            if (blockInfo.hasOwnProperty("Properties")) {
+              structure.addBlock(position, blockInfo.Name, blockInfo.Properties);
+            } else {
+              structure.addBlock(position, blockInfo.Name);
+            }
+          } else {
+            structure.addBlock(position, "minecraft:cake");
+          }
+        }
+      }
+    }
+  }
+  console.log("Done!", blockCount, "blocks");
+  return structure;
+}
