@@ -35,11 +35,12 @@ plugins:
     cacheDirectory: data/litematic-renderer-cache
     cacheMaxSizeGb: 20
     renderEngine: standalone
-    standaloneJavaCommand: java
-    minecraftJarPath: C:/path/to/.minecraft/versions/1.21.1/1.21.1.jar
-    resourcePackPaths:
-      - C:/path/to/.minecraft/resourcepacks/your-base-pack.zip
-      - C:/path/to/.minecraft/resourcepacks/your-overlay-pack.zip
+    # 留空自动查找 Java 21；也可填写自定义 Java 21 可执行文件路径
+    standaloneJavaCommand: ''
+    # 留空或文件不存在时自动下载 Mojang 最新正式版客户端文件
+    minecraftJarPath: ''
+    # 默认使用上方 Minecraft JAR 内的原版资源；需要自定义材质包时再填写
+    resourcePackPaths: []
     standaloneRenderTimeout: 180000
     javaResolution: 1024
     javaSupersampling: 2
@@ -59,7 +60,7 @@ plugins:
         replyAndMention: inherit
 ```
 
-请将示例中的 Java、Minecraft JAR 与材质包路径替换为本机实际路径；材质包越靠后优先级越高。
+`standaloneJavaCommand` 留空时会自动查找 Java 21（依次检查 `JAVA_HOME`、常见 JDK 安装目录和 `PATH`）；也可以填写自定义 Java 21 可执行文件路径。`minecraftJarPath` 留空或指向不存在的文件时，独立渲染器会从 Mojang 官方版本清单下载最新正式版客户端 JAR，并缓存到插件缓存目录。独立渲染默认只使用 Minecraft JAR 内的原版资源；需要自定义材质包时再设置 `resourcePackPaths`，越靠后优先级越高。使用 `java` Fabric 桥接后端时，请填写 `javaBridgeDirectory`。
 
 缓存按插件版本、投影文件 SHA-256 和渲染配置分目录，同时保存原始 `.litematic` 与两张 PNG。插件升级后使用新的版本目录，旧缓存不会因升级被主动删除；所有版本合计超过 `cacheMaxSizeGb` 时才按最久未使用顺序清理。
 

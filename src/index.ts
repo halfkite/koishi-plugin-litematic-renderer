@@ -82,15 +82,12 @@ export const Config: Schema<Config> = Schema.object({
   cacheMaxSizeGb: Schema.number().min(1).max(1024).step(1).default(20).description('所有版本缓存的总上限（GiB），超出后按最久未使用清理。'),
   gpuRendererCommand: Schema.string().default('').description('可选的可信本地 GPU 渲染器命令。'),
   renderEngine: Schema.union([Schema.const('standalone'), Schema.const('java'), Schema.const('webgl'), Schema.const('cpu')]).default('standalone').description('standalone 为无需客户端的独立 Java 资源包渲染器；java 为 Fabric 客户端桥接。'),
-  standaloneJavaCommand: Schema.string().default('C:/Program Files/Java/jdk-21.0.11/bin/java.exe').description('独立渲染器使用的 Java 21 可执行文件。'),
+  standaloneJavaCommand: Schema.string().default('').description('独立渲染器使用的 Java 21 可执行文件；留空自动查找，也可填写自定义路径或命令。'),
   standaloneRendererJar: Schema.string().default('').description('独立渲染器 JAR；留空使用插件内置版本。'),
   standaloneRenderTimeout: Schema.natural().min(10000).default(180000).description('独立 Java 渲染超时（毫秒）。'),
-  minecraftJarPath: Schema.string().default('D:/我的世界/.minecraft/versions/26.2/26.2.jar').description('提供原版 blockstate、模型和纹理的 Minecraft 客户端 JAR。'),
-  resourcePackPaths: Schema.array(Schema.string()).default([
-    'D:/我的世界/.minecraft/versions/26.2/resourcepacks/XK redstone display 26.1.5.zip',
-    'D:/我的世界/.minecraft/versions/26.2/resourcepacks/XKRDA红显附加包0.3for1.19.4~1.21snapshot.zip',
-  ]).description('独立渲染材质包路径；越靠后优先级越高。'),
-  javaBridgeDirectory: Schema.string().default('D:/我的世界/.minecraft/versions/1.21.1-Fabric/render-bridge').description('Fabric Java 渲染桥任务目录。'),
+  minecraftJarPath: Schema.string().default('').description('提供原版 blockstate、模型和纹理的 Minecraft 客户端 JAR；留空或路径不存在时自动下载最新正式版。'),
+  resourcePackPaths: Schema.array(Schema.string()).default([]).description('独立渲染的自定义材质包路径；默认仅使用 Minecraft JAR 中的原版资源，越靠后优先级越高。'),
+  javaBridgeDirectory: Schema.string().default('').description('Fabric Java 渲染桥任务目录；使用 java 后端时填写。'),
   javaRenderTimeout: Schema.natural().min(10000).default(180000).description('等待 Minecraft Java 渲染完成的超时（毫秒）。'),
   javaResolution: Schema.natural().min(256).max(4096).default(1024).description('Java 渲染最终输出边长。'),
   javaSupersampling: Schema.natural().min(1).max(4).default(2).description('Fabrishot 式离屏超采样倍数。'),
@@ -143,8 +140,11 @@ export function apply(ctx: Context, config: Config) {
     const bytes = await download(ctx, url, config.maxFileSize, config.renderTimeout)
     const metadata = formatLitematicMetadata(parseLitematicMetadata(bytes))
     const fileHash = createHash('sha256').update(bytes).digest('hex')
+    const minecraftJarPath = config.renderEngine === 'standalone'
+      ? await resolveMinecraftJar(ctx, config, cacheDirectory)
+      : ''
     const resourceFingerprint = config.renderEngine === 'standalone'
-      ? await fingerprintFiles([config.minecraftJarPath, ...config.resourcePackPaths])
+      ? await fingerprintFiles([minecraftJarPath, ...config.resourcePackPaths])
       : []
     const renderHash = hashRenderConfiguration({
         version: CACHE_FORMAT_VERSION,
@@ -190,7 +190,7 @@ export function apply(ctx: Context, config: Config) {
             && await renderWithGpu(config.gpuRendererCommand, input, output, config.renderTimeout, logger))
           if (!gpuSucceeded || !(await Promise.all(expected.map(exists))).every(Boolean)) {
             if (config.renderEngine === 'standalone') {
-              await renderWithStandalone(input, output, config)
+              await renderWithStandalone(input, output, minecraftJarPath, config)
             } else if (config.renderEngine === 'java') {
               await renderWithJavaBridge(input, output, config)
             } else {
@@ -384,10 +384,115 @@ async function fingerprintFiles(paths: string[]) {
   }))
 }
 
-async function renderWithStandalone(input: string, output: string, config: Config) {
+async function resolveStandaloneJavaCommand(configuredCommand: string) {
+  const command = configuredCommand.trim()
+  if (command) return command
+
+  const executable = process.platform === 'win32' ? 'java.exe' : 'java'
+  const candidates = new Set<string>()
+  if (process.env.JAVA_HOME) candidates.add(join(process.env.JAVA_HOME, 'bin', executable))
+
+  if (process.platform === 'win32') {
+    const roots = new Set([
+      join(process.env.ProgramFiles ?? 'C:/Program Files', 'Java'),
+      join(process.env.ProgramFiles ?? 'C:/Program Files', 'Eclipse Adoptium'),
+      join(process.env.ProgramFiles ?? 'C:/Program Files', 'Microsoft', 'jdk'),
+    ])
+    for (const root of roots) {
+      try {
+        const directories = await fs.readdir(root, { withFileTypes: true })
+        for (const directory of directories) {
+          if (directory.isDirectory() && /(?:^|[-_])21(?:[._-]|$)/.test(directory.name)) {
+            candidates.add(join(root, directory.name, 'bin', executable))
+          }
+        }
+      } catch { /* The JDK vendor is not installed at this location. */ }
+    }
+  }
+  candidates.add('java')
+
+  for (const candidate of candidates) {
+    if (await javaMajorVersion(candidate) === 21) return candidate
+  }
+  throw new Error('未找到 Java 21；请安装 Java 21，设置 JAVA_HOME，或填写 standaloneJavaCommand')
+}
+
+async function javaMajorVersion(command: string) {
+  return new Promise<number | undefined>(resolveVersion => {
+    let output = ''
+    let settled = false
+    const settle = (version?: number) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolveVersion(version)
+    }
+    const child = spawn(command, ['-version'], { shell: false, windowsHide: true })
+    const append = (chunk: Buffer) => { output = (output + String(chunk)).slice(-2000) }
+    child.stdout?.on('data', append)
+    child.stderr?.on('data', append)
+    child.once('error', () => settle())
+    child.once('close', () => {
+      const match = output.match(/(?:java|openjdk) version "(\d+)/i)
+      settle(match ? Number(match[1]) : undefined)
+    })
+    const timer = setTimeout(() => {
+      child.kill()
+      settle()
+    }, 5000)
+  })
+}
+
+interface MinecraftVersionManifest {
+  latest?: { release?: string }
+  versions?: Array<{ id?: string, url?: string }>
+}
+
+interface MinecraftVersionDetails {
+  downloads?: { client?: { url?: string, sha1?: string, size?: number } }
+}
+
+async function resolveMinecraftJar(ctx: Context, config: Config, cacheDirectory: string) {
+  const configuredPath = config.minecraftJarPath.trim()
+  if (configuredPath && await exists(resolve(configuredPath))) return resolve(configuredPath)
+
+  const manifestUrl = 'https://launchermeta.mojang.com/mc/game/version_manifest_v2.json'
+  const manifest = await ctx.http.get<MinecraftVersionManifest>(manifestUrl, { timeout: config.renderTimeout })
+  const releaseId = manifest.latest?.release
+  const release = manifest.versions?.find(version => version.id === releaseId)
+  if (!releaseId || !release?.url) throw new Error('无法从 Minecraft 官方版本清单获取最新正式版')
+
+  const details = await ctx.http.get<MinecraftVersionDetails>(release.url, { timeout: config.renderTimeout })
+  const client = details.downloads?.client
+  if (!client?.url || !client.sha1 || !client.size) throw new Error(`Minecraft ${releaseId} 官方客户端文件信息不完整`)
+
+  const target = join(cacheDirectory, 'minecraft-client', `${releaseId}.jar`)
+  if (await exists(target)) return target
+  if (client.size > 100 * 1024 * 1024) throw new Error(`Minecraft ${releaseId} 客户端文件超过 100 MiB 安全限制`)
+
+  const response = await ctx.http.get<ArrayBuffer>(client.url, { responseType: 'arraybuffer', timeout: config.standaloneRenderTimeout })
+  const bytes = Buffer.from(response)
+  if (bytes.byteLength !== client.size) throw new Error(`Minecraft ${releaseId} 客户端文件大小校验失败`)
+  if (createHash('sha1').update(bytes).digest('hex') !== client.sha1) {
+    throw new Error(`Minecraft ${releaseId} 客户端文件 SHA-1 校验失败`)
+  }
+
+  await fs.mkdir(join(cacheDirectory, 'minecraft-client'), { recursive: true })
+  const temporary = `${target}.${randomUUID()}.tmp`
+  await fs.writeFile(temporary, bytes)
+  try {
+    await fs.rename(temporary, target)
+  } catch (error) {
+    await fs.rm(temporary, { force: true })
+    if (!(await exists(target))) throw error
+  }
+  return target
+}
+
+async function renderWithStandalone(input: string, output: string, minecraftJarPath: string, config: Config) {
   const rendererJar = resolve(config.standaloneRendererJar || join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.1.7.jar'))
   if (!(await exists(rendererJar))) throw new Error(`独立 Java 渲染器不存在：${rendererJar}`)
-  if (!(await exists(resolve(config.minecraftJarPath)))) throw new Error(`Minecraft 资源 JAR 不存在：${config.minecraftJarPath}`)
+  if (!(await exists(minecraftJarPath))) throw new Error(`Minecraft 资源 JAR 不存在：${minecraftJarPath}`)
   for (const pack of config.resourcePackPaths) {
     if (!(await exists(resolve(pack)))) throw new Error(`材质包不存在：${pack}`)
   }
@@ -395,7 +500,7 @@ async function renderWithStandalone(input: string, output: string, config: Confi
   const args = [
     '-Djava.awt.headless=true', '-jar', rendererJar,
     '--input', resolve(input), '--output', resolve(output),
-    '--minecraft-jar', resolve(config.minecraftJarPath),
+    '--minecraft-jar', minecraftJarPath,
     '--resolution', String(config.javaResolution),
     '--supersampling', String(config.javaSupersampling),
     '--max-blocks', String(config.maxBlocks),
@@ -406,9 +511,10 @@ async function renderWithStandalone(input: string, output: string, config: Confi
   ]
   if (config.transparentBackground) args.push('--transparent-background')
   for (const pack of config.resourcePackPaths) args.push('--resource-pack', resolve(pack))
+  const javaCommand = await resolveStandaloneJavaCommand(config.standaloneJavaCommand)
 
   await new Promise<void>((resolveRun, reject) => {
-    const child = spawn(config.standaloneJavaCommand, args, { shell: false, windowsHide: true })
+    const child = spawn(javaCommand, args, { shell: false, windowsHide: true })
     let stderr = ''
     child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-6000) })
     const timer = setTimeout(() => {
@@ -439,6 +545,9 @@ interface JavaBridgeResult {
 }
 
 async function renderWithJavaBridge(input: string, output: string, config: Config) {
+  if (!config.javaBridgeDirectory.trim()) {
+    throw new Error('Fabric Java 渲染桥任务目录未配置；使用 java 后端时请填写 javaBridgeDirectory')
+  }
   const bridge = resolve(config.javaBridgeDirectory)
   const status = await readJson<JavaBridgeStatus>(join(bridge, 'status.json'))
   if (!status?.timestamp || Date.now() - status.timestamp > 5000) {
