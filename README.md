@@ -1,5 +1,7 @@
 # koishi-plugin-litematic-renderer
 
+[![npm](https://img.shields.io/npm/v/koishi-plugin-litematic-renderer?label=npm)](https://www.npmjs.com/package/koishi-plugin-litematic-renderer)
+
 自动识别 QQ 群消息中小于指定大小的 `.litematic` 文件，并发送两张 PNG：
 
 - 正二轴测
