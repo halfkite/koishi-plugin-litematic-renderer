@@ -419,6 +419,9 @@ function fileElements(session: Pick<Session, 'elements' | 'content'>) {
 }
 
 export function findFileElement(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
+  const raw = (session as any).event?._data
+  const rawFile = raw?.file ?? raw?.data?.file
+  if (rawFile && typeof rawFile === 'object') return rawFile as FileElement
   return fileElements(session).find((element: any) => element.type === 'file')?.attrs as FileElement | undefined
 }
 

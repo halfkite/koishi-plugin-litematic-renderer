@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { gzipSync } from 'node:zlib'
-import { cacheNameSegment, enforceCacheLimit, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, renderSchematic, resolveSendOptions, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
+import { cacheNameSegment, enforceCacheLimit, findFileElement, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, renderSchematic, resolveSendOptions, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
 
 const short = (value) => { const data = Buffer.alloc(2); data.writeUInt16BE(value); return data }
 const int = (value) => { const data = Buffer.alloc(4); data.writeInt32BE(value); return data }
@@ -195,6 +195,15 @@ test('detects NapCat file_name aliases and trims the extension', () => {
     content: '',
   })
   assert.equal(file?.file_name, '  结构投影.LITEMATIC  ')
+})
+
+test('reads the raw OneBot group upload file when normalized elements lose the name', () => {
+  const file = findFileElement({
+    elements: [],
+    content: '',
+    event: { _data: { notice_type: 'group_upload', file: { name: '4gt补盒.litematic', id: 'file-id' } } },
+  })
+  assert.equal(file?.name, '4gt补盒.litematic')
 })
 
 test('does not treat unnamed or unrelated files as litematic projections', () => {
