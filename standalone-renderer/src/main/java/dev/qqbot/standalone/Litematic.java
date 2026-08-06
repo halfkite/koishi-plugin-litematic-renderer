@@ -40,7 +40,7 @@ final class Litematic {
     private final List<Entity> entities;
     private final Bounds bounds;
 
-    private Litematic(List<Block> blocks, List<BlockEntity> blockEntities, List<Entity> entities, Bounds bounds) {
+    Litematic(List<Block> blocks, List<BlockEntity> blockEntities, List<Entity> entities, Bounds bounds) {
         this.blocks = List.copyOf(blocks);
         this.blockEntities = List.copyOf(blockEntities);
         this.entities = List.copyOf(entities);
@@ -52,7 +52,7 @@ final class Litematic {
     List<Entity> entities() { return entities; }
     Bounds bounds() { return bounds; }
 
-    static Litematic read(Path path, int maxBlocks) throws IOException {
+    static Litematic read(Path path) throws IOException {
         Map<String, Object> root = NbtReader.read(path);
         Map<String, Object> regions = compound(root.get("Regions"));
         if (regions == null || regions.isEmpty()) throw new IOException("Litematic has no regions");
@@ -119,7 +119,6 @@ final class Litematic {
                 if (paletteIndex < 0 || paletteIndex >= palette.size()) continue;
                 BlockState state = palette.get(paletteIndex);
                 if (state.name().equals("minecraft:air") || state.name().equals("minecraft:cave_air") || state.name().equals("minecraft:void_air")) continue;
-                if (blocks.size() >= maxBlocks) throw new IOException("Non-air block limit exceeded: " + maxBlocks);
                 int x = index % sx;
                 int z = (index / sx) % sz;
                 int y = index / (sx * sz);

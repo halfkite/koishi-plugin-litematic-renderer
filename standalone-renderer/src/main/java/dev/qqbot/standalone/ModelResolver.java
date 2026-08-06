@@ -3,6 +3,7 @@ package dev.qqbot.standalone;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import dev.qqbot.standalone.Geometry.BakedModel;
 import dev.qqbot.standalone.Geometry.Direction;
 import dev.qqbot.standalone.Geometry.Quad;
@@ -10,18 +11,28 @@ import dev.qqbot.standalone.Geometry.Vec3;
 import dev.qqbot.standalone.Geometry.Vertex;
 
 import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 
 final class ModelResolver {
+    record Diagnostic(String state, String reason, int count) {}
+    private static final class DiagnosticCounter { int count; }
     private record ModelRef(String id, int xRotation, int yRotation, boolean uvLock) {}
     private record ModelData(Map<String, String> textures, JsonArray elements) {}
 
@@ -29,6 +40,8 @@ final class ModelResolver {
     private final Map<Litematic.BlockState, BakedModel> bakedStates = new ConcurrentHashMap<>();
     private final Map<String, ModelData> models = new ConcurrentHashMap<>();
     private final Map<String, BufferedImage> processedTextures = new ConcurrentHashMap<>();
+    private final Map<String, Optional<BufferedImage>> remoteTextures = new ConcurrentHashMap<>();
+    private final Map<String, DiagnosticCounter> diagnostics = new ConcurrentHashMap<>();
 
     ModelResolver(ResourcePacks resources) {
         this.resources = resources;
@@ -36,6 +49,34 @@ final class ModelResolver {
 
     BakedModel resolve(Litematic.BlockState state) {
         return bakedStates.computeIfAbsent(state, this::bakeState);
+    }
+
+    List<Diagnostic> diagnostics() {
+        List<Diagnostic> result = new ArrayList<>();
+        diagnostics.forEach((key, value) -> {
+            int separator = key.indexOf('\u0000');
+            result.add(new Diagnostic(key.substring(0, separator), key.substring(separator + 1), value.count));
+        });
+        result.sort(java.util.Comparator.comparing(Diagnostic::state).thenComparing(Diagnostic::reason));
+        return List.copyOf(result);
+    }
+
+    private void diagnostic(Litematic.BlockState state, String reason) {
+        String properties = state.properties().entrySet().stream().sorted(Map.Entry.comparingByKey())
+            .map(entry -> entry.getKey() + "=" + entry.getValue())
+            .collect(java.util.stream.Collectors.joining(",", "[", "]"));
+        diagnostic(state.name() + (state.properties().isEmpty() ? "" : properties), reason);
+    }
+
+    private void diagnostic(String state, String reason) {
+        diagnostics.computeIfAbsent(state + '\u0000' + reason, ignored -> new DiagnosticCounter()).count++;
+    }
+
+    BakedModel resolve(Litematic.BlockState state, Litematic.BlockEntity blockEntity) {
+        String path = Identifier.parse(state.name()).path;
+        if (isHead(path)) return headModel(state, blockEntity);
+        if (path.endsWith("_banner")) return bannerModel(state, blockEntity);
+        return resolve(state);
     }
 
     boolean isOpaque(Litematic.BlockState state) {
@@ -72,26 +113,55 @@ final class ModelResolver {
         List<ModelRef> references = blockStateModels(state);
         List<Quad> quads = new ArrayList<>();
         for (ModelRef reference : references) quads.addAll(bakeModel(reference, state));
-        if (quads.isEmpty()) quads.addAll(fallbackCube(state));
+        if (quads.isEmpty() && Identifier.parse(state.name()).path.equals("cobblestone_wall")) return new BakedModel(List.of());
+        if (quads.isEmpty()) {
+            diagnostic(state, references.isEmpty() ? "missing blockstate/model; fallback cube" : "model produced no faces; fallback cube");
+            quads.addAll(fallbackCube(state));
+        }
         return new BakedModel(List.copyOf(quads));
     }
 
     private BakedModel entityBlockModel(Litematic.BlockState state) {
         String path = Identifier.parse(state.name()).path;
+        if (path.equals("structure_void") || path.equals("light") || path.equals("end_portal")) return new BakedModel(List.of());
+        if (path.equals("conduit")) {
+            BufferedImage texture = resources.texture("minecraft:block/conduit");
+            Map<Direction, BufferedImage> faces = new HashMap<>();
+            for (Direction direction : Direction.values()) faces.put(direction, texture);
+            return new BakedModel(List.copyOf(cuboid(new double[]{1, 1, 1}, new double[]{15, 15, 15}, faces, Set.of(), 0, 0)));
+        }
         if (path.equals("water") || path.equals("bubble_column")) return fluidModel(state, true);
         if (path.equals("lava")) return fluidModel(state, false);
-        if (path.equals("player_head")) return playerHeadModel(state);
+        if (isHead(path)) return headModel(state, null);
         if (path.equals("chest") || path.equals("trapped_chest") || path.equals("ender_chest") || path.endsWith("copper_chest")) {
             return chestModel(state, path);
         }
         if (path.equals("shulker_box") || path.endsWith("_shulker_box")) return shulkerModel(state, path);
+        if (path.equals("decorated_pot")) return decoratedPotModel(state);
         if ((path.endsWith("_sign") || path.endsWith("_wall_sign")) && !hasModernSignModel(path)) return signModel(state, path);
         return null;
     }
 
-    private BakedModel playerHeadModel(Litematic.BlockState state) {
-        BufferedImage skin = resources.firstTexture(
-            "minecraft:entity/player/wide/steve", "minecraft:entity/player/slim/steve", "minecraft:entity/steve");
+    private BakedModel decoratedPotModel(Litematic.BlockState state) {
+        BufferedImage base = resources.texture("minecraft:entity/decorated_pot/decorated_pot_base");
+        BufferedImage side = resources.texture("minecraft:entity/decorated_pot/decorated_pot_side");
+        Map<Direction, BufferedImage> sideTextures = new HashMap<>();
+        for (Direction direction : Direction.values()) sideTextures.put(direction, side);
+        sideTextures.put(Direction.UP, base);
+        sideTextures.put(Direction.DOWN, base);
+        // The vanilla pot is tapered; four narrow cuboids preserve its silhouette
+        // while keeping the entity texture mapping stable across resource-pack sizes.
+        List<Quad> quads = new ArrayList<>();
+        quads.addAll(cuboid(new double[]{3, 0, 3}, new double[]{13, 2, 13}, sideTextures, Set.of(Direction.UP), 0, 0));
+        quads.addAll(cuboid(new double[]{2, 2, 2}, new double[]{14, 14, 14}, sideTextures, Set.of(Direction.UP, Direction.DOWN), 0, 0));
+        quads.addAll(cuboid(new double[]{3, 14, 3}, new double[]{13, 16, 13}, sideTextures, Set.of(Direction.DOWN), 0, 0));
+        return new BakedModel(List.copyOf(quads));
+    }
+
+    private BakedModel headModel(Litematic.BlockState state, Litematic.BlockEntity blockEntity) {
+        String path = Identifier.parse(state.name()).path;
+        boolean player = path.startsWith("player_");
+        BufferedImage skin = player ? playerSkin(blockEntity) : headTexture(path);
         int scale = Math.max(1, skin.getWidth() / 64);
         Map<Direction, BufferedImage> base = Map.of(
             Direction.UP, crop(skin, scale, 8, 0, 8, 8, false, false),
@@ -100,21 +170,266 @@ final class ModelResolver {
             Direction.SOUTH, crop(skin, scale, 8, 8, 8, 8, false, false),
             Direction.EAST, crop(skin, scale, 16, 8, 8, 8, false, false),
             Direction.NORTH, crop(skin, scale, 24, 8, 8, 8, false, false));
-        Map<Direction, BufferedImage> overlay = Map.of(
-            Direction.UP, crop(skin, scale, 40, 0, 8, 8, false, false),
-            Direction.DOWN, crop(skin, scale, 48, 0, 8, 8, false, false),
-            Direction.WEST, crop(skin, scale, 32, 8, 8, 8, false, false),
-            Direction.SOUTH, crop(skin, scale, 40, 8, 8, 8, false, false),
-            Direction.EAST, crop(skin, scale, 48, 8, 8, 8, false, false),
-            Direction.NORTH, crop(skin, scale, 56, 8, 8, 8, false, false));
-        int rotation;
-        try { rotation = Integer.parseInt(state.properties().getOrDefault("rotation", "0")); }
-        catch (NumberFormatException ignored) { rotation = 0; }
-        double yRotation = rotation * 22.5;
-        List<Quad> quads = new ArrayList<>(cuboid(
-            new double[]{4, 0, 4}, new double[]{12, 8, 12}, base, Set.of(), 0, yRotation));
-        quads.addAll(cuboid(new double[]{3.75, -0.25, 3.75}, new double[]{12.25, 8.25, 12.25}, overlay, Set.of(), 0, yRotation));
+        boolean wall = path.contains("_wall_");
+        double yRotation = wall ? chestRotation(state.properties().getOrDefault("facing", "north")) : -rotation(state) * 22.5;
+        double[] from = wall ? new double[]{4, 4, 8} : new double[]{4, 0, 4};
+        double[] to = wall ? new double[]{12, 12, 16} : new double[]{12, 8, 12};
+        List<Quad> quads = new ArrayList<>(cuboid(from, to, base, Set.of(), 0, yRotation));
+        if (player) {
+            Map<Direction, BufferedImage> overlay = Map.of(
+                Direction.UP, crop(skin, scale, 40, 0, 8, 8, false, false),
+                Direction.DOWN, crop(skin, scale, 48, 0, 8, 8, false, false),
+                Direction.WEST, crop(skin, scale, 32, 8, 8, 8, false, false),
+                Direction.SOUTH, crop(skin, scale, 40, 8, 8, 8, false, false),
+                Direction.EAST, crop(skin, scale, 48, 8, 8, 8, false, false),
+                Direction.NORTH, crop(skin, scale, 56, 8, 8, 8, false, false));
+            double[] overlayFrom = {from[0] - 0.25, from[1] - 0.25, from[2] - 0.25};
+            double[] overlayTo = {to[0] + 0.25, to[1] + 0.25, to[2] + 0.25};
+            quads.addAll(cuboid(overlayFrom, overlayTo, overlay, Set.of(), 0, yRotation));
+        }
         return new BakedModel(List.copyOf(quads));
+    }
+
+    private static boolean isHead(String path) {
+        return path.endsWith("_head") || path.endsWith("_wall_head") || path.endsWith("_skull") || path.endsWith("_wall_skull");
+    }
+
+    private static int rotation(Litematic.BlockState state) {
+        try { return Integer.parseInt(state.properties().getOrDefault("rotation", "0")); }
+        catch (NumberFormatException ignored) { return 0; }
+    }
+
+    private BufferedImage headTexture(String path) {
+        if (path.startsWith("wither_skeleton_")) return resources.texture("minecraft:entity/skeleton/wither_skeleton");
+        if (path.startsWith("skeleton_")) return resources.texture("minecraft:entity/skeleton/skeleton");
+        if (path.startsWith("zombie_")) return resources.texture("minecraft:entity/zombie/zombie");
+        if (path.startsWith("creeper_")) return resources.texture("minecraft:entity/creeper/creeper");
+        if (path.startsWith("piglin_")) return resources.texture("minecraft:entity/piglin/piglin");
+        if (path.startsWith("dragon_")) return resources.texture("minecraft:entity/enderdragon/dragon");
+        return resources.firstTexture("minecraft:entity/player/wide/steve", "minecraft:entity/player/slim/steve");
+    }
+
+    private BufferedImage playerSkin(Litematic.BlockEntity blockEntity) {
+        String url = blockEntity == null ? null : skinUrl(blockEntity.data());
+        if (url != null) {
+            Optional<BufferedImage> loaded = remoteTextures.computeIfAbsent(url, this::downloadSkin);
+            if (loaded.isPresent()) return loaded.get();
+        }
+        return resources.firstTexture("minecraft:entity/player/wide/steve", "minecraft:entity/player/slim/steve");
+    }
+
+    private Optional<BufferedImage> downloadSkin(String value) {
+        try {
+            URI uri = URI.create(value);
+            if (!("https".equalsIgnoreCase(uri.getScheme()) || "http".equalsIgnoreCase(uri.getScheme()))
+                || !"textures.minecraft.net".equalsIgnoreCase(uri.getHost())) {
+                System.err.println("Ignored untrusted player head texture URL: " + value);
+                return Optional.empty();
+            }
+            if ("http".equalsIgnoreCase(uri.getScheme())) uri = URI.create(value.replaceFirst("(?i)^http://", "https://"));
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5))
+                .followRedirects(HttpClient.Redirect.NORMAL).build();
+            HttpRequest request = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(10)).GET().build();
+            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            if (response.statusCode() != 200 || response.body().length > 4 * 1024 * 1024) return Optional.empty();
+            return Optional.ofNullable(javax.imageio.ImageIO.read(new ByteArrayInputStream(response.body())));
+        } catch (Exception exception) {
+            System.err.println("Unable to load player head texture: " + exception.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private static String skinUrl(Map<String, Object> data) {
+        Map<String, Object> profile = nbtCompound(first(data, "profile", "SkullOwner", "Owner"));
+        if (profile == null) return null;
+        Object properties = first(profile, "properties", "Properties");
+        String encoded = null;
+        Map<String, Object> propertyMap = nbtCompound(properties);
+        if (propertyMap != null) encoded = textureValue(first(propertyMap, "textures", "Textures"));
+        if (encoded == null && properties instanceof List<?> list) {
+            for (Object item : list) {
+                Map<String, Object> property = nbtCompound(item);
+                if (property != null && "textures".equalsIgnoreCase(String.valueOf(first(property, "name", "Name")))) {
+                    encoded = string(first(property, "value", "Value"));
+                    if (encoded != null) break;
+                }
+            }
+        }
+        if (encoded == null) return null;
+        try {
+            String json = new String(Base64.getDecoder().decode(encoded), java.nio.charset.StandardCharsets.UTF_8);
+            JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+            JsonObject textures = object(root.get("textures"));
+            JsonObject skin = textures == null ? null : object(textures.get("SKIN"));
+            return skin != null && skin.has("url") ? skin.get("url").getAsString() : null;
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static String textureValue(Object value) {
+        if (value instanceof String string) return string;
+        if (value instanceof List<?> list && !list.isEmpty()) {
+            Map<String, Object> item = nbtCompound(list.get(0));
+            return item == null ? null : string(first(item, "value", "Value"));
+        }
+        return null;
+    }
+
+    private BakedModel bannerModel(Litematic.BlockState state, Litematic.BlockEntity blockEntity) {
+        String path = Identifier.parse(state.name()).path;
+        boolean wall = path.endsWith("_wall_banner");
+        double yRotation = wall ? chestRotation(state.properties().getOrDefault("facing", "north")) : -rotation(state) * 22.5;
+        BufferedImage cloth = bannerTexture(path, blockEntity);
+        Map<Direction, BufferedImage> clothFaces = new HashMap<>();
+        for (Direction direction : Direction.values()) clothFaces.put(direction, cloth);
+        double[] from = wall ? new double[]{1, 1, 14.5} : new double[]{1, 1, 7.5};
+        double[] to = wall ? new double[]{15, 15, 15.5} : new double[]{15, 15, 8.5};
+        List<Quad> quads = new ArrayList<>(cuboid(from, to, clothFaces, Set.of(), 0, yRotation));
+
+        BufferedImage wood = resources.texture("minecraft:block/oak_planks");
+        Map<Direction, BufferedImage> woodFaces = new HashMap<>();
+        for (Direction direction : Direction.values()) woodFaces.put(direction, wood);
+        quads.addAll(cuboid(
+            wall ? new double[]{1, 14, 14} : new double[]{1, 14, 7},
+            wall ? new double[]{15, 15, 16} : new double[]{15, 15, 9},
+            woodFaces, Set.of(), 0, yRotation));
+        if (!wall) quads.addAll(cuboid(new double[]{7.5, 0, 7.5}, new double[]{8.5, 16, 8.5}, woodFaces, Set.of(), 0, yRotation));
+        return new BakedModel(List.copyOf(quads));
+    }
+
+    private BufferedImage bannerTexture(String blockPath, Litematic.BlockEntity blockEntity) {
+        String baseName = blockPath.replace("_wall_banner", "").replace("_banner", "");
+        int baseColor = dyeColor(baseName);
+        if (blockEntity != null) {
+            Object legacyBase = first(blockEntity.data(), "Base", "base");
+            if (legacyBase instanceof Number number) baseColor = dyeColor(number.intValue());
+        }
+        BufferedImage result = tintMask(resources.texture("minecraft:entity/banner/base"), baseColor);
+        List<?> patterns = blockEntity == null ? null : nbtList(first(blockEntity.data(), "patterns", "Patterns"));
+        if (patterns == null) return result;
+
+        for (Object value : patterns) {
+            Map<String, Object> pattern = nbtCompound(value);
+            if (pattern == null) continue;
+            String id = string(first(pattern, "pattern", "Pattern"));
+            String texture = bannerPattern(id);
+            if (texture == null || !resources.hasTexture("minecraft:entity/banner/" + texture)) continue;
+            Object colorValue = first(pattern, "color", "Color");
+            int color = colorValue instanceof Number number ? dyeColor(number.intValue()) : dyeColor(String.valueOf(colorValue));
+            BufferedImage layer = tintMask(resources.texture("minecraft:entity/banner/" + texture), color);
+            java.awt.Graphics2D graphics = result.createGraphics();
+            graphics.drawImage(layer, 0, 0, result.getWidth(), result.getHeight(), null);
+            graphics.dispose();
+        }
+        return result;
+    }
+
+    private static BufferedImage tintMask(BufferedImage source, int color) {
+        BufferedImage target = new BufferedImage(source.getWidth(), source.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        int red = color >> 16 & 255, green = color >> 8 & 255, blue = color & 255;
+        for (int y = 0; y < source.getHeight(); y++) for (int x = 0; x < source.getWidth(); x++) {
+            int pixel = source.getRGB(x, y);
+            int alpha = pixel >>> 24;
+            int luminance = ((pixel >> 16 & 255) + (pixel >> 8 & 255) + (pixel & 255)) / 3;
+            target.setRGB(x, y, alpha << 24 | red * luminance / 255 << 16 | green * luminance / 255 << 8 | blue * luminance / 255);
+        }
+        return target;
+    }
+
+    private static int dyeColor(String name) {
+        if (name == null) return 0xf9fffe;
+        String normalized = name.toLowerCase(Locale.ROOT).replace("minecraft:", "");
+        return switch (normalized) {
+            case "orange" -> 0xf9801d;
+            case "magenta" -> 0xc74ebd;
+            case "light_blue" -> 0x3ab3da;
+            case "yellow" -> 0xfed83d;
+            case "lime" -> 0x80c71f;
+            case "pink" -> 0xf38baa;
+            case "gray" -> 0x474f52;
+            case "light_gray", "silver" -> 0x9d9d97;
+            case "cyan" -> 0x169c9c;
+            case "purple" -> 0x8932b8;
+            case "blue" -> 0x3c44aa;
+            case "brown" -> 0x835432;
+            case "green" -> 0x5e7c16;
+            case "red" -> 0xb02e26;
+            case "black" -> 0x1d1d21;
+            default -> 0xf9fffe;
+        };
+    }
+
+    private static int dyeColor(int id) {
+        String[] names = {"white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
+            "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black"};
+        return dyeColor(names[Math.max(0, Math.min(names.length - 1, id))]);
+    }
+
+    private static String bannerPattern(String id) {
+        if (id == null) return null;
+        String path = id.toLowerCase(Locale.ROOT).replace("minecraft:", "");
+        return switch (path) {
+            case "bs" -> "stripe_bottom";
+            case "ts" -> "stripe_top";
+            case "ls" -> "stripe_left";
+            case "rs" -> "stripe_right";
+            case "cs" -> "stripe_center";
+            case "ms" -> "stripe_middle";
+            case "drs" -> "stripe_downright";
+            case "dls" -> "stripe_downleft";
+            case "ss" -> "small_stripes";
+            case "cr" -> "cross";
+            case "sc" -> "straight_cross";
+            case "ld" -> "diagonal_left";
+            case "rud" -> "diagonal_up_right";
+            case "lud" -> "diagonal_up_left";
+            case "rd" -> "diagonal_right";
+            case "vh" -> "half_vertical";
+            case "vhr" -> "half_vertical_right";
+            case "hh" -> "half_horizontal";
+            case "hhb" -> "half_horizontal_bottom";
+            case "bl" -> "square_bottom_left";
+            case "br" -> "square_bottom_right";
+            case "tl" -> "square_top_left";
+            case "tr" -> "square_top_right";
+            case "bt" -> "triangle_bottom";
+            case "tt" -> "triangle_top";
+            case "bts" -> "triangles_bottom";
+            case "tts" -> "triangles_top";
+            case "mc" -> "circle";
+            case "mr" -> "rhombus";
+            case "bo" -> "border";
+            case "cbo" -> "curly_border";
+            case "bri" -> "bricks";
+            case "gra" -> "gradient";
+            case "gru" -> "gradient_up";
+            case "cre" -> "creeper";
+            case "sku" -> "skull";
+            case "flo" -> "flower";
+            case "moj" -> "mojang";
+            case "glb" -> "globe";
+            default -> path;
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> nbtCompound(Object value) {
+        return value instanceof Map<?, ?> map ? (Map<String, Object>) map : null;
+    }
+
+    private static List<?> nbtList(Object value) {
+        return value instanceof List<?> list ? list : null;
+    }
+
+    private static Object first(Map<String, Object> values, String... keys) {
+        if (values == null) return null;
+        for (String key : keys) if (values.containsKey(key)) return values.get(key);
+        return null;
+    }
+
+    private static String string(Object value) {
+        return value instanceof String text ? text : null;
     }
 
     private BakedModel fluidModel(Litematic.BlockState state, boolean water) {
@@ -336,9 +651,26 @@ final class ModelResolver {
 
     private List<ModelRef> blockStateModels(Litematic.BlockState state) {
         Identifier block = Identifier.parse(state.name());
+        if (block.namespace.equals("minecraft") && block.path.equals("grass")) {
+            return List.of(new ModelRef("minecraft:block/short_grass", 0, 0, false));
+        }
+        if (block.namespace.equals("minecraft") && block.path.equals("deepslate") && !state.properties().containsKey("axis")) {
+            return List.of(new ModelRef("minecraft:block/deepslate", 0, 0, false));
+        }
+        if (block.namespace.equals("minecraft") && block.path.equals("chain")) {
+            String axis = state.properties().getOrDefault("axis", "y");
+            return switch (axis) {
+                case "x" -> List.of(new ModelRef("minecraft:block/iron_chain", 90, 90, false));
+                case "z" -> List.of(new ModelRef("minecraft:block/iron_chain", 90, 0, false));
+                default -> List.of(new ModelRef("minecraft:block/iron_chain", 0, 0, false));
+            };
+        }
         String path = "assets/" + block.namespace + "/blockstates/" + block.path + ".json";
         JsonObject root = resources.json(path).filter(JsonElement::isJsonObject).map(JsonElement::getAsJsonObject).orElse(null);
-        if (root == null) return List.of();
+        if (root == null) {
+            diagnostic(state, "missing blockstate JSON");
+            return List.of();
+        }
         List<ModelRef> result = new ArrayList<>();
 
         JsonObject variants = object(root.get("variants"));
@@ -397,6 +729,8 @@ final class ModelResolver {
                 JsonObject face = object(faceEntry.getValue());
                 if (direction == null || face == null || !face.has("texture")) continue;
                 String textureId = resolveTexture(model.textures(), face.get("texture").getAsString());
+                if (textureId == null) diagnostic(state, "unresolved texture reference");
+                else if (!resources.hasTexture(textureId)) diagnostic(state, "missing texture: " + textureId);
                 BufferedImage texture = textureId == null ? resources.missingTexture() : resources.texture(textureId);
                 double[] uv = face.has("uv") ? vector(face.get("uv"), defaultUv(direction, from, to)) : defaultUv(direction, from, to);
                 int uvRotation = integer(face, "rotation", 0);
@@ -425,7 +759,10 @@ final class ModelResolver {
 
         String path = "assets/" + id.namespace + "/models/" + id.path + ".json";
         JsonObject root = resources.json(path).filter(JsonElement::isJsonObject).map(JsonElement::getAsJsonObject).orElse(null);
-        if (root == null) return null;
+        if (root == null) {
+            diagnostic(rawId, "missing model JSON");
+            return null;
+        }
         ModelData parent = root.has("parent") ? model(root.get("parent").getAsString(), stack) : null;
         Map<String, String> textures = new LinkedHashMap<>();
         if (parent != null) textures.putAll(parent.textures());

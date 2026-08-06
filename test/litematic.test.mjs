@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { gzipSync } from 'node:zlib'
-import { enforceCacheLimit, formatLitematicMetadata, hashRenderConfiguration, parseLitematic, parseLitematicMetadata, renderSchematic, resolveSendOptions, sendImages } from '../lib/index.js'
+import { cacheNameSegment, enforceCacheLimit, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, renderSchematic, resolveSendOptions, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
 
 const short = (value) => { const data = Buffer.alloc(2); data.writeUInt16BE(value); return data }
 const int = (value) => { const data = Buffer.alloc(4); data.writeInt32BE(value); return data }
@@ -42,10 +42,11 @@ function sampleLitematic() {
 test('parses packed Litematica block states and renders two opposite isometric PNGs', () => {
   const blocks = parseLitematic(sampleLitematic(), 10)
   assert.deepEqual(blocks, [{ x: 1, y: 0, z: 0, name: 'minecraft:diamond_block' }])
+  assert.deepEqual(parseLitematic(sampleLitematic(), 0), blocks)
   const images = renderSchematic(blocks, {
     maxFileSize: 1024 * 1024, outputSize: 256, cellSize: 8, isometricCellSize: 7,
     background: '#182026', transparentBackground: false, sendAsForward: true,
-    maxBlocks: 10, renderTimeout: 1000, cacheDirectory: '.', gpuRendererCommand: '',
+    renderTimeout: 1000, cacheDirectory: '.', gpuRendererCommand: '',
     renderEngine: 'cpu', javaBridgeDirectory: '.', javaRenderTimeout: 10000,
     javaResolution: 256, javaSupersampling: 1, webglQuality: 'standard',
     webglWidth: 256, webglHeight: 256, isometricSquare: true, isometricFill: 0.78,
@@ -105,6 +106,21 @@ test('uses a different cache folder when image settings change', () => {
   assert.notEqual(hashRenderConfiguration(baseline), hashRenderConfiguration({ ...baseline, transparentBackground: true }))
 })
 
+test('accepts Java 21+ and applies bounded-memory JVM options', () => {
+  assert.equal(supportsStandaloneJavaVersion(20), false)
+  assert.equal(supportsStandaloneJavaVersion(21), true)
+  assert.equal(supportsStandaloneJavaVersion(25), true)
+  assert.deepEqual(standaloneJvmOptions(2048), [
+    '-Xms128m', '-Xmx2048m', '-XX:+UseG1GC', '-XX:+UseStringDeduplication', '-XX:+ExitOnOutOfMemoryError',
+  ])
+  assert.ok(standaloneJvmOptions(64).includes('-Xmx128m'))
+  assert.ok(standaloneJvmOptions(100000).includes('-Xmx32768m'))
+  assert.equal(isJavaMemoryFailure('java.lang.OutOfMemoryError: Java heap space', 3), true)
+  assert.equal(isJavaMemoryFailure('Native memory allocation (malloc) failed', 1), true)
+  assert.equal(isJavaMemoryFailure('', 137), true)
+  assert.equal(isJavaMemoryFailure('Invalid command line option', 1), false)
+})
+
 test('resolves the last matching per-group send override', () => {
   const config = {
     sendAsForward: true,
@@ -115,9 +131,9 @@ test('resolves the last matching per-group send override', () => {
       { groupId: '456', sendMode: 'combined', replyAndMention: 'disabled' },
     ],
   }
-  assert.deepEqual(resolveSendOptions(config, '123'), { sendMode: 'combined', replyAndMention: true })
-  assert.deepEqual(resolveSendOptions(config, '456'), { sendMode: 'combined', replyAndMention: false })
-  assert.deepEqual(resolveSendOptions(config, '789'), { sendMode: 'forward', replyAndMention: false })
+  assert.deepEqual(resolveSendOptions(config, '123'), { sendMode: 'combined', replyAndMention: true, showViewTitles: false })
+  assert.deepEqual(resolveSendOptions(config, '456'), { sendMode: 'combined', replyAndMention: false, showViewTitles: false })
+  assert.deepEqual(resolveSendOptions(config, '789'), { sendMode: 'forward', replyAndMention: false, showViewTitles: false })
 })
 
 test('sends two images and metadata as one combined message with optional reply and mention', async () => {
@@ -132,11 +148,17 @@ test('sends two images and metadata as one combined message with optional reply 
   ], '投影信息', { sendMode: 'combined', replyAndMention: true })
 
   assert.equal(sent.length, 1)
-  assert.deepEqual(sent[0].map(element => element.type), ['quote', 'at', 'text', 'text', 'img', 'text', 'img', 'text'])
+  assert.deepEqual(sent[0].map(element => element.type), ['quote', 'at', 'text', 'img', 'img', 'text'])
   assert.equal(sent[0].at(-1).attrs.content, '\n投影信息')
 })
 
-test('keeps forward delivery and sends a reply notice separately when requested', async () => {
+test('keeps Chinese projection names in cache folders and formats size-limit errors', () => {
+  assert.equal(cacheNameSegment('城堡 主楼?.litematic'), '城堡 主楼_')
+  assert.equal(formatRenderError(new Error('文件超过 1 MB 限制'), { maxFileSize: 2 * 1024 }), '文件大小超过 2.00 MB，不渲染。')
+  assert.equal(formatRenderError(new Error('独立 Java 渲染器不存在：C:\\private\\renderer.jar'), { maxFileSize: 1024 }), '独立渲染器不可用，请重装插件或检查 Java 渲染配置。')
+})
+
+test('sends forward content before one concise result mention', async () => {
   const sent = []
   const session = {
     selfId: 'bot', userId: 'user', messageId: 'message',
@@ -148,6 +170,7 @@ test('keeps forward delivery and sends a reply notice separately when requested'
   ], '投影信息', { sendMode: 'forward', replyAndMention: true })
 
   assert.equal(sent.length, 2)
-  assert.deepEqual(sent[0].map(element => element.type), ['quote', 'at', 'text', 'text'])
-  assert.equal(sent[1].type, 'figure')
+  assert.equal(sent[0].type, 'figure')
+  assert.deepEqual(sent[1].map(element => element.type), ['at', 'text'])
+  assert.equal(sent[1][1].attrs.content, '渲染结果如上')
 })

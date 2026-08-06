@@ -32,6 +32,7 @@ final class SoftwareRenderer {
     private final ModelResolver models;
     private final EntityModelResolver entityModels;
     private final Map<Position, Litematic.BlockState> blocks = new HashMap<>();
+    private final Map<Position, Litematic.BlockEntity> blockEntities = new HashMap<>();
     private final Vec3 light = new Vec3(-0.35, 0.86, -0.38).normalized();
 
     SoftwareRenderer(Litematic schematic, ModelResolver models, EntityModelResolver entityModels) {
@@ -39,6 +40,9 @@ final class SoftwareRenderer {
         this.models = models;
         this.entityModels = entityModels;
         for (Litematic.Block block : schematic.blocks()) blocks.put(new Position(block.x(), block.y(), block.z()), block.state());
+        for (Litematic.BlockEntity entity : schematic.blockEntities()) {
+            blockEntities.put(new Position(entity.x(), entity.y(), entity.z()), entity);
+        }
     }
 
     void render(Settings settings, double rotation, Path output) throws IOException {
@@ -52,7 +56,7 @@ final class SoftwareRenderer {
         List<PendingQuad> translucent = new ArrayList<>();
 
         for (Litematic.Block block : schematic.blocks()) {
-            BakedModel model = models.resolve(block.state());
+            BakedModel model = models.resolve(block.state(), blockEntities.get(new Position(block.x(), block.y(), block.z())));
             for (Quad quad : model.quads()) {
                 if (hiddenByNeighbor(block, quad.cullFace())) continue;
                 int tint = tint(block.state(), quad.tintIndex());

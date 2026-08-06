@@ -25,12 +25,108 @@ final class EntityModelResolver {
     }
 
     BakedModel resolve(Litematic.Entity entity) {
+        if (entity.id().equals("minecraft:item_frame") || entity.id().equals("minecraft:glow_item_frame")) {
+            String key = entity.id() + ":" + facing(entity) + ":" + itemId(entity);
+            return models.computeIfAbsent(key, ignored -> itemFrame(entity));
+        }
         if (entity.id().equals("minecraft:hopper_minecart")) {
             String key = entity.id() + ":" + Float.floatToIntBits(entity.yaw());
             return models.computeIfAbsent(key, ignored -> hopperMinecart(entity.yaw()));
         }
         if (warned.add(entity.id())) System.err.println("Unsupported entity renderer: " + entity.id());
         return new BakedModel(List.of());
+    }
+
+    private BakedModel itemFrame(Litematic.Entity entity) {
+        List<Quad> quads = new ArrayList<>();
+        double yaw = facingYaw(facing(entity));
+        double pitch = facingPitch(facing(entity));
+        BufferedImage wood = resources.texture("minecraft:block/birch_planks");
+        BufferedImage back = resources.texture(entity.id().equals("minecraft:glow_item_frame")
+            ? "minecraft:block/glow_item_frame" : "minecraft:block/item_frame");
+        addBox(quads, wood, new Vec3(-0.5, -0.5, -0.06), new Vec3(0.5, -0.375, 0.06), yaw, pitch);
+        addBox(quads, wood, new Vec3(-0.5, 0.375, -0.06), new Vec3(0.5, 0.5, 0.06), yaw, pitch);
+        addBox(quads, wood, new Vec3(-0.5, -0.375, -0.06), new Vec3(-0.375, 0.375, 0.06), yaw, pitch);
+        addBox(quads, wood, new Vec3(0.375, -0.375, -0.06), new Vec3(0.5, 0.375, 0.06), yaw, pitch);
+        addBox(quads, back, new Vec3(-0.375, -0.375, -0.065), new Vec3(0.375, 0.375, -0.02), yaw, pitch);
+
+        String item = itemId(entity);
+        if (item != null) {
+            String textureId = itemTexture(item);
+            BufferedImage itemTexture = resources.hasTexture(textureId) ? resources.texture(textureId)
+                : resources.texture("minecraft:block/" + item.substring(item.indexOf(':') + 1));
+            addPlane(quads, itemTexture, new Vec3(-0.30, -0.30, 0.075), new Vec3(0.30, 0.30, 0.075), yaw, pitch);
+        }
+        return new BakedModel(List.copyOf(quads));
+    }
+
+    private static String itemTexture(String item) {
+        int separator = item.indexOf(':');
+        String namespace = separator < 0 ? "minecraft" : item.substring(0, separator);
+        String path = separator < 0 ? item : item.substring(separator + 1);
+        return namespace + ":item/" + path;
+    }
+
+    private static int facing(Litematic.Entity entity) {
+        Object value = first(entity.data(), "Facing", "facing");
+        return value instanceof Number number ? number.intValue() : 3;
+    }
+
+    private static double facingYaw(int facing) {
+        return switch (facing) { case 2 -> Math.PI; case 4 -> -Math.PI / 2; case 5 -> Math.PI / 2; default -> 0; };
+    }
+
+    private static double facingPitch(int facing) {
+        return facing == 0 ? Math.PI / 2 : facing == 1 ? -Math.PI / 2 : 0;
+    }
+
+    private static String itemId(Litematic.Entity entity) {
+        Map<String, Object> item = compound(first(entity.data(), "Item", "item"));
+        Object id = item == null ? null : first(item, "id", "Id", "name", "Name");
+        return id instanceof String value && !value.isBlank() ? value : null;
+    }
+
+    private static Object first(Map<String, Object> data, String... keys) {
+        for (String key : keys) if (data.containsKey(key)) return data.get(key);
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> compound(Object value) {
+        return value instanceof Map<?, ?> map ? (Map<String, Object>) map : null;
+    }
+
+    private static void addPlane(List<Quad> target, BufferedImage texture, Vec3 from, Vec3 to, double yaw, double pitch) {
+        Vec3[] points = {new Vec3(from.x(), from.y(), from.z()), new Vec3(to.x(), from.y(), from.z()),
+            new Vec3(to.x(), to.y(), to.z()), new Vec3(from.x(), to.y(), to.z())};
+        Vertex[] vertices = new Vertex[4];
+        double[] u = {0, 16, 16, 0}, v = {16, 16, 0, 0};
+        for (int index = 0; index < 4; index++) vertices[index] = new Vertex(transform(points[index], yaw, pitch), u[index], v[index]);
+        target.add(new Quad(vertices, texture, null, -1, false));
+    }
+
+    private static void addBox(List<Quad> target, BufferedImage texture, Vec3 from, Vec3 to, double yaw, double pitch) {
+        Vec3[] p = {new Vec3(from.x(), from.y(), from.z()), new Vec3(to.x(), from.y(), from.z()),
+            new Vec3(to.x(), to.y(), from.z()), new Vec3(from.x(), to.y(), from.z()),
+            new Vec3(from.x(), from.y(), to.z()), new Vec3(to.x(), from.y(), to.z()),
+            new Vec3(to.x(), to.y(), to.z()), new Vec3(from.x(), to.y(), to.z())};
+        addFace(target, texture, new Vec3[]{p[4], p[5], p[6], p[7]}, yaw, pitch);
+        addFace(target, texture, new Vec3[]{p[1], p[0], p[3], p[2]}, yaw, pitch);
+        addFace(target, texture, new Vec3[]{p[0], p[4], p[7], p[3]}, yaw, pitch);
+        addFace(target, texture, new Vec3[]{p[5], p[1], p[2], p[6]}, yaw, pitch);
+        addFace(target, texture, new Vec3[]{p[7], p[6], p[2], p[3]}, yaw, pitch);
+        addFace(target, texture, new Vec3[]{p[0], p[1], p[5], p[4]}, yaw, pitch);
+    }
+
+    private static void addFace(List<Quad> target, BufferedImage texture, Vec3[] points, double yaw, double pitch) {
+        Vertex[] vertices = new Vertex[4];
+        double[] u = {0, 16, 16, 0}, v = {16, 16, 0, 0};
+        for (int index = 0; index < 4; index++) vertices[index] = new Vertex(transform(points[index], yaw, pitch), u[index], v[index]);
+        target.add(new Quad(vertices, texture, null, -1));
+    }
+
+    private static Vec3 transform(Vec3 point, double yaw, double pitch) {
+        return rotateX(rotateY(point, yaw), pitch).add(0.5, 0.5, 0.5);
     }
 
     private BakedModel hopperMinecart(float yaw) {

@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-litematic-renderer",
-  "version": "0.3.9",
+  "version": "0.4.17",
   "description": "Render small Litematica schematics sent in QQ groups.",
   "author": "halfkite",
   "repository": {
@@ -17,7 +17,8 @@
     "lib",
     "assets/threeviews",
     "assets/java-bridge",
-    "assets/standalone-renderer",
+    "assets/standalone-renderer/litematic-standalone-renderer-0.2.6.jar",
+    "assets/vanilla-resources",
     "README.md"
   ],
   "keywords": [

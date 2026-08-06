@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'dev.qqbot'
-version = '0.1.7'
+version = '0.2.6'
 
 dependencies {
     implementation files('libs/gson-2.11.0.jar')
@@ -28,4 +28,11 @@ jar {
     from {
         configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
     }
+}
+
+tasks.register('smokeTest', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.qqbot.standalone.RendererSmokeTest'
+    args file('../assets/vanilla-resources/Minecraft-26.2-Vanilla-Resources.zip').absolutePath
 }

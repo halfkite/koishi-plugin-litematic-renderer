@@ -1,12 +1,15 @@
 package dev.qqbot.standalone;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executors;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 
 public final class Main {
     private Main() {}
@@ -17,7 +20,7 @@ public final class Main {
             Files.createDirectories(options.output);
             System.setProperty("java.awt.headless", "true");
             System.out.println("Reading Litematic: " + options.input);
-            Litematic schematic = Litematic.read(options.input, options.maxBlocks);
+            Litematic schematic = Litematic.read(options.input);
             System.out.println("Loaded " + schematic.blocks().size() + " non-air blocks, "
                 + schematic.blockEntities().size() + " block entities and " + schematic.entities().size() + " entities");
             if (options.debugStates) {
@@ -32,7 +35,6 @@ public final class Main {
                 System.out.println("Resource layers (low to high priority):");
                 resources.descriptions().forEach(path -> System.out.println("  " + path));
                 ModelResolver models = new ModelResolver(resources);
-                schematic.blocks().stream().map(Litematic.Block::state).distinct().forEach(models::resolve);
                 EntityModelResolver entityModels = new EntityModelResolver(resources, models);
                 SoftwareRenderer renderer = new SoftwareRenderer(schematic, models, entityModels);
                 SoftwareRenderer.Settings settings = new SoftwareRenderer.Settings(
@@ -40,24 +42,56 @@ public final class Main {
                     options.background, options.transparentBackground
                 );
 
-                try (var executor = Executors.newFixedThreadPool(2)) {
-                    var normal = executor.submit(() -> {
-                        renderer.render(settings, options.rotation, options.output.resolve("isometric.png"));
-                        return null;
-                    });
-                    var reverse = executor.submit(() -> {
-                        renderer.render(settings, options.rotation + 180, options.output.resolve("isometric-reverse.png"));
-                        return null;
-                    });
-                    normal.get();
-                    reverse.get();
-                }
+                renderer.render(settings, options.rotation, options.output.resolve("isometric.png"));
+                renderer.render(settings, options.rotation + 180, options.output.resolve("isometric-reverse.png"));
+                writeDiagnostics(options.output.resolve("render-diagnostics.json"), schematic, models);
             }
             System.out.println("Standalone render completed: " + options.output);
         } catch (Throwable throwable) {
             throwable.printStackTrace(System.err);
             System.exit(1);
         }
+    }
+
+    private static void writeDiagnostics(Path output, Litematic schematic, ModelResolver models) throws Exception {
+        Map<String, JsonObject> grouped = new LinkedHashMap<>();
+        for (ModelResolver.Diagnostic diagnostic : models.diagnostics()) {
+            JsonObject entry = new JsonObject();
+            entry.addProperty("state", diagnostic.state());
+            entry.addProperty("reason", diagnostic.reason());
+            long actualCount = schematic.blocks().stream().filter(block -> matchesState(diagnostic.state(), block.state())).count();
+            entry.addProperty("count", actualCount > 0 ? actualCount : diagnostic.count());
+            JsonArray samples = new JsonArray();
+            schematic.blocks().stream().filter(block -> matchesState(diagnostic.state(), block.state())).limit(10).forEach(block -> {
+                    JsonObject point = new JsonObject();
+                    point.addProperty("x", block.x()); point.addProperty("y", block.y()); point.addProperty("z", block.z());
+                    samples.add(point);
+                });
+            entry.add("samples", samples);
+            grouped.put(diagnostic.state() + "\u0000" + diagnostic.reason(), entry);
+        }
+        JsonObject root = new JsonObject();
+        root.addProperty("format", 2);
+        root.addProperty("generatedAt", java.time.Instant.now().toString());
+        root.addProperty("unsupportedBlockCount", grouped.size());
+        JsonArray entries = new JsonArray();
+        grouped.values().forEach(entries::add);
+        root.add("blocks", entries);
+        root.add("errors", new JsonArray());
+        Files.writeString(output, new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(root));
+    }
+
+    private static boolean matchesState(String diagnostic, Litematic.BlockState state) {
+        StringBuilder value = new StringBuilder(state.name());
+        if (!state.properties().isEmpty()) {
+            value.append('[');
+            state.properties().entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(entry -> {
+                if (value.charAt(value.length() - 1) != '[') value.append(',');
+                value.append(entry.getKey()).append('=').append(entry.getValue());
+            });
+            value.append(']');
+        }
+        return diagnostic.equals(value.toString());
     }
 
     private static final class Options {
@@ -67,7 +101,6 @@ public final class Main {
         final List<Path> resourcePacks = new ArrayList<>();
         int resolution = 1024;
         int supersampling = 2;
-        int maxBlocks = 250_000;
         double rotation = 135;
         double slant = 36;
         double fill = 0.78;
@@ -98,7 +131,6 @@ public final class Main {
                     case "--minecraft-jar" -> options.minecraftJar = Path.of(value).toAbsolutePath().normalize();
                     case "--resolution" -> options.resolution = clamp(Integer.parseInt(value), 256, 4096);
                     case "--supersampling" -> options.supersampling = clamp(Integer.parseInt(value), 1, 4);
-                    case "--max-blocks" -> options.maxBlocks = Math.max(1, Integer.parseInt(value));
                     case "--rotation" -> options.rotation = Double.parseDouble(value);
                     case "--slant" -> options.slant = Math.max(-90, Math.min(90, Double.parseDouble(value)));
                     case "--fill" -> options.fill = Math.max(0.1, Math.min(0.98, Double.parseDouble(value)));

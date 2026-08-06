@@ -6,6 +6,7 @@ lib/
 
 *.tgz
 *.zip
+!assets/vanilla-resources/*.zip
 java-smoke.job.json
 webgl-centered-isometric.png
 
@@ -30,7 +31,11 @@ webgl-centered-isometric.png
 
 /standalone-renderer/.gradle/
 /standalone-renderer/build/
+/standalone-renderer/bin/
 /standalone-renderer/libs/
 /fabric-render-bridge/.gradle/
 /fabric-render-bridge/build/
 /fabric-render-bridge/libs/
+
+/mod-builds/
+/plugin-archives/

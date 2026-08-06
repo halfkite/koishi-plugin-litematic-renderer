@@ -1,18 +1,27 @@
 import { Context, h, Schema, Session } from 'koishi'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, promises as fs } from 'node:fs'
-import { basename, extname, join, resolve } from 'node:path'
+import { basename, dirname, extname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { spawn } from 'node:child_process'
+import { ChildProcess, spawn } from 'node:child_process'
 import { deflateSync, gunzipSync } from 'node:zlib'
 
 export const name = 'litematic-renderer'
 export const inject = { optional: ['puppeteer'] }
-const CACHE_FORMAT_VERSION = 10
+const CACHE_FORMAT_VERSION = 13
 const packageVersion = (require('../package.json') as { version?: unknown }).version
 const PLUGIN_VERSION = typeof packageVersion === 'string' ? packageVersion : 'unknown'
 
 export interface Config {
+  standaloneJavaCommand: string
+  minecraftJarPath: string
+  resourcePackPaths: string[]
+  renderEngine: 'standalone' | 'java' | 'webgl' | 'cpu'
+  standaloneRendererJar: string
+  standaloneRenderTimeout: number
+  standaloneJavaMaxHeapMb: number
+  standaloneJavaRetryMaxHeapMb: number
+  standaloneJavaMemoryRestartLimit: number
   maxFileSize: number
   outputSize: number
   cellSize: number
@@ -20,20 +29,16 @@ export interface Config {
   background: string
   transparentBackground: boolean
   sendAsForward: boolean
+  showViewTitles: boolean
   replyAndMention: boolean
   groupSendOptions: GroupSendOption[]
-  maxBlocks: number
   renderTimeout: number
   cacheDirectory: string
   cacheMaxSizeGb: number
-  gpuRendererCommand: string
-  renderEngine: 'standalone' | 'java' | 'webgl' | 'cpu'
-  standaloneJavaCommand: string
-  standaloneRendererJar: string
-  standaloneRenderTimeout: number
-  minecraftJarPath: string
-  resourcePackPaths: string[]
+  diagnosticsFilePath: string
+  diagnosticsExport: string
   javaBridgeDirectory: string
+  gpuRendererCommand: string
   javaRenderTimeout: number
   javaResolution: number
   javaSupersampling: number
@@ -56,13 +61,23 @@ export interface GroupSendOption {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  maxFileSize: Schema.natural().default(1024 * 1024).description('自动处理的最大文件大小（字节）。'),
+  standaloneJavaCommand: Schema.string().default('').description('【重点】独立渲染器使用的 Java 可执行文件；推荐 Java 21+，留空自动查找，也可填写自定义路径或命令。'),
+  minecraftJarPath: Schema.string().default('').description('次要设置：可选的 Minecraft 客户端 JAR 或基础资源包；留空或路径不存在时使用插件内置的 26.2 原版资源。'),
+  resourcePackPaths: Schema.array(Schema.string()).default([]).description('次要设置：独立渲染的自定义材质包路径；默认为空，使用插件内置的 26.2 原版资源，越靠后优先级越高。'),
+  renderEngine: Schema.union([Schema.const('standalone'), Schema.const('java'), Schema.const('webgl'), Schema.const('cpu')]).default('standalone').description('渲染引擎；standalone 为无需客户端的独立 Java 资源包渲染器。'),
+  standaloneRendererJar: Schema.string().default('').description('独立渲染器 JAR；留空使用插件内置版本。'),
+  standaloneRenderTimeout: Schema.natural().min(10000).default(180000).description('独立 Java 渲染超时（毫秒）。'),
+  standaloneJavaMaxHeapMb: Schema.natural().min(128).max(32768).step(8).default(200).description('首次独立 Java 渲染的最大堆内存（MiB）。'),
+  standaloneJavaRetryMaxHeapMb: Schema.natural().min(256).max(32768).step(128).default(2048).description('首次渲染内存不足时，新 Java 进程重试使用的最大堆内存（MiB）。'),
+  standaloneJavaMemoryRestartLimit: Schema.natural().max(3).default(1).description('检测到 Java 内存不足后，启动全新进程重试的次数。'),
+  maxFileSize: Schema.natural().min(1).default(1024).description('自动处理的最大文件大小（KB）。'),
   outputSize: Schema.natural().min(128).max(4096).default(1024).description('正交视图最长边的最大像素数。'),
   cellSize: Schema.natural().min(1).max(32).default(8).description('正交投影每个方块的基础像素大小。'),
   isometricCellSize: Schema.natural().min(2).max(32).default(7).description('正二轴测方块菱形半宽。'),
   background: Schema.string().default('#000000').description('PNG 背景颜色。'),
   transparentBackground: Schema.boolean().default(false).description('输出透明背景。'),
   sendAsForward: Schema.boolean().default(false).description('默认发送方式；开启为合并转发，关闭为两张图片和信息组成一条普通消息。'),
+  showViewTitles: Schema.boolean().default(false).description('发送图片时显示正二轴测和反向正二轴测标题；默认关闭以节省空间。'),
   replyAndMention: Schema.boolean().default(false).description('默认是否引用原消息并 @ 投影发送者。'),
   groupSendOptions: Schema.array(Schema.object({
     groupId: Schema.string().description('QQ群号。'),
@@ -76,18 +91,11 @@ export const Config: Schema<Config> = Schema.object({
       Schema.const('disabled').description('关闭回复 @'),
     ]).default('inherit'),
   })).default([]).description('按群覆盖发送方式和回复 @ 设置；相同群号以最后一项为准。'),
-  maxBlocks: Schema.natural().min(1).default(250000).description('解析的非空气方块上限。'),
   renderTimeout: Schema.natural().min(1000).default(30000).description('下载与渲染超时（毫秒）。'),
   cacheDirectory: Schema.string().default('data/litematic-renderer-cache').description('持久缓存目录；按插件版本和投影 SHA-256 分区。'),
   cacheMaxSizeGb: Schema.number().min(1).max(1024).step(1).default(20).description('所有版本缓存的总上限（GiB），超出后按最久未使用清理。'),
-  gpuRendererCommand: Schema.string().default('').description('可选的可信本地 GPU 渲染器命令。'),
-  renderEngine: Schema.union([Schema.const('standalone'), Schema.const('java'), Schema.const('webgl'), Schema.const('cpu')]).default('standalone').description('standalone 为无需客户端的独立 Java 资源包渲染器；java 为 Fabric 客户端桥接。'),
-  standaloneJavaCommand: Schema.string().default('').description('独立渲染器使用的 Java 21 可执行文件；留空自动查找，也可填写自定义路径或命令。'),
-  standaloneRendererJar: Schema.string().default('').description('独立渲染器 JAR；留空使用插件内置版本。'),
-  standaloneRenderTimeout: Schema.natural().min(10000).default(180000).description('独立 Java 渲染超时（毫秒）。'),
-  minecraftJarPath: Schema.string().default('').description('提供原版 blockstate、模型和纹理的 Minecraft 客户端 JAR；留空或路径不存在时自动下载最新正式版。'),
-  resourcePackPaths: Schema.array(Schema.string()).default([]).description('独立渲染的自定义材质包路径；默认仅使用 Minecraft JAR 中的原版资源，越靠后优先级越高。'),
-  javaBridgeDirectory: Schema.string().default('').description('Fabric Java 渲染桥任务目录；使用 java 后端时填写。'),
+  diagnosticsFilePath: Schema.string().default('data/litematic-renderer-diagnostics.json').description('无法正常渲染的方块诊断持久化文件路径。'),
+  diagnosticsExport: Schema.string().default('/litematic-renderer/diagnostics').role('link').description('导出错误报告（点击下载 JSON）。'),
   javaRenderTimeout: Schema.natural().min(10000).default(180000).description('等待 Minecraft Java 渲染完成的超时（毫秒）。'),
   javaResolution: Schema.natural().min(256).max(4096).default(1024).description('Java 渲染最终输出边长。'),
   javaSupersampling: Schema.natural().min(1).max(4).default(2).description('Fabrishot 式离屏超采样倍数。'),
@@ -98,6 +106,8 @@ export const Config: Schema<Config> = Schema.object({
   isometricFill: Schema.percent().default(0.78).description('正二轴测主体在画布中的最大占比。'),
   isometricRotation: Schema.number().min(0).max(360).step(1).default(135).description('Isometric Renders 绕竖直轴的基准旋转角。'),
   isometricSlant: Schema.number().min(-90).max(90).step(1).default(36).description('Isometric Renders 俯仰角；36° 为正二轴测预设。'),
+  javaBridgeDirectory: Schema.string().default('').description('Fabric Java 渲染桥任务目录；桥接功能已隐藏，仅保留兼容配置。').hidden(),
+  gpuRendererCommand: Schema.string().default('').description('GPU 渲染器命令；高级功能已隐藏，仅保留兼容配置。').hidden(),
 })
 
 interface FileElement {
@@ -115,6 +125,8 @@ interface ImageResult { title: string, path: string }
 interface RenderedImage { title: string, png: Buffer }
 interface RenderResult { images: ImageResult[], metadata: string }
 
+const activeStandaloneJavaProcesses = new Set<ChildProcess>()
+
 export interface LitematicMetadata {
   author: string
   createdAt: string
@@ -128,6 +140,12 @@ export interface LitematicMetadata {
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger(name)
+  const maxFileSizeBytes = config.maxFileSize * 1024
+  ctx.on('dispose', () => terminateActiveStandaloneJavaProcesses(logger))
+  const diagnosticsPath = resolve(config.diagnosticsFilePath)
+  const diagnosticsArchiveDirectory = join(dirname(diagnosticsPath), 'litematic-renderer-diagnostics-archive')
+  const diagnosticsDisabledDirectory = join(dirname(diagnosticsPath), 'litematic-renderer-diagnostics-disabled')
+  void rotateDiagnosticsFile(diagnosticsPath, diagnosticsArchiveDirectory, logger)
   const cacheDirectory = resolve(config.cacheDirectory)
   const versionCacheDirectory = join(cacheDirectory, `v${cachePathSegment(PLUGIN_VERSION)}`)
   const cacheMaxBytes = Math.floor(config.cacheMaxSizeGb * 1024 ** 3)
@@ -137,11 +155,11 @@ export function apply(ctx: Context, config: Config) {
     .catch(error => logger.warn(`缓存初始化失败：${error instanceof Error ? error.message : String(error)}`))
 
   const render = async (url: string, filename = 'schematic.litematic'): Promise<RenderResult> => {
-    const bytes = await download(ctx, url, config.maxFileSize, config.renderTimeout)
+    const bytes = await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
     const metadata = formatLitematicMetadata(parseLitematicMetadata(bytes))
     const fileHash = createHash('sha256').update(bytes).digest('hex')
     const minecraftJarPath = config.renderEngine === 'standalone'
-      ? await resolveMinecraftJar(ctx, config, cacheDirectory)
+      ? await resolveMinecraftResources(config)
       : ''
     const resourceFingerprint = config.renderEngine === 'standalone'
       ? await fingerprintFiles([minecraftJarPath, ...config.resourcePackPaths])
@@ -153,7 +171,7 @@ export function apply(ctx: Context, config: Config) {
         isometricCellSize: config.isometricCellSize,
         background: config.background,
         transparentBackground: config.transparentBackground,
-        maxBlocks: config.maxBlocks,
+        showViewTitles: config.showViewTitles,
         gpuRendererCommand: config.gpuRendererCommand,
         renderEngine: config.renderEngine,
         standaloneRendererJar: config.standaloneRendererJar,
@@ -168,7 +186,8 @@ export function apply(ctx: Context, config: Config) {
         isometricRotation: config.isometricRotation,
         isometricSlant: config.isometricSlant,
       })
-    const output = join(versionCacheDirectory, `${fileHash}-${renderHash}`)
+    const projectionName = cacheNameSegment(filename)
+    const output = join(versionCacheDirectory, `${projectionName}-${fileHash}-${renderHash}`)
     const input = join(output, 'projection.litematic')
     await fs.mkdir(output, { recursive: true })
     if (!(await exists(input))) await fs.writeFile(input, bytes)
@@ -185,16 +204,18 @@ export function apply(ctx: Context, config: Config) {
       let task = inFlight.get(output)
       if (!task) {
         task = (async () => {
+          try {
           if ((await Promise.all(expected.map(exists))).every(Boolean)) return
           const gpuSucceeded = Boolean(config.gpuRendererCommand
             && await renderWithGpu(config.gpuRendererCommand, input, output, config.renderTimeout, logger))
           if (!gpuSucceeded || !(await Promise.all(expected.map(exists))).every(Boolean)) {
             if (config.renderEngine === 'standalone') {
-              await renderWithStandalone(input, output, minecraftJarPath, config)
+              await renderWithStandalone(input, output, minecraftJarPath, config, logger)
+              await mergeRenderDiagnostics(output, config.diagnosticsFilePath, logger)
             } else if (config.renderEngine === 'java') {
               await renderWithJavaBridge(input, output, config)
             } else {
-              const schematic = parseLitematic(bytes, config.maxBlocks)
+              const schematic = parseLitematic(bytes)
               let images: RenderedImage[]
               if (config.renderEngine === 'webgl' && (ctx as any).puppeteer) {
                 try {
@@ -210,6 +231,10 @@ export function apply(ctx: Context, config: Config) {
             }
           }
           if (!(await Promise.all(expected.map(exists))).every(Boolean)) throw new Error('渲染器没有生成两张正二轴测 PNG')
+          } catch (error) {
+            await appendRenderError(output, config.diagnosticsFilePath, config.renderEngine, error, logger)
+            throw error
+          }
         })().finally(() => inFlight.delete(output))
         inFlight.set(output, task)
       } else {
@@ -231,12 +256,23 @@ export function apply(ctx: Context, config: Config) {
     if (!session.guildId) return next()
     const file = findLitematicFile(session)
     const url = file && await resolveFileUrl(session, file)
-    if (!url || !file || !isUnderLimit(file.size, config.maxFileSize)) return next()
+    if (!url || !file) return next()
+    if (isOverLimit(file.size, maxFileSizeBytes)) {
+      await appendGlobalRenderError(config.diagnosticsFilePath, `input:${basename(file.name ?? 'unknown')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
+      await session.send([...replyElements(session), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
+      return next()
+      await session.send(`文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。`)
+      return next()
+    }
+    if (!isUnderLimit(file.size, maxFileSizeBytes)) return next()
     try {
       const result = await render(url, file.name)
       await sendImages(session, result.images, result.metadata, resolveSendOptions(config, session.guildId))
     } catch (error) {
       logger.warn(error)
+      await session.send([...replyElements(session), h('text', { content: formatRenderError(error, config) })])
+      return next()
+      // @ts-expect-error unreachable legacy error text is retained for compatibility
       await session.send(`投影渲染失败：${error instanceof Error ? error.message : String(error)}`)
     }
     return next()
@@ -250,6 +286,8 @@ export function apply(ctx: Context, config: Config) {
         const result = await render(url)
         await sendImages(session, result.images, result.metadata, resolveSendOptions(config, session.guildId))
       } catch (error) {
+        return formatRenderError(error, config)
+        // @ts-expect-error unreachable legacy error text is retained for compatibility
         return `渲染失败：${error instanceof Error ? error.message : String(error)}`
       }
     })
@@ -259,6 +297,18 @@ export function apply(ctx: Context, config: Config) {
       await fs.mkdir(versionCacheDirectory, { recursive: true })
       return '投影渲染缓存已清理。'
     })
+  ctx.command('litematic.errors.export', 'export render diagnostics', { authority: 3 })
+    .action(async () => `Diagnostics file: ${resolve(config.diagnosticsFilePath)}`)
+  ctx.command('litematic.errors.disable', 'disable current render diagnostics snapshot', { authority: 3 })
+    .action(async () => disableDiagnosticsSnapshot(diagnosticsPath, diagnosticsDisabledDirectory))
+  const server = (ctx as any).server
+  if (server?.get) {
+    server.get('/litematic-renderer/diagnostics', async (koa: any) => {
+      koa.type = 'application/json'
+      koa.set('Content-Disposition', 'attachment; filename=\"litematic-renderer-diagnostics.json\"')
+      koa.body = await fs.readFile(resolve(config.diagnosticsFilePath), 'utf8').catch(() => '{\"format\":2,\"blocks\":[],\"errors\":[]}')
+    })
+  }
 }
 
 interface CacheMetadata {
@@ -276,6 +326,14 @@ export function hashRenderConfiguration(configuration: unknown) {
 
 function cachePathSegment(value: string) {
   return value.replace(/[^a-zA-Z0-9._-]/g, '_') || 'unknown'
+}
+
+export function cacheNameSegment(filename: string) {
+  const name = basename(filename || 'schematic.litematic', extname(filename || ''))
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .trim()
+  return (name || 'schematic').slice(0, 80)
 }
 
 async function ensureCacheMetadata(directory: string, metadata: CacheMetadata) {
@@ -412,9 +470,15 @@ async function resolveStandaloneJavaCommand(configuredCommand: string) {
   candidates.add('java')
 
   for (const candidate of candidates) {
-    if (await javaMajorVersion(candidate) === 21) return candidate
+    if (supportsStandaloneJavaVersion(await javaMajorVersion(candidate))) return candidate
   }
-  throw new Error('未找到 Java 21；请安装 Java 21，设置 JAVA_HOME，或填写 standaloneJavaCommand')
+  throw new Error('未找到 Java 21+；请安装 Java 21 或更高版本，设置 JAVA_HOME，或填写 standaloneJavaCommand')
+}
+
+function isOverLimit(size: string | number | undefined, limit: number) {
+  if (size == null || size === '') return false
+  const numeric = Number(size)
+  return Number.isFinite(numeric) && numeric > limit
 }
 
 async function javaMajorVersion(command: string) {
@@ -443,94 +507,130 @@ async function javaMajorVersion(command: string) {
   })
 }
 
-interface MinecraftVersionManifest {
-  latest?: { release?: string }
-  versions?: Array<{ id?: string, url?: string }>
+export function supportsStandaloneJavaVersion(version: number | undefined) {
+  return version !== undefined && version >= 21
 }
 
-interface MinecraftVersionDetails {
-  downloads?: { client?: { url?: string, sha1?: string, size?: number } }
+export function standaloneJvmOptions(maxHeapMb: number) {
+  const heap = Math.max(128, Math.min(32768, Math.floor(maxHeapMb)))
+  return [
+    '-Xms128m',
+    `-Xmx${heap}m`,
+    '-XX:+UseG1GC',
+    '-XX:+UseStringDeduplication',
+    '-XX:+ExitOnOutOfMemoryError',
+  ]
 }
 
-async function resolveMinecraftJar(ctx: Context, config: Config, cacheDirectory: string) {
+export function isJavaMemoryFailure(output: string, exitCode?: number | null) {
+  if (exitCode === 137) return true
+  return /outofmemoryerror|java heap space|gc overhead limit|cannot reserve enough space|native memory allocation|insufficient memory|malloc failed|os::commit_memory/i.test(output)
+}
+
+async function resolveMinecraftResources(config: Config) {
   const configuredPath = config.minecraftJarPath.trim()
   if (configuredPath && await exists(resolve(configuredPath))) return resolve(configuredPath)
-
-  const manifestUrl = 'https://launchermeta.mojang.com/mc/game/version_manifest_v2.json'
-  const manifest = await ctx.http.get<MinecraftVersionManifest>(manifestUrl, { timeout: config.renderTimeout })
-  const releaseId = manifest.latest?.release
-  const release = manifest.versions?.find(version => version.id === releaseId)
-  if (!releaseId || !release?.url) throw new Error('无法从 Minecraft 官方版本清单获取最新正式版')
-
-  const details = await ctx.http.get<MinecraftVersionDetails>(release.url, { timeout: config.renderTimeout })
-  const client = details.downloads?.client
-  if (!client?.url || !client.sha1 || !client.size) throw new Error(`Minecraft ${releaseId} 官方客户端文件信息不完整`)
-
-  const target = join(cacheDirectory, 'minecraft-client', `${releaseId}.jar`)
-  if (await exists(target)) return target
-  if (client.size > 100 * 1024 * 1024) throw new Error(`Minecraft ${releaseId} 客户端文件超过 100 MiB 安全限制`)
-
-  const response = await ctx.http.get<ArrayBuffer>(client.url, { responseType: 'arraybuffer', timeout: config.standaloneRenderTimeout })
-  const bytes = Buffer.from(response)
-  if (bytes.byteLength !== client.size) throw new Error(`Minecraft ${releaseId} 客户端文件大小校验失败`)
-  if (createHash('sha1').update(bytes).digest('hex') !== client.sha1) {
-    throw new Error(`Minecraft ${releaseId} 客户端文件 SHA-1 校验失败`)
-  }
-
-  await fs.mkdir(join(cacheDirectory, 'minecraft-client'), { recursive: true })
-  const temporary = `${target}.${randomUUID()}.tmp`
-  await fs.writeFile(temporary, bytes)
-  try {
-    await fs.rename(temporary, target)
-  } catch (error) {
-    await fs.rm(temporary, { force: true })
-    if (!(await exists(target))) throw error
-  }
-  return target
+  const bundled = resolve(join(__dirname, '../assets/vanilla-resources/Minecraft-26.2-Vanilla-Resources.zip'))
+  if (!(await exists(bundled))) throw new Error(`插件内置的 Minecraft 26.2 原版资源包不存在：${bundled}`)
+  return bundled
 }
 
-async function renderWithStandalone(input: string, output: string, minecraftJarPath: string, config: Config) {
-  const rendererJar = resolve(config.standaloneRendererJar || join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.1.7.jar'))
+async function renderWithStandalone(input: string, output: string, minecraftJarPath: string, config: Config,
+                                    logger: ReturnType<Context['logger']>) {
+  const rendererJar = resolve(config.standaloneRendererJar || join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.2.6.jar'))
   if (!(await exists(rendererJar))) throw new Error(`独立 Java 渲染器不存在：${rendererJar}`)
   if (!(await exists(minecraftJarPath))) throw new Error(`Minecraft 资源 JAR 不存在：${minecraftJarPath}`)
   for (const pack of config.resourcePackPaths) {
     if (!(await exists(resolve(pack)))) throw new Error(`材质包不存在：${pack}`)
   }
 
-  const args = [
+  const rendererArgs = [
     '-Djava.awt.headless=true', '-jar', rendererJar,
     '--input', resolve(input), '--output', resolve(output),
     '--minecraft-jar', minecraftJarPath,
     '--resolution', String(config.javaResolution),
     '--supersampling', String(config.javaSupersampling),
-    '--max-blocks', String(config.maxBlocks),
     '--rotation', String(config.isometricRotation),
     '--slant', String(config.isometricSlant),
     '--fill', String(config.isometricFill),
     '--background', config.background,
   ]
-  if (config.transparentBackground) args.push('--transparent-background')
-  for (const pack of config.resourcePackPaths) args.push('--resource-pack', resolve(pack))
+  if (config.transparentBackground) rendererArgs.push('--transparent-background')
+  for (const pack of config.resourcePackPaths) rendererArgs.push('--resource-pack', resolve(pack))
   const javaCommand = await resolveStandaloneJavaCommand(config.standaloneJavaCommand)
 
-  await new Promise<void>((resolveRun, reject) => {
-    const child = spawn(javaCommand, args, { shell: false, windowsHide: true })
+  for (let attempt = 0; attempt <= config.standaloneJavaMemoryRestartLimit; attempt++) {
+    const heap = attempt === 0 ? config.standaloneJavaMaxHeapMb : config.standaloneJavaRetryMaxHeapMb
+    const result = await runStandaloneJava(javaCommand, [...standaloneJvmOptions(heap), ...rendererArgs], config.standaloneRenderTimeout)
+    if (result.code === 0) return
+    const memoryFailure = isJavaMemoryFailure(result.stderr, result.code)
+    if (memoryFailure && attempt < config.standaloneJavaMemoryRestartLimit) {
+      logger.warn(`独立 Java 渲染超出 ${config.standaloneJavaMaxHeapMb} MiB 堆内存限制；正在启动全新进程重试（${attempt + 1}/${config.standaloneJavaMemoryRestartLimit}）`)
+      await Promise.all(['isometric.png', 'isometric-reverse.png'].map(file => fs.rm(join(output, file), { force: true })))
+      continue
+    }
+    const memoryHint = memoryFailure
+      ? `；Java 内存不足（最大堆 ${config.standaloneJavaMaxHeapMb} MiB，已重启 ${attempt} 次）`
+      : ''
+    throw new Error(`独立 Java 渲染器退出码 ${result.code}${memoryHint}${result.stderr ? `：${result.stderr.trim()}` : ''}`)
+  }
+}
+
+async function runStandaloneJava(command: string, args: string[], timeout: number) {
+  return new Promise<{ code: number | null, stderr: string }>((resolveRun, reject) => {
+    const child = spawn(command, args, { shell: false, windowsHide: true })
+    activeStandaloneJavaProcesses.add(child)
     let stderr = ''
+    let settled = false
+    const cleanup = () => activeStandaloneJavaProcesses.delete(child)
     child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-6000) })
     const timer = setTimeout(() => {
-      child.kill()
-      reject(new Error(`独立 Java 渲染超过 ${Math.round(config.standaloneRenderTimeout / 1000)} 秒`))
-    }, config.standaloneRenderTimeout)
+      if (settled) return
+      settled = true
+      void (async () => {
+        await terminateStandaloneJavaProcess(child)
+        cleanup()
+        reject(new Error('Standalone Java render timed out; process terminated and memory reclaimed'))
+      })()
+      return
+      reject(new Error(`独立 Java 渲染超过 ${Math.round(timeout / 1000)} 秒；Java 进程已终止并回收内存`))
+    }, timeout)
     child.once('error', error => {
+      if (settled) return
+      settled = true
       clearTimeout(timer)
+      void terminateStandaloneJavaProcess(child)
+      cleanup()
       reject(error)
     })
     child.once('close', code => {
+      if (settled) return
+      settled = true
       clearTimeout(timer)
-      if (code === 0) resolveRun()
-      else reject(new Error(`独立 Java 渲染器退出码 ${code}${stderr ? `：${stderr.trim()}` : ''}`))
+      cleanup()
+      resolveRun({ code, stderr })
     })
   })
+}
+
+async function terminateStandaloneJavaProcess(child: ChildProcess) {
+  const pid = child.pid
+  if (!pid) return
+  if (process.platform === 'win32') {
+    await new Promise<void>(resolveTaskkill => {
+      const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true })
+      killer.once('close', () => resolveTaskkill())
+      killer.once('error', () => resolveTaskkill())
+    })
+  }
+  if (child.exitCode == null && !child.killed) child.kill()
+}
+
+async function terminateActiveStandaloneJavaProcesses(logger: ReturnType<Context['logger']>) {
+  const processes = [...activeStandaloneJavaProcesses]
+  if (!processes.length) return
+  await Promise.all(processes.map(process => terminateStandaloneJavaProcess(process)))
+  logger.info(`已终止 ${processes.length} 个独立渲染 Java 进程并回收其子进程`)
 }
 
 interface JavaBridgeStatus {
@@ -605,6 +705,108 @@ async function readJson<T>(path: string): Promise<T | undefined> {
   }
 }
 
+async function mergeRenderDiagnostics(output: string, destination: string, logger: ReturnType<Context['logger']>) {
+  const sourcePath = join(output, 'render-diagnostics.json')
+  const source = await readJson<any>(sourcePath)
+  if (!source) return
+  const targetPath = resolve(destination)
+  const existing = await readJson<any>(targetPath) ?? { format: 2, generatedAt: new Date().toISOString(), blocks: [], errors: [] }
+  const entries = new Map<string, any>()
+  for (const entry of existing.blocks ?? []) entries.set(`${entry.state}\u0000${entry.reason}`, entry)
+  for (const entry of source.blocks ?? []) {
+    const key = `${entry.state}\u0000${entry.reason}`
+    const previous = entries.get(key)
+    if (!previous) entries.set(key, { ...entry, samples: entry.samples ?? [] })
+    else {
+      previous.count = Number(previous.count ?? 0) + Number(entry.count ?? 0)
+      previous.samples = [...(previous.samples ?? []), ...(entry.samples ?? [])].slice(0, 20)
+    }
+  }
+  const errors = new Map<string, any>()
+  for (const entry of existing.errors ?? []) errors.set(`${entry.renderId}\u0000${entry.engine}\u0000${entry.message}`, entry)
+  for (const entry of source.errors ?? []) {
+    const key = `${entry.renderId}\u0000${entry.engine}\u0000${entry.message}`
+    const previous = errors.get(key)
+    if (!previous) errors.set(key, { ...entry })
+    else previous.count = Number(previous.count ?? 0) + Number(entry.count ?? 0)
+  }
+  const result = { format: 2, pluginVersion: PLUGIN_VERSION, generatedAt: new Date().toISOString(), blocks: [...entries.values()], errors: [...errors.values()] }
+  await fs.mkdir(resolve(destination, '..'), { recursive: true }).catch(() => undefined)
+  await fs.writeFile(targetPath, JSON.stringify(result, null, 2) + '\n')
+  logger.warn(`记录 ${source.blocks?.length ?? 0} 类无法正常渲染的方块；诊断已保存到 ${targetPath}`)
+}
+
+async function rotateDiagnosticsFile(path: string, archiveDirectory: string, logger: ReturnType<Context['logger']>) {
+  const document = await readJson<any>(path)
+  if (!document || document.pluginVersion === PLUGIN_VERSION) return
+  await fs.mkdir(archiveDirectory, { recursive: true })
+  const oldVersion = cachePathSegment(typeof document.pluginVersion === 'string' ? document.pluginVersion : 'legacy')
+  const stamp = formatDiagnosticsTimestamp(new Date())
+  const target = join(archiveDirectory, `litematic-renderer-diagnostics-v${oldVersion}-${stamp}.json`)
+  await fs.rename(path, target)
+  logger.info(`已将旧版诊断汇总归档到 ${target}`)
+}
+
+async function disableDiagnosticsSnapshot(path: string, disabledDirectory: string) {
+  const document = await readJson<any>(path)
+  if (!document) return '当前没有可禁用的诊断汇总。'
+  await fs.mkdir(disabledDirectory, { recursive: true })
+  const target = join(disabledDirectory, `litematic-renderer-diagnostics-disabled-${formatDiagnosticsTimestamp(new Date())}.json`)
+  await fs.rename(path, target)
+  await fs.writeFile(path, JSON.stringify({ format: 2, pluginVersion: PLUGIN_VERSION, generatedAt: new Date().toISOString(), blocks: [], errors: [] }, null, 2) + '\n')
+  return `当前诊断已移入禁用文件夹：${target}`
+}
+
+async function appendGlobalRenderError(destination: string, renderId: string, engine: string, message: string, logger: ReturnType<Context['logger']>) {
+  const path = resolve(destination)
+  const document = await readJson<any>(path) ?? { format: 2, pluginVersion: PLUGIN_VERSION, generatedAt: new Date().toISOString(), blocks: [], errors: [] }
+  document.format = 2
+  document.pluginVersion = PLUGIN_VERSION
+  document.errors ??= []
+  const existing = document.errors.find((entry: any) => entry.renderId === renderId && entry.engine === engine && entry.message === message)
+  if (existing) existing.count = Number(existing.count ?? 0) + 1
+  else document.errors.push({ renderId, engine, message, count: 1, generatedAt: new Date().toISOString() })
+  await fs.mkdir(dirname(path), { recursive: true })
+  await fs.writeFile(path, JSON.stringify(document, null, 2) + '\n')
+  logger.warn(`渲染问题已记录到 ${path}`)
+}
+
+function formatDiagnosticsTimestamp(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+}
+
+async function appendRenderError(output: string, destination: string, engine: Config['renderEngine'], error: unknown, logger: ReturnType<Context['logger']>) {
+  const path = join(output, 'render-diagnostics.json')
+  const document = await readJson<any>(path) ?? { format: 2, generatedAt: new Date().toISOString(), blocks: [], errors: [] }
+  document.format = 2
+  document.errors ??= []
+  const message = error instanceof Error ? error.message : String(error)
+  const renderId = basename(output)
+  const existing = document.errors.find((entry: any) => entry.renderId === renderId && entry.engine === engine && entry.message === message)
+  if (existing) existing.count = Number(existing.count ?? 0) + 1
+  else document.errors.push({ renderId, engine, message, count: 1, generatedAt: new Date().toISOString() })
+  await fs.writeFile(path, JSON.stringify(document, null, 2) + '\n')
+  await mergeRenderDiagnostics(output, destination, logger)
+}
+
+export function formatRenderError(error: unknown, config: Pick<Config, 'maxFileSize'>) {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/文件超过|file size|file.*limit/i.test(message)) {
+    return `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，不渲染。`
+  }
+  if (/java 21\+|未找到.*java|java.*not found/i.test(message)) {
+    return '未找到 Java 21+，请在插件配置中检查 Java 可执行文件设置。'
+  }
+  if (/standalone renderer|独立.*渲染器.*不存在|渲染器.*not exist/i.test(message)) {
+    return '独立渲染器不可用，请重装插件或检查 Java 渲染配置。'
+  }
+  if (/minecraft.*resource|resource pack|原版资源|材质包.*不存在/i.test(message)) {
+    return 'Minecraft 原版资源包不可用，请检查资源包配置。'
+  }
+  return '投影渲染失败，请检查渲染器配置或导出诊断文件。'
+}
+
 async function renderWithGpu(command: string, input: string, output: string, timeout: number, logger: ReturnType<Context['logger']>) {
   try {
     await new Promise<void>((resolveRun, reject) => {
@@ -654,9 +856,10 @@ function decodeDataUrl(value: unknown) {
 export interface ResolvedSendOptions {
   sendMode: SendMode
   replyAndMention: boolean
+  showViewTitles: boolean
 }
 
-type SendConfig = Pick<Config, 'sendAsForward' | 'replyAndMention' | 'groupSendOptions'>
+type SendConfig = Pick<Config, 'sendAsForward' | 'replyAndMention' | 'groupSendOptions'> & Partial<Pick<Config, 'showViewTitles'>>
 
 export function resolveSendOptions(config: SendConfig, groupId?: string): ResolvedSendOptions {
   const override = groupId
@@ -670,20 +873,25 @@ export function resolveSendOptions(config: SendConfig, groupId?: string): Resolv
   return {
     sendMode: override?.sendMode ?? (config.sendAsForward ? 'forward' : 'combined'),
     replyAndMention,
+    showViewTitles: config.showViewTitles ?? false,
   }
 }
 
 export async function sendImages(session: Session, images: ImageResult[], metadata: string, options: ResolvedSendOptions) {
-  const messages = images.map(({ title, path }) => h('message', { userId: session.selfId, nickname: '投影渲染' }, [h('text', { content: title }), h.image(path)]))
+  const messages = images.map(({ title, path }) => h('message', { userId: session.selfId, nickname: '投影渲染' }, [
+    ...(options.showViewTitles ? [h('text', { content: title })] : []), h.image(path),
+  ]))
   const metadataMessage = h('message', { userId: session.selfId, nickname: '投影信息' }, [h('text', { content: metadata })])
   const reply = options.replyAndMention ? replyElements(session) : []
   if (options.sendMode === 'forward') {
-    if (reply.length) await session.send([...reply, h('text', { content: '投影渲染结果如下。' })])
     await session.send(h('figure', {}, [...messages, metadataMessage]))
+    if (options.replyAndMention && session.userId) {
+      await session.send([h('at', { id: session.userId }), h('text', { content: '渲染结果如上' })])
+    }
     return
   }
   const combined = images.flatMap(({ title, path }, index) => [
-    h('text', { content: `${index ? '\n' : ''}${title}\n` }),
+    ...(options.showViewTitles ? [h('text', { content: `${index ? '\n' : ''}${title}\n` })] : []),
     h.image(path),
   ])
   await session.send([...reply, ...combined, h('text', { content: `\n${metadata}` })])
@@ -850,17 +1058,17 @@ export function formatLitematicMetadata(metadata: LitematicMetadata) {
   ].join('\n')
 }
 
-export function parseLitematic(data: Buffer, maxBlocks: number) {
+export function parseLitematic(data: Buffer) {
   const root = readLitematicRoot(data)
   const regions = root.Regions as Record<string, Record<string, unknown>> | undefined
   if (!regions || typeof regions !== 'object') throw new Error('文件不含 Litematica Regions 数据')
   const blocks: Block[] = []
-  for (const region of Object.values(regions)) parseRegion(region, blocks, maxBlocks)
+  for (const region of Object.values(regions)) parseRegion(region, blocks)
   if (!blocks.length) throw new Error('投影中没有非空气方块')
   return blocks
 }
 
-function parseRegion(region: Record<string, unknown>, target: Block[], maxBlocks: number) {
+function parseRegion(region: Record<string, unknown>, target: Block[]) {
   const position = region.Position as Record<string, number>
   const size = region.Size as Record<string, number>
   const palette = region.BlockStatePalette as Array<Record<string, string>>
@@ -875,7 +1083,6 @@ function parseRegion(region: Record<string, unknown>, target: Block[], maxBlocks
     const paletteIndex = unpackState(states, index, bits)
     const blockName = palette[paletteIndex]?.Name
     if (!blockName || blockName === 'minecraft:air' || blockName === 'minecraft:cave_air' || blockName === 'minecraft:void_air') continue
-    if (target.length >= maxBlocks) throw new Error(`非空气方块超过 ${maxBlocks} 上限`)
     const x = index % sx, z = Math.floor(index / sx) % sz, y = Math.floor(index / (sx * sz))
     target.push({ x: position.x + x * dx, y: position.y + y * dy, z: position.z + z * dz, name: blockName })
   }
