@@ -410,22 +410,53 @@ function fileElements(session: Pick<Session, 'elements' | 'content'>) {
 }
 
 export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
-  return fileElements(session).find((element: any) => {
-    if (element.type !== 'file') return false
+  const elements = fileElements(session).filter((element: any) => element.type === 'file')
+  const matching = elements.find((element: any) => {
     return extname(fileName(element.attrs as FileElement) ?? '').toLowerCase() === '.litematic'
-  })?.attrs as FileElement | undefined
+  })
+  if (matching?.attrs) return matching.attrs as FileElement
+
+  // NapCat may keep the complete file object only on the raw OneBot event.
+  const raw = (session as any).event?._data ?? (session as any).event?.data
+  const rawFile = raw?.file ?? raw?.data?.file
+  if (rawFile && typeof rawFile === 'object'
+    && extname(fileName(rawFile as FileElement) ?? '').toLowerCase() === '.litematic') {
+    return rawFile as FileElement
+  }
+
+  // Some adapters expose a nameless file element but retain the displayed name in text.
+  const inferredName = inferLitematicName(session.content)
+  if (inferredName && elements[0]?.attrs) {
+    return { ...(elements[0].attrs as FileElement), name: inferredName }
+  }
+  return undefined
+}
+
+function inferLitematicName(content: string | undefined) {
+  if (!content) return undefined
+  const marked = content.match(/(?:file|\u6587\u4ef6)\s+([^\]\u3011\r\n]*\.litematic)\s*[\]\u3011]?/i)
+  if (marked?.[1]) return marked[1].trim()
+  const plain = content.match(/([^\s\]\u3011<>"']+\.litematic)(?=$|[\s\]\u3011])/i)
+  return plain?.[1]?.trim()
 }
 
 function fileName(file: FileElement): string | undefined {
-  return file.name ?? file.filename ?? file.file_name ?? file.fileName
+  const nested = file.file && typeof file.file === 'object' ? file.file : undefined
+  const value = file.name ?? file.filename ?? file.file_name ?? file.fileName
+    ?? nested?.name ?? nested?.filename ?? nested?.file_name ?? nested?.fileName
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
 async function resolveFileUrl(session: Session, file: FileElement) {
-  if (file.url || file.src || typeof file.file === 'string') return file.url ?? file.src ?? file.file
+  const nested = file.file && typeof file.file === 'object' ? file.file : undefined
+  const direct = file.url ?? file.src ?? (typeof file.file === 'string' ? file.file : undefined)
+    ?? nested?.url ?? nested?.src
+  if (typeof direct === 'string' && direct) return direct
   const fileId = file.id ?? file.file_id ?? file.fileId
+    ?? nested?.id ?? nested?.file_id ?? nested?.fileId
   const internal = (session.bot as any).internal
   if (!session.guildId || !fileId || typeof internal?.getGroupFileUrl !== 'function') return
-  const result = await internal.getGroupFileUrl(session.guildId, fileId, Number(file.busid ?? 0))
+  const result = await internal.getGroupFileUrl(session.guildId, fileId, Number(file.busid ?? nested?.busid ?? 0))
   return typeof result === 'string' ? result : result?.url
 }
 

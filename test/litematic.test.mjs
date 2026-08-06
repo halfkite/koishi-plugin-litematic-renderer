@@ -193,3 +193,19 @@ test('does not treat unnamed or unrelated files as litematic projections', () =>
   assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { url: 'https://example.invalid/image.png' } }], content: '' }), undefined)
   assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { name: 'map.zip', url: 'https://example.invalid/map.zip' } }], content: '' }), undefined)
 })
+
+test('recognizes nested and raw OneBot litematic filenames without matching suffixes', () => {
+  assert.equal(findLitematicFile({
+    elements: [{ type: 'file', attrs: { file: { name: 'nested.litematic', url: 'https://example.invalid/nested' } } }],
+    content: '',
+  })?.file?.name, 'nested.litematic')
+  assert.equal(findLitematicFile({
+    elements: [{ type: 'file', attrs: { url: 'https://example.invalid/unknown' } }],
+    content: '[文件 raw-name.litematic]',
+    event: { _data: { file: { name: 'raw-name.litematic', url: 'https://example.invalid/raw' } } },
+  })?.name, 'raw-name.litematic')
+  assert.equal(findLitematicFile({
+    elements: [{ type: 'file', attrs: { name: 'not-a-projection.zip.txt', url: 'https://example.invalid/no' } }],
+    content: '',
+  }), undefined)
+})
