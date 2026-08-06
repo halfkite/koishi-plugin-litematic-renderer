@@ -434,7 +434,7 @@ export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>
 
 function inferLitematicName(content: string | undefined) {
   if (!content) return undefined
-  const marked = content.match(/(?:file|\u6587\u4ef6)\s+([^\]\u3011\r\n]*\.litematic)\s*[\]\u3011]?/i)
+  const marked = content.match(/(?:file|\u6587\u4ef6)\s+(.+?\.litematic)(?=$|[\]\u3011\r\n])/i)
   if (marked?.[1]) return marked[1].trim()
   const plain = content.match(/([^\s\]\u3011<>"']+\.litematic)(?=$|[\s\]\u3011])/i)
   return plain?.[1]?.trim()

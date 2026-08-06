@@ -208,4 +208,8 @@ test('recognizes nested and raw OneBot litematic filenames without matching suff
     elements: [{ type: 'file', attrs: { name: 'not-a-projection.zip.txt', url: 'https://example.invalid/no' } }],
     content: '',
   }), undefined)
+  assert.equal(findLitematicFile({
+    elements: [{ type: 'file', attrs: { url: 'https://example.invalid/bracketed' } }],
+    content: '[文件 4gt补盒[正经储] 有外接口.litematic]',
+  })?.name, '4gt补盒[正经储] 有外接口.litematic')
 })
