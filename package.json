@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-litematic-renderer",
-  "version": "0.4.26",
+  "version": "0.4.27",
   "description": "Render small Litematica schematics sent in QQ groups.",
   "author": "halfkite",
   "repository": {
