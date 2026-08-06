@@ -7,7 +7,7 @@ import { ChildProcess, spawn } from 'node:child_process'
 import { deflateSync, gunzipSync } from 'node:zlib'
 
 export const name = 'litematic-renderer'
-export const inject = { optional: ['puppeteer'] }
+export const inject = { optional: ['puppeteer', 'server'] }
 const CACHE_FORMAT_VERSION = 13
 const packageVersion = (require('../package.json') as { version?: unknown }).version
 const PLUGIN_VERSION = typeof packageVersion === 'string' ? packageVersion : 'unknown'
