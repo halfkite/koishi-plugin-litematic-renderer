@@ -416,18 +416,38 @@ export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>
   })
   if (matching?.attrs) return matching.attrs as FileElement
 
-  // NapCat may keep the complete file object only on the raw OneBot event.
-  const raw = (session as any).event?._data ?? (session as any).event?.data
-  const rawFile = raw?.file ?? raw?.data?.file
-  if (rawFile && typeof rawFile === 'object'
-    && extname(fileName(rawFile as FileElement) ?? '').toLowerCase() === '.litematic') {
-    return rawFile as FileElement
+  // NapCat/OneBot versions place the file payload at different event levels.
+  const rawRoots = [(session as any).event, (session as any)._data, (session as any).data, (session as any).message]
+  for (const root of rawRoots) {
+    const rawFile = findLitematicInFilePayload(root)
+    if (rawFile) return rawFile
   }
 
   // Some adapters expose a nameless file element but retain the displayed name in text.
   const inferredName = inferLitematicName(session.content)
   if (inferredName && elements[0]?.attrs) {
     return { ...(elements[0].attrs as FileElement), name: inferredName }
+  }
+  return undefined
+}
+
+function findLitematicInFilePayload(value: unknown, seen = new Set<object>(), depth = 0): FileElement | undefined {
+  if (!value || typeof value !== 'object' || depth > 6) return undefined
+  if (seen.has(value as object)) return undefined
+  seen.add(value as object)
+  const object = value as Record<string, unknown>
+  const candidate = object as FileElement
+  const nested = candidate.file && typeof candidate.file === 'object' ? candidate.file as FileElement : undefined
+  if (nested && fileName(nested) && extname(fileName(nested)!).toLowerCase() === '.litematic') {
+    return { ...nested, id: nested.id ?? candidate.id, file_id: nested.file_id ?? candidate.file_id, fileId: nested.fileId ?? candidate.fileId, busid: nested.busid ?? candidate.busid }
+  }
+  if (fileName(candidate) && extname(fileName(candidate)!).toLowerCase() === '.litematic') return candidate
+  for (const [key, child] of Object.entries(object)) {
+    if (!child || typeof child !== 'object') continue
+    if (/file|upload|message|data|event/i.test(key)) {
+      const found = findLitematicInFilePayload(child, seen, depth + 1)
+      if (found) return found
+    }
   }
   return undefined
 }

@@ -205,6 +205,11 @@ test('recognizes nested and raw OneBot litematic filenames without matching suff
     event: { _data: { file: { name: 'raw-name.litematic', url: 'https://example.invalid/raw' } } },
   })?.name, 'raw-name.litematic')
   assert.equal(findLitematicFile({
+    elements: [],
+    content: '',
+    event: { data: { message: { upload: { filename: 'alternate.litematic', file_id: 'id-1' } } } },
+  })?.filename, 'alternate.litematic')
+  assert.equal(findLitematicFile({
     elements: [{ type: 'file', attrs: { name: 'not-a-projection.zip.txt', url: 'https://example.invalid/no' } }],
     content: '',
   }), undefined)
