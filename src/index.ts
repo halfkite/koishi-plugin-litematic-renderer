@@ -257,7 +257,7 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.middleware(async (session, next) => {
     if (!session.guildId) return next()
-    const file = findFileElement(session)
+    const file = findLitematicFile(session)
     if (!file) return next()
     const url = await resolveFileUrl(session, file)
     if (!url) {
@@ -267,28 +267,16 @@ export function apply(ctx: Context, config: Config) {
       }
       return next()
     }
-    const likelyLitematic = isLikelyLitematicFile(file)
-    if (likelyLitematic && isOverLimit(file.size, maxFileSizeBytes)) {
+    if (isOverLimit(file.size, maxFileSizeBytes)) {
       await appendGlobalRenderError(diagnosticsPath, `input:${basename(file.name ?? 'unknown')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
       await session.send([...replyElements(session), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
       return next()
       await session.send(`文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。`)
       return next()
     }
-    if (likelyLitematic && !isUnderLimit(file.size, maxFileSizeBytes)) return next()
-    let bytes: Buffer
+    if (!isUnderLimit(file.size, maxFileSizeBytes)) return next()
     try {
-      bytes = await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
-    } catch (error) {
-      if (likelyLitematic) {
-        logger.warn(error)
-        await session.send([...replyElements(session), h('text', { content: formatRenderError(error, config) })])
-      }
-      return next()
-    }
-    if (!isLitematicData(bytes)) return next()
-    try {
-      const result = await render(url, fileName(file) || 'schematic.litematic', bytes)
+      const result = await render(url, fileName(file) || 'schematic.litematic')
       await sendImages(session, result.images, result.metadata, resolveSendOptions(config, session.guildId))
     } catch (error) {
       logger.warn(error)
@@ -420,10 +408,6 @@ export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number
 function fileElements(session: Pick<Session, 'elements' | 'content'>) {
   const parsed = h.parse(session.content ?? '')
   return [...(session.elements ?? []), ...parsed]
-}
-
-export function findFileElement(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
-  return fileElements(session).find((element: any) => element.type === 'file')?.attrs as FileElement | undefined
 }
 
 export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
@@ -1021,19 +1005,6 @@ function readLitematicRoot(data: Buffer) {
   return new NbtReader(raw).readNamedRoot()
 }
 
-export function isLitematicData(data: Buffer) {
-  try {
-    const root = readLitematicRoot(data)
-    const regions = compoundValue(root.Regions)
-    if (!regions || !Object.keys(regions).length) return false
-    return Object.values(regions).some(value => {
-      const region = compoundValue(value)
-      return Boolean(region && Array.isArray(region.BlockStatePalette) && Array.isArray(region.BlockStates))
-    })
-  } catch {
-    return false
-  }
-}
 
 function compoundValue(value: unknown) {
   return value && typeof value === 'object' && !Array.isArray(value) && !Buffer.isBuffer(value)

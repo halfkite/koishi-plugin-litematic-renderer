@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { gzipSync } from 'node:zlib'
-import { cacheNameSegment, enforceCacheLimit, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, isLitematicData, parseLitematic, parseLitematicMetadata, renderSchematic, resolveSendOptions, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
+import { cacheNameSegment, enforceCacheLimit, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, renderSchematic, resolveSendOptions, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
 
 const short = (value) => { const data = Buffer.alloc(2); data.writeUInt16BE(value); return data }
 const int = (value) => { const data = Buffer.alloc(4); data.writeInt32BE(value); return data }
@@ -192,10 +192,4 @@ test('detects litematic files from message content when session elements are emp
 test('does not treat unnamed or unrelated files as litematic projections', () => {
   assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { url: 'https://example.invalid/image.png' } }], content: '' }), undefined)
   assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { name: 'map.zip', url: 'https://example.invalid/map.zip' } }], content: '' }), undefined)
-})
-
-test('filters files by Litematica content instead of filename only', () => {
-  const data = sampleLitematic()
-  assert.equal(isLitematicData(data), true)
-  assert.equal(isLitematicData(Buffer.from('not a litematic file')), false)
 })
