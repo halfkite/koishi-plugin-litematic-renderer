@@ -157,8 +157,8 @@ export function apply(ctx: Context, config: Config) {
     .then(() => enforceCacheLimit(cacheDirectory, cacheMaxBytes))
     .catch(error => logger.warn(`缓存初始化失败：${error instanceof Error ? error.message : String(error)}`))
 
-  const render = async (url: string, filename = 'schematic.litematic'): Promise<RenderResult> => {
-    const bytes = await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
+  const render = async (url: string, filename = 'schematic.litematic', preparedBytes?: Buffer): Promise<RenderResult> => {
+    const bytes = preparedBytes ?? await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
     const metadata = formatLitematicMetadata(parseLitematicMetadata(bytes), filename)
     const fileHash = createHash('sha256').update(bytes).digest('hex')
     const minecraftJarPath = config.renderEngine === 'standalone'
@@ -257,24 +257,38 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.middleware(async (session, next) => {
     if (!session.guildId) return next()
-    const file = findLitematicFile(session)
+    const file = findFileElement(session)
     if (!file) return next()
     const url = await resolveFileUrl(session, file)
     if (!url) {
-      logger.warn(`检测到 Litematic 文件但无法获取下载地址：${fileName(file)}；请检查 OneBot/NapCat 的 get_group_file_url 接口。`)
-      await session.send([...replyElements(session), h('text', { content: '检测到投影文件，但无法获取群文件下载地址，请检查 OneBot/NapCat 文件接口。' })])
+      if (isLikelyLitematicFile(file)) {
+        logger.warn(`检测到可能的 Litematic 文件但无法获取下载地址：${fileName(file)}；请检查 OneBot/NapCat 的 get_group_file_url 接口。`)
+        await session.send([...replyElements(session), h('text', { content: '检测到可能的投影文件，但无法获取群文件下载地址，请检查 OneBot/NapCat 文件接口。' })])
+      }
       return next()
     }
-    if (isOverLimit(file.size, maxFileSizeBytes)) {
+    const likelyLitematic = isLikelyLitematicFile(file)
+    if (likelyLitematic && isOverLimit(file.size, maxFileSizeBytes)) {
       await appendGlobalRenderError(diagnosticsPath, `input:${basename(file.name ?? 'unknown')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
       await session.send([...replyElements(session), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
       return next()
       await session.send(`文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。`)
       return next()
     }
-    if (!isUnderLimit(file.size, maxFileSizeBytes)) return next()
+    if (likelyLitematic && !isUnderLimit(file.size, maxFileSizeBytes)) return next()
+    let bytes: Buffer
     try {
-      const result = await render(url, file.name)
+      bytes = await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
+    } catch (error) {
+      if (likelyLitematic) {
+        logger.warn(error)
+        await session.send([...replyElements(session), h('text', { content: formatRenderError(error, config) })])
+      }
+      return next()
+    }
+    if (!isLitematicData(bytes)) return next()
+    try {
+      const result = await render(url, fileName(file) || 'schematic.litematic', bytes)
       await sendImages(session, result.images, result.metadata, resolveSendOptions(config, session.guildId))
     } catch (error) {
       logger.warn(error)
@@ -403,18 +417,28 @@ export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number
   return { totalBytes, removedBytes, removedEntries }
 }
 
-export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
+function fileElements(session: Pick<Session, 'elements' | 'content'>) {
   const parsed = h.parse(session.content ?? '')
-  const elements = [...(session.elements ?? []), ...parsed]
-  return elements.find((element: any) => {
+  return [...(session.elements ?? []), ...parsed]
+}
+
+export function findFileElement(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
+  return fileElements(session).find((element: any) => element.type === 'file')?.attrs as FileElement | undefined
+}
+
+export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
+  return fileElements(session).find((element: any) => {
     if (element.type !== 'file') return false
-    const attrs = element.attrs as FileElement
-    return extname(fileName(attrs)).toLowerCase() === '.litematic'
+    return isLikelyLitematicFile(element.attrs as FileElement)
   })?.attrs as FileElement | undefined
 }
 
 function fileName(file: FileElement) {
   return file.name ?? file.filename ?? ''
+}
+
+function isLikelyLitematicFile(file: FileElement) {
+  return extname(fileName(file)).toLowerCase() === '.litematic'
 }
 
 async function resolveFileUrl(session: Session, file: FileElement) {
@@ -995,6 +1019,20 @@ function readLitematicRoot(data: Buffer) {
   let raw: Buffer
   try { raw = gunzipSync(data) } catch { raw = data }
   return new NbtReader(raw).readNamedRoot()
+}
+
+export function isLitematicData(data: Buffer) {
+  try {
+    const root = readLitematicRoot(data)
+    const regions = compoundValue(root.Regions)
+    if (!regions || !Object.keys(regions).length) return false
+    return Object.values(regions).some(value => {
+      const region = compoundValue(value)
+      return Boolean(region && Array.isArray(region.BlockStatePalette) && Array.isArray(region.BlockStates))
+    })
+  } catch {
+    return false
+  }
 }
 
 function compoundValue(value: unknown) {
