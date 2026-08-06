@@ -112,11 +112,14 @@ export const Config: Schema<Config> = Schema.object({
 
 interface FileElement {
   name?: string
+  filename?: string
   url?: string
   src?: string
+  file?: string
   size?: string | number
   id?: string
   file_id?: string
+  fileId?: string
   busid?: string | number
 }
 interface Block { x: number, y: number, z: number, name: string }
@@ -255,8 +258,13 @@ export function apply(ctx: Context, config: Config) {
   ctx.middleware(async (session, next) => {
     if (!session.guildId) return next()
     const file = findLitematicFile(session)
-    const url = file && await resolveFileUrl(session, file)
-    if (!url || !file) return next()
+    if (!file) return next()
+    const url = await resolveFileUrl(session, file)
+    if (!url) {
+      logger.warn(`检测到 Litematic 文件但无法获取下载地址：${fileName(file)}；请检查 OneBot/NapCat 的 get_group_file_url 接口。`)
+      await session.send([...replyElements(session), h('text', { content: '检测到投影文件，但无法获取群文件下载地址，请检查 OneBot/NapCat 文件接口。' })])
+      return next()
+    }
     if (isOverLimit(file.size, maxFileSizeBytes)) {
       await appendGlobalRenderError(config.diagnosticsFilePath, `input:${basename(file.name ?? 'unknown')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
       await session.send([...replyElements(session), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
@@ -395,18 +403,23 @@ export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number
   return { totalBytes, removedBytes, removedEntries }
 }
 
-function findLitematicFile(session: Session): FileElement | undefined {
-  const elements = session.elements ?? h.parse(session.content ?? '')
+export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
+  const parsed = h.parse(session.content ?? '')
+  const elements = [...(session.elements ?? []), ...parsed]
   return elements.find((element: any) => {
     if (element.type !== 'file') return false
     const attrs = element.attrs as FileElement
-    return extname(attrs.name ?? '').toLowerCase() === '.litematic'
+    return extname(fileName(attrs)).toLowerCase() === '.litematic'
   })?.attrs as FileElement | undefined
 }
 
+function fileName(file: FileElement) {
+  return file.name ?? file.filename ?? 'unknown.litematic'
+}
+
 async function resolveFileUrl(session: Session, file: FileElement) {
-  if (file.url || file.src) return file.url ?? file.src
-  const fileId = file.id ?? file.file_id
+  if (file.url || file.src || file.file) return file.url ?? file.src ?? file.file
+  const fileId = file.id ?? file.file_id ?? file.fileId
   const internal = (session.bot as any).internal
   if (!session.guildId || !fileId || typeof internal?.getGroupFileUrl !== 'function') return
   const result = await internal.getGroupFileUrl(session.guildId, fileId, Number(file.busid ?? 0))
