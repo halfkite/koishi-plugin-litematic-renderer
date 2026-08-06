@@ -189,6 +189,14 @@ test('detects litematic files from message content when session elements are emp
   assert.equal(file?.url, 'https://example.invalid/test.litematic')
 })
 
+test('detects NapCat file_name aliases and trims the extension', () => {
+  const file = findLitematicFile({
+    elements: [{ type: 'file', attrs: { file_name: '  结构投影.LITEMATIC  ', file_id: 'abc' } }],
+    content: '',
+  })
+  assert.equal(file?.file_name, '  结构投影.LITEMATIC  ')
+})
+
 test('does not treat unnamed or unrelated files as litematic projections', () => {
   assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { url: 'https://example.invalid/image.png' } }], content: '' }), undefined)
   assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { name: 'map.zip', url: 'https://example.invalid/map.zip' } }], content: '' }), undefined)

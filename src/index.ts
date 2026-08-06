@@ -113,9 +113,11 @@ export const Config: Schema<Config> = Schema.object({
 interface FileElement {
   name?: string
   filename?: string
+  file_name?: string
+  fileName?: string
   url?: string
   src?: string
-  file?: string
+  file?: string | Record<string, unknown>
   size?: string | number
   id?: string
   file_id?: string
@@ -257,8 +259,14 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.middleware(async (session, next) => {
     if (!session.guildId) return next()
-    const file = findLitematicFile(session)
-    if (!file) return next()
+    const receivedFile = findFileElement(session)
+    if (!receivedFile) return next()
+    const file = isLikelyLitematicFile(receivedFile) ? receivedFile : undefined
+    if (!file) {
+      logger.info(`忽略非 Litematic 群文件：${fileName(receivedFile) || '未提供文件名'}`)
+      return next()
+    }
+    logger.info(`检测到 Litematic 群文件：${fileName(file)}`)
     const url = await resolveFileUrl(session, file)
     if (!url) {
       if (isLikelyLitematicFile(file)) {
@@ -410,6 +418,10 @@ function fileElements(session: Pick<Session, 'elements' | 'content'>) {
   return [...(session.elements ?? []), ...parsed]
 }
 
+export function findFileElement(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
+  return fileElements(session).find((element: any) => element.type === 'file')?.attrs as FileElement | undefined
+}
+
 export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
   return fileElements(session).find((element: any) => {
     if (element.type !== 'file') return false
@@ -418,7 +430,10 @@ export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>
 }
 
 function fileName(file: FileElement) {
-  return file.name ?? file.filename ?? ''
+  const nested = file.file && typeof file.file === 'object' ? file.file : undefined
+  const value = file.name ?? file.filename ?? file.file_name ?? file.fileName
+    ?? nested?.name ?? nested?.filename ?? nested?.file_name ?? nested?.fileName ?? ''
+  return typeof value === 'string' ? value.trim() : ''
 }
 
 function isLikelyLitematicFile(file: FileElement) {
@@ -426,7 +441,10 @@ function isLikelyLitematicFile(file: FileElement) {
 }
 
 async function resolveFileUrl(session: Session, file: FileElement) {
-  if (file.url || file.src || file.file) return file.url ?? file.src ?? file.file
+  const nested = file.file && typeof file.file === 'object' ? file.file : undefined
+  const direct = file.url ?? file.src ?? (typeof file.file === 'string' ? file.file : undefined)
+    ?? nested?.url ?? nested?.src
+  if (typeof direct === 'string' && direct) return direct
   const fileId = file.id ?? file.file_id ?? file.fileId
   const internal = (session.bot as any).internal
   if (!session.guildId || !fileId || typeof internal?.getGroupFileUrl !== 'function') return
