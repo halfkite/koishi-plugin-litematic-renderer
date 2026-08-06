@@ -2,14 +2,14 @@
 
 [![npm](https://img.shields.io/npm/v/koishi-plugin-litematic-renderer?label=npm)](https://www.npmjs.com/package/koishi-plugin-litematic-renderer)
 
-自动识别 QQ 群消息中小于指定大小的 `.litematic` 文件，并发送两张 PNG：
+一个面向 Koishi 的 Minecraft Litematica 投影渲染插件。它会自动识别 QQ 群消息中的 `.litematic` 文件，渲染并发送两张 PNG：
 
 - 正二轴测
 - 反向正二轴测（在基准角度上旋转 180°）
 
-可选择合并转发，或将两张图片和投影信息组成一条普通群消息。消息中的信息包含保存者游戏 ID、创建时间、方块数/体积、尺寸、Litematic 版本和游戏数据版本。
+支持合并转发或普通消息发送，并附带投影元数据：保存者游戏 ID、创建时间、方块数/体积、尺寸、Litematic 版本和游戏数据版本。合并转发完成后，会单独发送一条“@用户 渲染结果如上”的提示，避免图片与提示混在一起。
 
-不再生成正视、侧视或俯视图。默认 `standalone` 后端只启动独立 Java 进程，直接读取 Litematic、插件内置的 Minecraft 26.2 原版资源和配置的材质包，不要求启动客户端、进入世界或另行下载客户端 JAR。材质包越靠后优先级越高。
+默认使用 `standalone` 独立 Java 渲染器，只读取 Litematic、插件内置的 Minecraft 26.2 原版资源和可选材质包，不要求启动 Minecraft 客户端、进入世界或另行下载客户端 JAR。推荐 Java 21+；Java 可执行文件支持自动查找或自定义路径。材质包越靠后优先级越高。
 
 ## 独立 Java 渲染器
 
@@ -34,9 +34,9 @@ plugins:
     maxFileSize: 1024
     cacheDirectory: data/litematic-renderer-cache
     cacheMaxSizeGb: 20
-    renderEngine: standalone
-    # 推荐 Java 21+；留空自动查找，也可填写自定义 Java 可执行文件路径
+    # 【重点】推荐 Java 21+；留空自动查找，也可填写自定义 Java 可执行文件路径
     standaloneJavaCommand: ''
+    renderEngine: standalone
     # 单次 Java 渲染最大堆内存，以及内存不足后的全新进程重试次数
     standaloneJavaMaxHeapMb: 200
     standaloneJavaRetryMaxHeapMb: 2048
@@ -75,11 +75,11 @@ plugins:
 
 `isometricRotation` 控制第一张图的方向，第二张图始终自动增加 180°。`isometricSlant: 36` 对应 Isometric Renders 的正二轴测预设。`javaSupersampling: 2` 会以最终边长的两倍离屏渲染，再高质量缩小。
 
-`sendAsForward` 是未配置群覆盖时的默认发送方式：`true` 为合并转发，`false` 为联合发送。联合发送会把两张图片和投影信息放在同一条普通消息中。`replyAndMention` 控制是否引用原消息并 @ 投影发送者；`groupSendOptions` 可按群号覆盖这两个设置，相同群号以最后一项为准。合并转发受 QQ 协议限制，不能直接携带引用，因此开启回复 @ 时会先发送一条引用提示，再发送转发内容。
+`sendAsForward` 是未配置群覆盖时的默认发送方式：`true` 为合并转发，`false` 为联合发送。联合发送会把两张图片和投影信息放在同一条普通消息中。`replyAndMention` 控制是否引用原消息并 @ 投影发送者；`groupSendOptions` 可按群号覆盖这两个设置，相同群号以最后一项为准。合并转发会先发送转发内容，再单独发送“@用户 渲染结果如上”。
 
 可用命令 `litematic.render <文件 URL>` 手动渲染直链文件。管理员可执行 `litematic.cache.clear` 清理缓存。
 
-`showViewTitles` 默认关闭，发送图片时不再附带“正二轴测”和“反向正二轴测（旋转 180°）”标题；打开后恢复这两行文字。`diagnosticsFilePath` 同时保留每次渲染目录中的 `render-diagnostics.json` 和一个全局汇总文件，方块问题写入 `blocks`，渲染失败写入 `errors`。缓存目录名会保留投影文件名（包括中文）。
+`showViewTitles` 默认关闭，发送图片时不再附带“正二轴测”和“反向正二轴测（旋转 180°）”标题；打开后恢复这两行文字。`diagnosticsFilePath` 同时保留每次渲染目录中的 `render-diagnostics.json` 和一个全局汇总文件，方块问题写入 `blocks`，渲染失败写入 `errors`；可通过 `/litematic-renderer/diagnostics` 下载错误报告。缓存目录名会保留投影文件名（包括中文）。
 附件大小超过 `maxFileSize` 时会直接回复“文件大小超过 X MB，无法渲染”，不会静默跳过。
 插件版本更新时，旧的全局诊断会自动按旧版本和日期移动到 `data/litematic-renderer-diagnostics-archive`；管理员执行 `litematic.errors.disable` 后，当前快照会移动到 `data/litematic-renderer-diagnostics-disabled`，活动文件会重新开始统计。
 独立渲染器支持 `item_frame` 和 `glow_item_frame` 实体，会绘制展示框及其 `Item.id` 指定的物品纹理。
