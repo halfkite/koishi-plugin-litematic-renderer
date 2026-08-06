@@ -159,7 +159,7 @@ export function apply(ctx: Context, config: Config) {
 
   const render = async (url: string, filename = 'schematic.litematic'): Promise<RenderResult> => {
     const bytes = await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
-    const metadata = formatLitematicMetadata(parseLitematicMetadata(bytes))
+    const metadata = formatLitematicMetadata(parseLitematicMetadata(bytes), filename)
     const fileHash = createHash('sha256').update(bytes).digest('hex')
     const minecraftJarPath = config.renderEngine === 'standalone'
       ? await resolveMinecraftResources(config)
@@ -414,7 +414,7 @@ export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>
 }
 
 function fileName(file: FileElement) {
-  return file.name ?? file.filename ?? 'unknown.litematic'
+  return file.name ?? file.filename ?? ''
 }
 
 async function resolveFileUrl(session: Session, file: FileElement) {
@@ -1064,14 +1064,18 @@ export function parseLitematicMetadata(data: Buffer): LitematicMetadata {
   }
 }
 
-export function formatLitematicMetadata(metadata: LitematicMetadata) {
+export function formatLitematicMetadata(metadata: LitematicMetadata, filename?: string) {
   const blocks = metadata.totalBlocks == null ? '未知' : String(metadata.totalBlocks)
   const volume = metadata.totalVolume == null ? '未知' : String(metadata.totalVolume)
   const size = metadata.size?.join(' × ') ?? '未知'
   const litematicVersion = metadata.litematicVersion == null ? '未知' : String(metadata.litematicVersion)
   const gameVersion = metadata.minecraftVersion ?? '未知'
   const dataVersion = metadata.minecraftDataVersion == null ? '' : `（数据版本：${metadata.minecraftDataVersion}）`
+  const projectionName = typeof filename === 'string' && filename.trim()
+    ? basename(filename).replace(/\.litematic$/i, '')
+    : ''
   return [
+    ...(projectionName ? [`投影名称：${projectionName}`] : []),
     `保存者游戏 ID：${metadata.author}`,
     `创建时间：${metadata.createdAt}`,
     `方块数/体积：${blocks}/${volume}`,

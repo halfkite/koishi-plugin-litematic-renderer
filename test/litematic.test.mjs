@@ -78,6 +78,11 @@ test('reads the Litematic metadata used by the forwarded text footer', () => {
   ].join('\n'))
 })
 
+test('includes the projection name in forwarded metadata', () => {
+  const metadata = parseLitematicMetadata(sampleLitematic())
+  assert.match(formatLitematicMetadata(metadata, '测试投影.litematic'), /^投影名称：测试投影\n/)
+})
+
 test('keeps versioned cache entries until the total limit requires LRU eviction', async () => {
   const root = await mkdtemp(join(tmpdir(), 'litematic-cache-test-'))
   const oldEntry = join(root, 'v0.3.6', 'old-hash')
@@ -182,4 +187,9 @@ test('detects litematic files from message content when session elements are emp
   })
   assert.equal(file?.name, '跨环境测试.litematic')
   assert.equal(file?.url, 'https://example.invalid/test.litematic')
+})
+
+test('does not treat unnamed or unrelated files as litematic projections', () => {
+  assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { url: 'https://example.invalid/image.png' } }], content: '' }), undefined)
+  assert.equal(findLitematicFile({ elements: [{ type: 'file', attrs: { name: 'map.zip', url: 'https://example.invalid/map.zip' } }], content: '' }), undefined)
 })
