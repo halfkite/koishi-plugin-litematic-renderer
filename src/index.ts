@@ -145,11 +145,11 @@ export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger(name)
   const maxFileSizeBytes = config.maxFileSize * 1024
   ctx.on('dispose', () => terminateActiveStandaloneJavaProcesses(logger))
-  const diagnosticsPath = resolve(config.diagnosticsFilePath)
+  const diagnosticsPath = resolve(stringOrDefault(config.diagnosticsFilePath, 'data/litematic-renderer-diagnostics.json'))
   const diagnosticsArchiveDirectory = join(dirname(diagnosticsPath), 'litematic-renderer-diagnostics-archive')
   const diagnosticsDisabledDirectory = join(dirname(diagnosticsPath), 'litematic-renderer-diagnostics-disabled')
   void rotateDiagnosticsFile(diagnosticsPath, diagnosticsArchiveDirectory, logger)
-  const cacheDirectory = resolve(config.cacheDirectory)
+  const cacheDirectory = resolve(stringOrDefault(config.cacheDirectory, 'data/litematic-renderer-cache'))
   const versionCacheDirectory = join(cacheDirectory, `v${cachePathSegment(PLUGIN_VERSION)}`)
   const cacheMaxBytes = Math.floor(config.cacheMaxSizeGb * 1024 ** 3)
   const inFlight = new Map<string, Promise<void>>()
@@ -165,7 +165,7 @@ export function apply(ctx: Context, config: Config) {
       ? await resolveMinecraftResources(config)
       : ''
     const resourceFingerprint = config.renderEngine === 'standalone'
-      ? await fingerprintFiles([minecraftJarPath, ...config.resourcePackPaths])
+      ? await fingerprintFiles([minecraftJarPath, ...resourcePackPaths(config.resourcePackPaths)])
       : []
     const renderHash = hashRenderConfiguration({
         version: CACHE_FORMAT_VERSION,
@@ -214,7 +214,7 @@ export function apply(ctx: Context, config: Config) {
           if (!gpuSucceeded || !(await Promise.all(expected.map(exists))).every(Boolean)) {
             if (config.renderEngine === 'standalone') {
               await renderWithStandalone(input, output, minecraftJarPath, config, logger)
-              await mergeRenderDiagnostics(output, config.diagnosticsFilePath, logger)
+              await mergeRenderDiagnostics(output, diagnosticsPath, logger)
             } else if (config.renderEngine === 'java') {
               await renderWithJavaBridge(input, output, config)
             } else {
@@ -235,7 +235,7 @@ export function apply(ctx: Context, config: Config) {
           }
           if (!(await Promise.all(expected.map(exists))).every(Boolean)) throw new Error('渲染器没有生成两张正二轴测 PNG')
           } catch (error) {
-            await appendRenderError(output, config.diagnosticsFilePath, config.renderEngine, error, logger)
+            await appendRenderError(output, diagnosticsPath, config.renderEngine, error, logger)
             throw error
           }
         })().finally(() => inFlight.delete(output))
@@ -266,7 +266,7 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
     if (isOverLimit(file.size, maxFileSizeBytes)) {
-      await appendGlobalRenderError(config.diagnosticsFilePath, `input:${basename(file.name ?? 'unknown')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
+      await appendGlobalRenderError(diagnosticsPath, `input:${basename(file.name ?? 'unknown')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
       await session.send([...replyElements(session), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
       return next()
       await session.send(`文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。`)
@@ -306,7 +306,7 @@ export function apply(ctx: Context, config: Config) {
       return '投影渲染缓存已清理。'
     })
   ctx.command('litematic.errors.export', 'export render diagnostics', { authority: 3 })
-    .action(async () => `Diagnostics file: ${resolve(config.diagnosticsFilePath)}`)
+    .action(async () => `Diagnostics file: ${diagnosticsPath}`)
   ctx.command('litematic.errors.disable', 'disable current render diagnostics snapshot', { authority: 3 })
     .action(async () => disableDiagnosticsSnapshot(diagnosticsPath, diagnosticsDisabledDirectory))
   const server = (ctx as any).server
@@ -314,7 +314,7 @@ export function apply(ctx: Context, config: Config) {
     server.get('/litematic-renderer/diagnostics', async (koa: any) => {
       koa.type = 'application/json'
       koa.set('Content-Disposition', 'attachment; filename=\"litematic-renderer-diagnostics.json\"')
-      koa.body = await fs.readFile(resolve(config.diagnosticsFilePath), 'utf8').catch(() => '{\"format\":2,\"blocks\":[],\"errors\":[]}')
+      koa.body = await fs.readFile(diagnosticsPath, 'utf8').catch(() => '{\"format\":2,\"blocks\":[],\"errors\":[]}')
     })
   }
 }
@@ -443,8 +443,18 @@ async function exists(path: string) {
   try { await fs.access(path, constants.R_OK); return true } catch { return false }
 }
 
-async function fingerprintFiles(paths: string[]) {
-  return Promise.all(paths.map(async path => {
+function stringOrDefault(value: unknown, fallback: string) {
+  return typeof value === 'string' && value.trim() ? value : fallback
+}
+
+function resourcePackPaths(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((path): path is string => typeof path === 'string' && Boolean(path.trim()))
+    : []
+}
+
+async function fingerprintFiles(paths: unknown[]) {
+  return Promise.all(paths.filter((path): path is string => typeof path === 'string' && Boolean(path.trim())).map(async path => {
     const absolute = resolve(path)
     try {
       const stat = await fs.stat(absolute)
@@ -541,7 +551,7 @@ export function isJavaMemoryFailure(output: string, exitCode?: number | null) {
 }
 
 async function resolveMinecraftResources(config: Config) {
-  const configuredPath = config.minecraftJarPath.trim()
+  const configuredPath = typeof config.minecraftJarPath === 'string' ? config.minecraftJarPath.trim() : ''
   if (configuredPath && await exists(resolve(configuredPath))) return resolve(configuredPath)
   const bundled = resolve(join(__dirname, '../assets/vanilla-resources/Minecraft-26.2-Vanilla-Resources.zip'))
   if (!(await exists(bundled))) throw new Error(`插件内置的 Minecraft 26.2 原版资源包不存在：${bundled}`)
@@ -553,7 +563,7 @@ async function renderWithStandalone(input: string, output: string, minecraftJarP
   const rendererJar = resolve(config.standaloneRendererJar || join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.2.6.jar'))
   if (!(await exists(rendererJar))) throw new Error(`独立 Java 渲染器不存在：${rendererJar}`)
   if (!(await exists(minecraftJarPath))) throw new Error(`Minecraft 资源 JAR 不存在：${minecraftJarPath}`)
-  for (const pack of config.resourcePackPaths) {
+  for (const pack of resourcePackPaths(config.resourcePackPaths)) {
     if (!(await exists(resolve(pack)))) throw new Error(`材质包不存在：${pack}`)
   }
 
@@ -569,7 +579,7 @@ async function renderWithStandalone(input: string, output: string, minecraftJarP
     '--background', config.background,
   ]
   if (config.transparentBackground) rendererArgs.push('--transparent-background')
-  for (const pack of config.resourcePackPaths) rendererArgs.push('--resource-pack', resolve(pack))
+  for (const pack of resourcePackPaths(config.resourcePackPaths)) rendererArgs.push('--resource-pack', resolve(pack))
   const javaCommand = await resolveStandaloneJavaCommand(config.standaloneJavaCommand)
 
   for (let attempt = 0; attempt <= config.standaloneJavaMemoryRestartLimit; attempt++) {
