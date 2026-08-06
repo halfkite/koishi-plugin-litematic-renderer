@@ -259,22 +259,9 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.middleware(async (session, next) => {
     if (!session.guildId) return next()
-    const receivedFile = findFileElement(session)
-    if (!receivedFile) return next()
-    const file = isLikelyLitematicFile(receivedFile) ? receivedFile : undefined
-    if (!file) {
-      logger.info(`忽略非 Litematic 群文件：${fileName(receivedFile) || '未提供文件名'}`)
-      return next()
-    }
-    logger.info(`检测到 Litematic 群文件：${fileName(file)}`)
-    const url = await resolveFileUrl(session, file)
-    if (!url) {
-      if (isLikelyLitematicFile(file)) {
-        logger.warn(`检测到可能的 Litematic 文件但无法获取下载地址：${fileName(file)}；请检查 OneBot/NapCat 的 get_group_file_url 接口。`)
-        await session.send([...replyElements(session), h('text', { content: '检测到可能的投影文件，但无法获取群文件下载地址，请检查 OneBot/NapCat 文件接口。' })])
-      }
-      return next()
-    }
+    const file = findLitematicFile(session)
+    const url = file && await resolveFileUrl(session, file)
+    if (!url || !file) return next()
     if (isOverLimit(file.size, maxFileSizeBytes)) {
       await appendGlobalRenderError(diagnosticsPath, `input:${basename(file.name ?? 'unknown')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
       await session.send([...replyElements(session), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
@@ -284,7 +271,7 @@ export function apply(ctx: Context, config: Config) {
     }
     if (!isUnderLimit(file.size, maxFileSizeBytes)) return next()
     try {
-      const result = await render(url, fileName(file) || 'schematic.litematic')
+      const result = await render(url, file.name)
       await sendImages(session, result.images, result.metadata, resolveSendOptions(config, session.guildId))
     } catch (error) {
       logger.warn(error)
@@ -414,40 +401,18 @@ export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number
 }
 
 function fileElements(session: Pick<Session, 'elements' | 'content'>) {
-  const parsed = h.parse(session.content ?? '')
-  return [...(session.elements ?? []), ...parsed]
-}
-
-export function findFileElement(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
-  const raw = (session as any).event?._data
-  const rawFile = raw?.file ?? raw?.data?.file
-  if (rawFile && typeof rawFile === 'object') return rawFile as FileElement
-  return fileElements(session).find((element: any) => element.type === 'file')?.attrs as FileElement | undefined
+  return session.elements ?? h.parse(session.content ?? '')
 }
 
 export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>): FileElement | undefined {
   return fileElements(session).find((element: any) => {
     if (element.type !== 'file') return false
-    return isLikelyLitematicFile(element.attrs as FileElement)
+    return extname((element.attrs as FileElement).name ?? '').toLowerCase() === '.litematic'
   })?.attrs as FileElement | undefined
 }
 
-function fileName(file: FileElement) {
-  const nested = file.file && typeof file.file === 'object' ? file.file : undefined
-  const value = file.name ?? file.filename ?? file.file_name ?? file.fileName
-    ?? nested?.name ?? nested?.filename ?? nested?.file_name ?? nested?.fileName ?? ''
-  return typeof value === 'string' ? value.trim() : ''
-}
-
-function isLikelyLitematicFile(file: FileElement) {
-  return extname(fileName(file)).toLowerCase() === '.litematic'
-}
-
 async function resolveFileUrl(session: Session, file: FileElement) {
-  const nested = file.file && typeof file.file === 'object' ? file.file : undefined
-  const direct = file.url ?? file.src ?? (typeof file.file === 'string' ? file.file : undefined)
-    ?? nested?.url ?? nested?.src
-  if (typeof direct === 'string' && direct) return direct
+  if (file.url || file.src) return file.url ?? file.src
   const fileId = file.id ?? file.file_id ?? file.fileId
   const internal = (session.bot as any).internal
   if (!session.guildId || !fileId || typeof internal?.getGroupFileUrl !== 'function') return
