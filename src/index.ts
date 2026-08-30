@@ -44,6 +44,7 @@ export interface Config {
   standaloneJavaRetryMaxHeapMb: number
   standaloneJavaMemoryRestartLimit: number
   maxFileSize: number
+  privateMaxFileSize: number
   outputSize: number
   background: string
   transparentBackground: boolean
@@ -111,7 +112,8 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const('gpuAgent').description('独立 GPU Agent（主动连接）'),
       Schema.const('standalone').description('真实材质快速渲染（推荐）'),
     ]).default('gpuAgent').description('渲染引擎；真实材质快速渲染无需启动 Minecraft 客户端。'),
-    maxFileSize: Schema.natural().min(1).default(1024).description('自动处理的最大文件大小（KB）。'),
+    maxFileSize: Schema.natural().min(1).default(1024).description('群聊自动处理的最大文件大小（KB）。'),
+    privateMaxFileSize: Schema.natural().min(1).default(1024).description('单人聊天自动处理的最大文件大小（KB）；与群聊上限相互独立。'),
     outputSize: Schema.natural().min(256).max(4096).default(1024).description('最终输出边长（CPU 渲染时生效）。GPU Agent 模式下分辨率由 Agent 端「分辨率」设置接管，此项不生效。'),
     background: Schema.string().default('#000000').description('PNG 背景颜色。'),
     transparentBackground: Schema.boolean().default(false).description('输出透明背景。'),
@@ -556,9 +558,9 @@ export function apply(ctx: Context, config: Config) {
     .catch(error => logger.warn(`缓存初始化失败：${error instanceof Error ? error.message : String(error)}`))
 
   const render = async (url: string, filename = 'schematic.litematic', preparedBytes?: Buffer, includeSixFace = false,
-                        source?: { group?: string, user?: string }): Promise<RenderResult> => {
+                        source?: { group?: string, user?: string }, limitBytes?: number): Promise<RenderResult> => {
     const renderSource = source
-    const bytes = preparedBytes ?? await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
+    const bytes = preparedBytes ?? await download(ctx, url, limitBytes ?? maxFileSizeBytes, config.renderTimeout)
     const parsedMetadata = parseLitematicMetadata(bytes)
     const metadata = formatLitematicMetadata(parsedMetadata, filename)
     const projectionName = projectionNameFromFilename(filename)
@@ -706,18 +708,25 @@ export function apply(ctx: Context, config: Config) {
       await session.send([...replyElements(session, config.qqBotType), h('text', { content: '检测到投影文件，但无法获取群文件下载地址，请检查机器人文件接口。' })])
       return next()
     }
-    if (isOverLimit(file.size, maxFileSizeBytes)) {
-      await appendGlobalRenderError(diagnosticsPath, `input:${basename(fileName(file) ?? 'unknown.litematic')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
-      await session.send([...replyElements(session, config.qqBotType), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
-      return next()
-      await session.send(`文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。`)
+    if (!isGroupAllowed(config, session.guildId)) {
+      logger.info(`群 ${session.guildId} 不在渲染白名单内（或已被拉黑），忽略其投影文件。`)
+      await session.send([...replyElements(session, config.qqBotType), h('text', { content: `本群未开启投影渲染。如需开启，请将群 ID ${session.guildId} 加入插件的白名单。` })])
       return next()
     }
-    if (!isUnderLimit(file.size, maxFileSizeBytes)) return next()
+    // 单人聊天使用独立的文件大小上限
+    const privateChat = Boolean(session.isDirect)
+    const limitKb = privateChat ? config.privateMaxFileSize : config.maxFileSize
+    const limitBytes = limitKb * 1024
+    if (isOverLimit(file.size, limitBytes)) {
+      await appendGlobalRenderError(diagnosticsPath, `input:${basename(fileName(file) ?? 'unknown.litematic')}`, 'input', `file size exceeds ${limitKb} KB`, logger)
+      await session.send([...replyElements(session, config.qqBotType), h('text', { content: `文件大小超过 ${(limitKb / 1024).toFixed(2)} MB，无法渲染。` })])
+      return next()
+    }
+    if (!isUnderLimit(file.size, limitBytes)) return next()
     try {
       const sendOptions = resolveSendOptions(config, session.guildId)
       const result = await render(url, fileName(file) ?? 'schematic.litematic', undefined, sendOptions.sixFaceOverview,
-        { group: session.guildId ?? undefined, user: session.userId ?? undefined })
+        { group: session.guildId ?? undefined, user: session.userId ?? undefined }, limitBytes)
       await sendImages(session, result.images, result.metadata, sendOptions, result.projectionName)
     } catch (error) {
       logger.warn(error)
@@ -735,9 +744,10 @@ export function apply(ctx: Context, config: Config) {
       if (!session) return '此命令只能在消息会话中执行。'
       if (!canRenderInSession(session, config.allowPrivateRender)) return '单人对话渲染未开启，请在插件发送设置中启用。'
       if (!isGroupAllowed(config, session.guildId)) return `本群未开启投影渲染。如需开启，请将群 ID ${session.guildId} 加入插件的白名单。`
+      const limitBytes = (session.isDirect ? config.privateMaxFileSize : config.maxFileSize) * 1024
       try {
         const sendOptions = resolveSendOptions(config, session.guildId)
-        const result = await render(url, 'schematic.litematic', undefined, sendOptions.sixFaceOverview)
+        const result = await render(url, 'schematic.litematic', undefined, sendOptions.sixFaceOverview, undefined, limitBytes)
         await sendImages(session, result.images, result.metadata, sendOptions, result.projectionName)
       } catch (error) {
         return formatRenderError(error, config)
