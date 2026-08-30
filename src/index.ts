@@ -21,7 +21,6 @@ export const name = 'litematic-renderer'
 export const inject = { optional: ['puppeteer', 'server', 'console'] }
 const CACHE_FORMAT_VERSION = 16
 const RESOURCE_PACK_UPLOAD_LIMIT = 256 * 1024 * 1024
-const GPU_CLIENT_JAR_NAME = 'quickcraft-mc26.2-1.0.5-renderbridge.jar'
 const packageVersion = (require('../package.json') as { version?: unknown }).version
 const PLUGIN_VERSION = typeof packageVersion === 'string' ? packageVersion : 'unknown'
 
@@ -39,14 +38,13 @@ export interface Config {
   javaPath: string
   minecraftJarPath: string
   resourcePackPaths: string[]
-  renderEngine: 'standalone' | 'gpuClient' | 'gpuAgent' | 'java' | 'webgl' | 'cpu'
+  renderEngine: 'standalone' | 'gpuAgent'
   standaloneRenderTimeout: number
   standaloneJavaMaxHeapMb: number
   standaloneJavaRetryMaxHeapMb: number
   standaloneJavaMemoryRestartLimit: number
   maxFileSize: number
   outputSize: number
-  isometricCellSize: number
   background: string
   transparentBackground: boolean
   allowPrivateRender: boolean
@@ -61,15 +59,6 @@ export interface Config {
   cacheMaxSizeGb: number
   diagnosticsFilePath: string
   patchOneBotGroupUpload: boolean
-  javaBridgeDirectory: string
-  gpuClientGameDirectory: string
-  gpuRendererCommand: string
-  javaRenderTimeout: number
-  javaResolution: number
-  webglQuality: 'standard' | 'high' | 'ultra'
-  webglWidth: number
-  webglHeight: number
-  isometricSquare: boolean
   isometricFill: number
   isometricRotation: number
   isometricSlant: number
@@ -119,10 +108,6 @@ export const Config: Schema<Config> = Schema.intersect([
     renderEngine: Schema.union([
       Schema.const('gpuAgent').description('独立 GPU Agent（主动连接）'),
       Schema.const('standalone').description('真实材质快速渲染（推荐）'),
-      Schema.const('gpuClient').description('Minecraft 26.2 GPU 客户端（最快）').hidden(),
-      Schema.const('webgl').description('GPU WebGL（轻量，部分透明材质可能不准确）').hidden(),
-      Schema.const('java').description('Fabric 客户端桥接').hidden(),
-      Schema.const('cpu').description('简化方块颜色渲染').hidden(),
     ]).default('gpuAgent').description('渲染引擎；真实材质快速渲染无需启动 Minecraft 客户端。'),
     maxFileSize: Schema.natural().min(1).default(1024).description('自动处理的最大文件大小（KB）。'),
     outputSize: Schema.natural().min(256).max(4096).default(1024).description('最终输出边长（CPU 渲染时生效）。GPU Agent 模式下分辨率由 Agent 端「分辨率」设置接管，此项不生效。'),
@@ -163,7 +148,6 @@ export const Config: Schema<Config> = Schema.intersect([
     standaloneJavaMaxHeapMb: Schema.natural().min(128).max(32768).step(8).default(200).description('首次独立渲染的最大堆内存（MiB）。'),
     standaloneJavaRetryMaxHeapMb: Schema.natural().min(256).max(32768).step(128).default(2048).description('内存不足时新进程重试的最大堆内存（MiB）。'),
     standaloneJavaMemoryRestartLimit: Schema.natural().max(3).default(1).description('检测到内存不足后启动全新进程重试的次数。'),
-    javaResolution: Schema.natural().min(256).max(4096).default(1024).hidden().description('旧版 Java 分辨率字段，仅用于兼容已有配置；现在统一使用图像清晰度。'),
   }).description('独立渲染器').collapse(),
   Schema.object({
     renderTimeout: Schema.natural().min(1000).default(30000).description('文件下载超时（毫秒）。'),
@@ -171,17 +155,6 @@ export const Config: Schema<Config> = Schema.intersect([
     cacheMaxSizeGb: Schema.number().min(1).max(1024).step(1).default(20).description('所有版本缓存总上限（GiB），超出后按最久未使用清理。'),
     diagnosticsFilePath: Schema.string().default('data/litematic-renderer-diagnostics.json').description('渲染诊断持久化文件路径；导出地址固定为 /litematic-renderer/diagnostics。'),
   }).description('缓存与诊断').collapse(),
-  Schema.object({
-    isometricCellSize: Schema.natural().min(2).max(32).default(7).description('仅 CPU 后端：方块菱形半宽；数值越大，原始轴测图越细致，也越耗内存。'),
-    javaRenderTimeout: Schema.natural().min(10000).default(180000).description('Minecraft GPU/Fabric 客户端后端：等待渲染任务完成的超时（毫秒）。'),
-    webglQuality: Schema.union([Schema.const('standard'), Schema.const('high'), Schema.const('ultra')]).default('high').description('仅 WebGL 后端：模型与材质渲染质量；越高越清晰，也越耗浏览器资源。'),
-    webglWidth: Schema.natural().min(256).max(2048).default(800).hidden().description('旧版 WebGL 宽度字段，仅用于兼容；现在统一使用图像清晰度。'),
-    webglHeight: Schema.natural().min(256).max(2048).default(600).hidden().description('旧版 WebGL 高度字段，仅用于兼容；现在统一使用图像清晰度。'),
-    isometricSquare: Schema.boolean().default(true).description('仅 WebGL 后端：将轴测图画布调整为正方形。'),
-    javaBridgeDirectory: Schema.path({ filters: ['directory'] }).default('').description('仅 java/Fabric 桥后端：Minecraft Java 渲染桥任务目录；standalone 后端无需填写。'),
-    gpuClientGameDirectory: Schema.path({ filters: ['directory'] }).default('').description('仅 Minecraft 26.2 GPU 客户端：游戏目录（例如 26.2-Fabricjqr）。插件会自动安装内置单 JAR 渲染端并连接任务队列。'),
-    gpuRendererCommand: Schema.path({ filters: ['file'] }).default('').description('可选外部 GPU 渲染器程序；填写后最先尝试，失败时自动回退到 renderEngine。'),
-  }).description('高级设置').collapse(),
   Schema.object({
     gpuAgentEnabled: Schema.boolean().default(false).description('启用由 GPU Agent 主动连接的 WebSocket v2 服务。'),
     gpuAgentListenHost: Schema.string().default('0.0.0.0').description('GPU Agent WebSocket 监听地址。'),
@@ -501,9 +474,6 @@ export function apply(ctx: Context, config: Config) {
       gpuAgentQueue = run.catch(() => undefined)
       return run
     }
-  if (config.renderEngine === 'gpuClient' && config.gpuClientGameDirectory?.trim()) {
-    void installBundledGpuClient(config.gpuClientGameDirectory, logger)
-  }
   if (config.qqBotType === 'official') {
     const proxyUrl = resolveOfficialProxyUrl(config)
     if (proxyUrl) {
@@ -600,16 +570,10 @@ export function apply(ctx: Context, config: Config) {
     const renderHash = hashRenderConfiguration({
         version: CACHE_FORMAT_VERSION,
         outputSize: config.outputSize,
-        isometricCellSize: config.isometricCellSize,
         background: config.background,
         transparentBackground: config.transparentBackground,
-        gpuRendererCommand: config.gpuRendererCommand,
         renderEngine: config.renderEngine,
         resourceFingerprint,
-        webglQuality: config.webglQuality,
-        webglWidth: config.webglWidth,
-        webglHeight: config.webglHeight,
-        isometricSquare: config.isometricSquare,
         isometricFill: config.isometricFill,
         isometricRotation: config.isometricRotation,
         isometricSlant: config.isometricSlant,
@@ -637,50 +601,30 @@ export function apply(ctx: Context, config: Config) {
         task = (async () => {
           try {
           if ((await Promise.all(expected.map(exists))).every(Boolean)) return
-          const gpuSucceeded = Boolean(config.gpuRendererCommand
-            && await renderWithGpu(config.gpuRendererCommand, input, output, config.renderTimeout, logger))
-          if (!gpuSucceeded || !(await Promise.all(expected.map(exists))).every(Boolean)) {
-            if (config.renderEngine === 'standalone') {
+          if (config.renderEngine === 'standalone') {
+            await renderWithStandalone(input, output, minecraftJarPath, config, logger)
+            await mergeRenderDiagnostics(output, diagnosticsPath, logger)
+          } else {
+            try {
+              if (!gpuAgentHub) throw new Error('GPU Agent v2 服务未启用')
+              const result = await enqueueGpuAgentRender(() => gpuAgentHub.render(createGpuRenderRequest(filename, config, renderSource), bytes, config.gpuAgentTimeout))
+              for (const image of result.images) {
+                if (image.id === 'merged' || image.name === 'merged.png') {
+                  // Agent 已把正反两图拼为一张：直接作为唯一结果
+                  await fs.writeFile(join(output, 'isometric.png'), image.png)
+                  break
+                }
+                if (image.id === 'isometric' || image.name === 'isometric.png') {
+                  await fs.writeFile(join(output, 'isometric.png'), image.png)
+                } else if (image.id === 'isometric-reverse' || image.name === 'isometric-reverse.png') {
+                  await fs.writeFile(join(output, 'isometric-reverse.png'), image.png)
+                }
+              }
+            } catch (error) {
+              if (!config.gpuAgentFallback) throw error
+              logger.warn(`GPU Agent 渲染失败，回退独立 Java：${error instanceof Error ? error.message : String(error)}`)
               await renderWithStandalone(input, output, minecraftJarPath, config, logger)
               await mergeRenderDiagnostics(output, diagnosticsPath, logger)
-            } else if (config.renderEngine === 'gpuAgent') {
-              try {
-                if (!gpuAgentHub) throw new Error('GPU Agent v2 服务未启用')
-                const result = await enqueueGpuAgentRender(() => gpuAgentHub.render(createGpuRenderRequest(filename, config, renderSource), bytes, config.gpuAgentTimeout))
-                for (const image of result.images) {
-                  if (image.id === 'merged' || image.name === 'merged.png') {
-                    // Agent 已把正反两图拼为一张：直接作为唯一结果
-                    await fs.writeFile(join(output, 'isometric.png'), image.png)
-                    break
-                  }
-                  if (image.id === 'isometric' || image.name === 'isometric.png') {
-                    await fs.writeFile(join(output, 'isometric.png'), image.png)
-                  } else if (image.id === 'isometric-reverse' || image.name === 'isometric-reverse.png') {
-                    await fs.writeFile(join(output, 'isometric-reverse.png'), image.png)
-                  }
-                }
-              } catch (error) {
-                if (!config.gpuAgentFallback) throw error
-                logger.warn(`GPU Agent 渲染失败，回退独立 Java：${error instanceof Error ? error.message : String(error)}`)
-                await renderWithStandalone(input, output, minecraftJarPath, config, logger)
-                await mergeRenderDiagnostics(output, diagnosticsPath, logger)
-              }
-            } else if (config.renderEngine === 'java' || config.renderEngine === 'gpuClient') {
-              await renderWithJavaBridge(input, output, config)
-            } else {
-              const schematic = parseLitematic(bytes)
-              let images: RenderedImage[]
-              if (config.renderEngine === 'webgl' && (ctx as any).puppeteer) {
-                try {
-                  images = await renderWithWebgl(ctx, bytes, config)
-                } catch (error) {
-                  logger.warn(`WebGL 渲染失败，回退 CPU：${error instanceof Error ? error.message : String(error)}`)
-                  images = renderSchematic(schematic, config)
-                }
-              } else {
-                images = renderSchematic(schematic, config)
-              }
-              await Promise.all(images.map(image => fs.writeFile(join(output, image.title), image.png)))
             }
           }
           // Agent 合并模式下只生成一张拼接图（isometric.png），此时不要求两张
@@ -1340,38 +1284,6 @@ async function terminateActiveStandaloneJavaProcesses(logger: ReturnType<Context
   logger.info(`已终止 ${processes.length} 个独立渲染 Java 进程并回收其子进程`)
 }
 
-async function installBundledGpuClient(gameDirectory: string, logger: ReturnType<Context['logger']>) {
-  const game = resolve(gameDirectory)
-  const source = resolve(join(__dirname, `../assets/gpu-client/${GPU_CLIENT_JAR_NAME}`))
-  if (!(await exists(source))) {
-    logger.warn(`内置 GPU 客户端 JAR 不存在：${source}`)
-    return
-  }
-  if (!(await exists(game))) {
-    logger.warn(`GPU 客户端游戏目录不存在：${game}`)
-    return
-  }
-  const mods = join(game, 'mods')
-  const destination = join(mods, GPU_CLIENT_JAR_NAME)
-  try {
-    await fs.mkdir(mods, { recursive: true })
-    const sourceHash = await fileSha256(source)
-    const destinationHash = await fileSha256(destination)
-    if (sourceHash !== destinationHash) {
-      await fs.copyFile(source, destination)
-    }
-    for (const entry of await fs.readdir(mods)) {
-      if (entry === GPU_CLIENT_JAR_NAME || !/^quickcraft-mc26\.2-.*\.jar$/i.test(entry)) continue
-      const path = join(mods, entry)
-      const disabled = `${path}.disabled`
-      if (!(await exists(disabled))) await fs.rename(path, disabled)
-    }
-    logger.info(`Minecraft 26.2 GPU 渲染端已安装：${destination}`)
-  } catch (error) {
-    logger.warn(`GPU 渲染端安装失败，请关闭 Minecraft 后重载插件：${error instanceof Error ? error.message : String(error)}`)
-  }
-}
-
 async function fileSha256(path: string) {
   try {
     return createHash('sha256').update(await fs.readFile(path)).digest('hex')
@@ -1379,84 +1291,6 @@ async function fileSha256(path: string) {
     if (error?.code === 'ENOENT') return undefined
     throw error
   }
-}
-
-interface JavaBridgeStatus {
-  timestamp?: number
-  inWorld?: boolean
-  resourcePacks?: string[]
-  renderer?: string
-  rendererVersion?: string
-}
-
-interface JavaBridgeResult {
-  success?: boolean
-  error?: string
-}
-
-async function renderWithJavaBridge(input: string, output: string, config: Config) {
-  const quickCraftGpu = config.renderEngine === 'gpuClient'
-  if (quickCraftGpu && !config.gpuClientGameDirectory?.trim()) {
-    throw new Error('Minecraft 26.2 GPU 客户端游戏目录未配置')
-  }
-  if (!quickCraftGpu && !config.javaBridgeDirectory.trim()) {
-    throw new Error('Fabric Java 渲染桥任务目录未配置；使用 java 后端时请填写 javaBridgeDirectory')
-  }
-  const bridge = quickCraftGpu
-    ? join(resolve(config.gpuClientGameDirectory), 'quickcraft-render-bridge')
-    : resolve(config.javaBridgeDirectory)
-  const status = await readJson<JavaBridgeStatus>(join(bridge, 'status.json'))
-  if (!status?.timestamp || Date.now() - status.timestamp > 5000) {
-    throw new Error(quickCraftGpu
-      ? 'Minecraft 26.2 GPU 渲染端未运行；请启动已配置的 Fabric 客户端，无需手动进入存档'
-      : 'Minecraft Java 渲染桥未运行；请启动 1.21.1-Fabric 客户端并进入一个世界')
-  }
-  if (!quickCraftGpu && !status.inWorld) throw new Error('Minecraft Java 渲染桥已启动，但客户端尚未进入世界')
-
-  if (!quickCraftGpu) {
-    const packs = status.resourcePacks ?? []
-    const required = [
-      ['XeKr', '3.6forMC1.20.2~1.21.5.zip'],
-      ['XKRDA', '1.19.4~1.21snapshot.zip'],
-    ]
-    if (!required.every(parts => packs.some(id => parts.every(part => id.includes(part))))) {
-      throw new Error('Minecraft 客户端没有同时启用 XeKr 红显基础包和 XKRDA 附加包')
-    }
-  }
-
-  const id = randomUUID()
-  const jobs = join(bridge, 'jobs')
-  const resultPath = join(bridge, 'results', `${id}.result.json`)
-  const jobPath = join(jobs, `${id}.job.json`)
-  const temporaryPath = `${jobPath}.tmp`
-  await fs.mkdir(jobs, { recursive: true })
-  await fs.rm(resultPath, { force: true })
-  await fs.writeFile(temporaryPath, JSON.stringify({
-    id,
-    input: resolve(input),
-    outputDirectory: resolve(output),
-    resolution: effectiveRenderResolution(config),
-    supersampling: 1,
-    rotation: config.isometricRotation,
-    pitch: config.isometricSlant,
-    slant: config.isometricSlant,
-    fill: config.isometricFill,
-    background: config.background,
-    transparentBackground: config.transparentBackground,
-  }))
-  await fs.rename(temporaryPath, jobPath)
-
-  const deadline = Date.now() + config.javaRenderTimeout
-  while (Date.now() < deadline) {
-    const result = await readJson<JavaBridgeResult>(resultPath)
-    if (result) {
-      await fs.rm(resultPath, { force: true })
-      if (!result.success) throw new Error(`Minecraft Java 渲染失败：${result.error ?? '未知错误'}`)
-      return
-    }
-    await new Promise(resolveDelay => setTimeout(resolveDelay, 200))
-  }
-  throw new Error(`Minecraft Java 渲染超过 ${Math.round(config.javaRenderTimeout / 1000)} 秒`)
 }
 
 export function createGpuRenderRequest(filename: string, config: Pick<Config,
@@ -1603,45 +1437,6 @@ export function formatRenderError(error: unknown, config: Pick<Config, 'maxFileS
     return '请启动 Minecraft 26.2-Fabricjqr GPU 渲染客户端，停在主菜单即可，无需手动进入存档。'
   }
   return '投影渲染失败，请检查渲染器配置或导出诊断文件。'
-}
-
-async function renderWithGpu(command: string, input: string, output: string, timeout: number, logger: ReturnType<Context['logger']>) {
-  try {
-    await new Promise<void>((resolveRun, reject) => {
-      const child = spawn(command, ['--input', input, '--output', output, '--views', 'isometric,isometric-reverse'], { shell: false, windowsHide: true })
-      const timer = setTimeout(() => { child.kill(); reject(new Error('GPU 渲染超时')) }, timeout)
-      child.once('error', reject)
-      child.once('exit', code => code === 0 ? resolveRun() : reject(new Error(`GPU 渲染器退出码：${code}`)))
-      child.once('close', () => clearTimeout(timer))
-    })
-    return true
-  } catch (error) {
-    logger.warn(`GPU 渲染器不可用，回退 CPU：${error instanceof Error ? error.message : String(error)}`)
-    return false
-  }
-}
-
-async function renderWithWebgl(ctx: Context, data: Buffer, config: Config): Promise<RenderedImage[]> {
-  const page = await (ctx as any).puppeteer.page()
-  try {
-    const viewer = pathToFileURL(resolve(__dirname, '../assets/threeviews/index.html')).href
-    await page.goto(viewer, { waitUntil: 'networkidle0', timeout: config.renderTimeout })
-    await page.waitForFunction(() => Boolean((window as any).litematicViewerAPI && (window as any).deepslateResources), { timeout: config.renderTimeout })
-    const views = await page.evaluate(async ({ base64, width, height, quality, isometricSquare, isometricFill, isometricRotation, isometricSlant }: { base64: string, width: number, height: number, quality: string, isometricSquare: boolean, isometricFill: number, isometricRotation: number, isometricSlant: number }) => {
-      const binary = atob(base64)
-      const bytes = new Uint8Array(binary.length)
-      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
-      const file = new File([bytes], 'schematic.litematic', { type: 'application/octet-stream' })
-      await (window as any).litematicViewerAPI.loadFromFile(file)
-      return (window as any).litematicViewerAPI.renderIsometricViews({ width, height, quality, isometricSquare, isometricFill, isometricRotation, isometricSlant })
-    }, { base64: data.toString('base64'), width: effectiveRenderResolution(config), height: effectiveRenderResolution(config), quality: config.webglQuality, isometricSquare: config.isometricSquare, isometricFill: config.isometricFill, isometricRotation: config.isometricRotation, isometricSlant: config.isometricSlant })
-    return [
-      { title: 'isometric.png', png: decodeDataUrl(views.isometricView) },
-      { title: 'isometric-reverse.png', png: decodeDataUrl(views.reverseIsometricView) },
-    ]
-  } finally {
-    await page.close().catch(() => undefined)
-  }
 }
 
 function decodeDataUrl(value: unknown) {
@@ -1973,14 +1768,6 @@ function unpackState(words: bigint[], index: number, bits: number) {
   return Number(value)
 }
 
-export function renderSchematic(blocks: Block[], config: Config) {
-  const bounds = getBounds(blocks)
-  return [
-    { title: 'isometric.png', png: renderIsometric(blocks, bounds, config, false) },
-    { title: 'isometric-reverse.png', png: renderIsometric(blocks, bounds, config, true) },
-  ]
-}
-
 function getBounds(blocks: Block[]): Bounds {
   return blocks.reduce((box, block) => ({ minX: Math.min(box.minX, block.x), minY: Math.min(box.minY, block.y), minZ: Math.min(box.minZ, block.z), maxX: Math.max(box.maxX, block.x), maxY: Math.max(box.maxY, block.y), maxZ: Math.max(box.maxZ, block.z) }), { minX: Infinity, minY: Infinity, minZ: Infinity, maxX: -Infinity, maxY: -Infinity, maxZ: -Infinity })
 }
@@ -2107,29 +1894,6 @@ function drawFaceLabel(canvas: Raster, face: OrthographicFace, tileX: number, ti
       }
     }
   }
-}
-
-function renderIsometric(blocks: Block[], bounds: Bounds, config: Config, reverse: boolean) {
-  const c = config.isometricCellSize, halfHeight = Math.ceil(c / 2)
-  const width = (bounds.maxX - bounds.minX + bounds.maxZ - bounds.minZ + 2) * c + 4
-  const height = (bounds.maxX - bounds.minX + bounds.maxZ - bounds.minZ + 2) * halfHeight + (bounds.maxY - bounds.minY + 2) * c + 4
-  const scale = Math.max(1, Math.min(1, config.outputSize / Math.max(width, height)))
-  const canvas = new Raster(Math.ceil(width * scale), Math.ceil(height * scale), config)
-  const coordinate = (block: Block) => ({
-    x: reverse ? bounds.maxX - block.x : block.x - bounds.minX,
-    z: reverse ? bounds.maxZ - block.z : block.z - bounds.minZ,
-  })
-  const sorted = [...blocks].sort((a, b) => {
-    const first = coordinate(a), second = coordinate(b)
-    return (first.x + first.z + a.y) - (second.x + second.z + b.y)
-  })
-  for (const block of sorted) {
-    const projected = coordinate(block)
-    const x = (projected.x - projected.z) * c + width / 2
-    const y = ((projected.x + projected.z) * halfHeight) + (bounds.maxY - block.y + 1) * c
-    canvas.voxel(Math.round(x * scale), Math.round(y * scale), Math.max(2, Math.round(c * scale)), colorFor(block.name))
-  }
-  return canvas.png()
 }
 
 const COLORS: Record<string, string> = {

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { gzipSync, inflateSync } from 'node:zlib'
-import { Config as RendererConfig, SIX_FACE_LABELS, buildSshProxyArguments, cacheNameSegment, canRenderInSession, effectiveRenderResolution, enforceCacheLimit, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, patchOneBotAdapterSource, renderSchematic, renderSixFaceOverview, replyElements, resolveOfficialProxyUrl, resolveSendOptions, saveUploadedResourcePack, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
+import { Config as RendererConfig, SIX_FACE_LABELS, buildSshProxyArguments, cacheNameSegment, canRenderInSession, effectiveRenderResolution, enforceCacheLimit, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, patchOneBotAdapterSource, renderSixFaceOverview, replyElements, resolveOfficialProxyUrl, resolveSendOptions, saveUploadedResourcePack, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
 import { decodeGpuBinary, encodeGpuBinary, gpuAgentAuthSignature, selectGpuAgent } from '../lib/gpu-agent-protocol.js'
 
 const short = (value) => { const data = Buffer.alloc(2); data.writeUInt16BE(value); return data }
@@ -98,21 +98,10 @@ test('resolves official outbound proxy and builds a local-only SSH SOCKS tunnel'
   assert.throws(() => resolveOfficialProxyUrl({ ...config, officialProxyMode: 'proxy', officialProxyUrl: 'ftp://127.0.0.1' }), /不支持的代理协议/)
 })
 
-test('parses packed Litematica block states and renders two opposite isometric PNGs', () => {
+test('parses packed Litematica block states', () => {
   const blocks = parseLitematic(sampleLitematic(), 10)
   assert.deepEqual(blocks, [{ x: 1, y: 0, z: 0, name: 'minecraft:diamond_block' }])
   assert.deepEqual(parseLitematic(sampleLitematic(), 0), blocks)
-  const images = renderSchematic(blocks, {
-    maxFileSize: 1024 * 1024, outputSize: 256, isometricCellSize: 7,
-    background: '#182026', transparentBackground: false, sendAsForward: true,
-    renderTimeout: 1000, cacheDirectory: '.', gpuRendererCommand: '',
-    renderEngine: 'cpu', javaBridgeDirectory: '.', javaRenderTimeout: 10000,
-    javaResolution: 256, webglQuality: 'standard',
-    webglWidth: 256, webglHeight: 256, isometricSquare: true, isometricFill: 0.78,
-    isometricRotation: 135, isometricSlant: 36,
-  })
-  assert.deepEqual(images.map(image => image.title), ['isometric.png', 'isometric-reverse.png'])
-  for (const image of images) assert.deepEqual(image.png.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
 })
 
 test('renders horizontal and vertical six-face PNGs within outputSize', () => {
@@ -210,9 +199,9 @@ test('shows every effective config field and omits obsolete fields', () => {
   assert.equal(fields.standaloneJavaCommand, undefined)
   assert.equal(fields.javaSupersampling, undefined)
   assert.equal(fields.remoteAgentUrl, undefined)
-  assert.ok(fields.javaBridgeDirectory)
-  assert.ok(fields.gpuClientGameDirectory)
-  assert.ok(fields.gpuRendererCommand)
+  assert.ok(fields.javaBridgeDirectory === undefined)
+  assert.ok(fields.gpuClientGameDirectory === undefined)
+  assert.ok(fields.gpuRendererCommand === undefined)
   assert.equal(fields.cellSize, undefined)
   assert.equal(fields.diagnosticsExport, undefined)
   for (const index of [3, 4, 5]) {
@@ -267,8 +256,7 @@ test('keeps versioned cache entries until the total limit requires LRU eviction'
 })
 
 test('uses a different cache folder when image settings change', () => {
-  const baseline = { javaResolution: 1024, background: '#000000', transparentBackground: false }
-  assert.notEqual(hashRenderConfiguration(baseline), hashRenderConfiguration({ ...baseline, javaResolution: 2048 }))
+  const baseline = { background: '#000000', transparentBackground: false }
   assert.notEqual(hashRenderConfiguration(baseline), hashRenderConfiguration({ ...baseline, background: '#ffffff' }))
   assert.notEqual(hashRenderConfiguration(baseline), hashRenderConfiguration({ ...baseline, transparentBackground: true }))
 })
@@ -290,7 +278,7 @@ test('accepts Java 21+ and applies bounded-memory JVM options', () => {
 })
 
 test('uses the main image clarity setting for every render backend', () => {
-  assert.equal(effectiveRenderResolution({ outputSize: 2048, javaResolution: 256 }), 2048)
+  assert.equal(effectiveRenderResolution({ outputSize: 2048 }), 2048)
   assert.equal(effectiveRenderResolution({ outputSize: 99999 }), 4096)
   assert.equal(effectiveRenderResolution({ outputSize: 1 }), 256)
 })
