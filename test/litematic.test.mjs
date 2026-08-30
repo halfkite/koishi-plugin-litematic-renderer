@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { gzipSync, inflateSync } from 'node:zlib'
-import { Config as RendererConfig, SIX_FACE_LABELS, buildSshProxyArguments, cacheNameSegment, canRenderInSession, effectiveRenderResolution, enforceCacheLimit, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, patchOneBotAdapterSource, renderSixFaceOverview, replyElements, resolveOfficialProxyUrl, resolveSendOptions, saveUploadedResourcePack, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
+import { Config as RendererConfig, SIX_FACE_LABELS, buildSshProxyArguments, cacheNameSegment, canRenderInSession, effectiveRenderResolution, enforceCacheLimit, findLitematicFile, formatLitematicMetadata, formatRenderError, hashRenderConfiguration, isGroupAllowed, isJavaMemoryFailure, parseLitematic, parseLitematicMetadata, patchOneBotAdapterSource, renderSixFaceOverview, replyElements, resolveOfficialProxyUrl, resolveSendOptions, saveUploadedResourcePack, sendImages, standaloneJvmOptions, supportsStandaloneJavaVersion } from '../lib/index.js'
 import { decodeGpuBinary, encodeGpuBinary, gpuAgentAuthSignature, selectGpuAgent } from '../lib/gpu-agent-protocol.js'
 
 const short = (value) => { const data = Buffer.alloc(2); data.writeUInt16BE(value); return data }
@@ -443,6 +443,19 @@ test('gates private rendering without affecting group and channel sessions', () 
   assert.equal(canRenderInSession({ guildId: undefined, isDirect: true }, false), false)
   assert.equal(canRenderInSession({ guildId: undefined, isDirect: true }, true), true)
   assert.equal(canRenderInSession({ guildId: undefined, isDirect: false }, true), false)
+})
+
+test('applies group whitelist and blacklist with blacklist precedence', () => {
+  const both = { groupWhitelist: ['g1', ' g2 '], groupBlacklist: ['bad'] }
+  assert.equal(isGroupAllowed(both, 'g1'), true)
+  assert.equal(isGroupAllowed(both, 'g2'), true, '白名单匹配应忽略首尾空格')
+  assert.equal(isGroupAllowed(both, 'g3'), false, '白名单非空时未列出的群不可用')
+  assert.equal(isGroupAllowed(both, 'bad'), false, '黑名单优先于白名单')
+  const blacklistOnly = { groupWhitelist: [], groupBlacklist: ['bad'] }
+  assert.equal(isGroupAllowed(blacklistOnly, 'any-group'), true)
+  assert.equal(isGroupAllowed(blacklistOnly, 'bad'), false)
+  assert.equal(isGroupAllowed({ groupWhitelist: [], groupBlacklist: [] }, 'any-group'), true)
+  assert.equal(isGroupAllowed(both, undefined), true, '私聊不受名单约束')
 })
 
 test('recognizes nested and raw OneBot litematic filenames without matching suffixes', () => {

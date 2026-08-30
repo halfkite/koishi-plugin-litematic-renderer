@@ -54,6 +54,8 @@ export interface Config {
   sixFaceOverview: boolean
   sixFaceLayout: SixFaceLayout
   groupSendOptions: GroupSendOption[]
+  groupWhitelist: string[]
+  groupBlacklist: string[]
   renderTimeout: number
   cacheDirectory: string
   cacheMaxSizeGb: number
@@ -132,6 +134,8 @@ export const Config: Schema<Config> = Schema.intersect([
         Schema.const('disabled').description('关闭回复 @'),
       ]).default('inherit'),
     })).default([]).description('按群覆盖发送方式和回复设置；官方 QQ 只使用引用开关，自建 QQ 同时使用发送模式和 @。'),
+    groupWhitelist: Schema.array(Schema.string()).default([]).description('群白名单：非空时只有列表内的群可以渲染（官方 QQ 填开放平台群哈希，自建 QQ 填群号）。'),
+    groupBlacklist: Schema.array(Schema.string()).default([]).description('群黑名单：列表内的群始终不渲染，优先级高于白名单。'),
     showViewTitles: Schema.boolean().default(false).description('仅自建 QQ：发送图片时显示视图标题。'),
     replyAndMention: Schema.boolean().default(false).description('自建 QQ 会引用并 @ 发送者；官方 QQ 仅引用，避免显示 OpenID。'),
     sixFaceOverview: Schema.boolean().default(true).description('合并转发时生成并附加上、下、东、南、西、北六面正交合成图。'),
@@ -691,6 +695,11 @@ export function apply(ctx: Context, config: Config) {
     if (!canRenderInSession(session, config.allowPrivateRender)) return next()
     const file = findLitematicFile(session)
     if (!file) return next()
+    if (!isGroupAllowed(config, session.guildId)) {
+      logger.info(`群 ${session.guildId} 不在渲染白名单内（或已被拉黑），忽略其投影文件。`)
+      await session.send([...replyElements(session, config.qqBotType), h('text', { content: `本群未开启投影渲染。如需开启，请将群 ID ${session.guildId} 加入插件的白名单。` })])
+      return next()
+    }
     const url = await resolveFileUrl(session, file)
     if (!url) {
       logger.warn(`检测到 Litematic 文件但无法获取下载地址：${fileName(file) ?? 'unknown.litematic'}；请检查 OneBot/NapCat 的 get_group_file_url 接口。`)
@@ -725,6 +734,7 @@ export function apply(ctx: Context, config: Config) {
       if (!url) return '请提供 .litematic 文件的直链。'
       if (!session) return '此命令只能在消息会话中执行。'
       if (!canRenderInSession(session, config.allowPrivateRender)) return '单人对话渲染未开启，请在插件发送设置中启用。'
+      if (!isGroupAllowed(config, session.guildId)) return `本群未开启投影渲染。如需开启，请将群 ID ${session.guildId} 加入插件的白名单。`
       try {
         const sendOptions = resolveSendOptions(config, session.guildId)
         const result = await render(url, 'schematic.litematic', undefined, sendOptions.sixFaceOverview)
@@ -986,6 +996,22 @@ export function canRenderInSession(
   allowPrivateRender: boolean,
 ) {
   return Boolean(session.guildId) || (Boolean(session.isDirect) && allowPrivateRender)
+}
+
+/**
+ * 群白/黑名单判定：黑名单优先；白名单非空时仅白名单内群可用。
+ * 私聊（无群 ID）不参与名单判定，由 allowPrivateRender 单独控制。
+ */
+export function isGroupAllowed(
+  config: Pick<Config, 'groupWhitelist' | 'groupBlacklist'>,
+  groupId?: string | null,
+): boolean {
+  if (!groupId) return true
+  const id = groupId.trim()
+  if (!id) return true
+  if (config.groupBlacklist.some(item => item.trim() === id)) return false
+  if (config.groupWhitelist.length > 0 && !config.groupWhitelist.some(item => item.trim() === id)) return false
+  return true
 }
 
 function findLitematicInFilePayload(value: unknown, seen = new Set<object>(), depth = 0): FileElement | undefined {
