@@ -1,0 +1,18 @@
+.litematic-resource-pack-toolbar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-right: 8px;
+}
+
+.litematic-resource-pack-toolbar .el-button {
+  margin-left: 0;
+}
+
+.k-schema-table tr.litematic-selected td {
+  background: var(--k-button-hover-bg);
+}
+
+.k-schema-table tr.litematic-selected td:first-child {
+  box-shadow: inset 3px 0 var(--k-color-active);
+}

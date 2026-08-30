@@ -1,0 +1,51 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'dev.qqbot'
+version = '0.2.26'
+
+repositories { mavenCentral() }
+
+dependencies {
+    implementation 'com.google.code.gson:gson:2.13.2'
+    implementation 'dev.qqbot:litematic-standalone-renderer:0.2.8'
+    testImplementation platform('org.junit:junit-bom:5.13.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(25) }
+}
+
+application { mainClass = 'dev.qqbot.gpuagent.Main' }
+
+processResources {
+    from('../gpu-render-runtime/build/libs') {
+        include 'litematic-gpu-runtime-mc26.2-*.jar'
+        exclude '*-sources.jar'
+        into 'renderer'
+        rename { 'litematic-gpu-runtime.jar' }
+    }
+}
+
+tasks.test { useJUnitPlatform() }
+
+tasks.register('fatJar', Jar) {
+    archiveClassifier = 'all'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest { attributes 'Main-Class': application.mainClass.get() }
+    from sourceSets.main.output
+    dependsOn configurations.runtimeClasspath
+    from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+}
+
+tasks.register('portableZip', Zip) {
+    dependsOn tasks.fatJar
+    archiveClassifier = 'windows-portable'
+    into('app') { from tasks.fatJar }
+    from('README.md')
+    from('package-windows.ps1')
+}

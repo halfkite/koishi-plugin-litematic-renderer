@@ -27,6 +27,46 @@ final class SoftwareRenderer {
     private record Projected(double x, double y, double depth, double u, double v) {}
     private record Camera(double yaw, double pitch, double scale, double centerX, double centerY, int size) {}
     private record PendingQuad(Quad quad, double x, double y, double z, int tint, boolean fullBright, double depth) {}
+    private record OrthographicView(String[] glyph, double yaw, double pitch) {}
+
+    private static final List<OrthographicView> SIX_FACES = List.of(
+        new OrthographicView(new String[]{
+            "0000011000000000", "0000011000000000", "0000011000000000", "0000011000000000",
+            "0000011111110000", "0000011111110000", "0000011000000000", "0000011000000000",
+            "0000011000000000", "0000011000000000", "0000011000000000", "0000011000000000",
+            "1111111111111000", "0000000000000000", "0000000000000000", "0000000000000000"
+        }, 0, Math.PI / 2),
+        new OrthographicView(new String[]{
+            "0000000000000000", "1111111111111000", "0000011000000000", "0000011000000000",
+            "0000011000000000", "0000011010000000", "0000011011000000", "0000011001100000",
+            "0000011000110000", "0000011000000000", "0000011000000000", "0000011000000000",
+            "0000011000000000", "0000000000000000", "0000000000000000", "0000000000000000"
+        }, Math.PI, -Math.PI / 2),
+        new OrthographicView(new String[]{
+            "0000011000000000", "0000010000000000", "0111111111110000", "0000100000000000",
+            "0001001100000000", "0011001100000000", "0110001100000000", "0111111111110000",
+            "0000001100000000", "0001001101100000", "0011001100110000", "0110001100011000",
+            "0100011000000000", "0000000000000000", "0000000000000000", "0000000000000000"
+        }, -Math.PI / 2, 0),
+        new OrthographicView(new String[]{
+            "0000001000000000", "1111111111111000", "0000001000000000", "0000001000000000",
+            "1111111111110000", "1100100010010000", "1100110110010000", "1101111111010000",
+            "1100001000010000", "1111111111110000", "1100001000010000", "1100001000010000",
+            "1100001000110000", "0000000000000000", "0000000000000000", "0000000000000000"
+        }, 0, 0),
+        new OrthographicView(new String[]{
+            "0000000000000000", "1111111111111000", "0000010100000000", "0000010100000000",
+            "0111111111110000", "0100010100010000", "0100100100010000", "0100100100010000",
+            "0101100111010000", "0101000000010000", "0100000000010000", "0111111111110000",
+            "0100000000010000", "0000000000000000", "0000000000000000", "0000000000000000"
+        }, Math.PI / 2, 0),
+        new OrthographicView(new String[]{
+            "0000100110000000", "0000100110000000", "0000100110000000", "0000100110000000",
+            "1111100110110000", "0000100111100000", "0000100110000000", "0000100110000000",
+            "0000100110000000", "0000100110000000", "0111100110001000", "1100100110001000",
+            "0000100011111000", "0000000000000000", "0000000000000000", "0000000000000000"
+        }, Math.PI, 0)
+    );
 
     private final Litematic schematic;
     private final ModelResolver models;
@@ -46,8 +86,222 @@ final class SoftwareRenderer {
     }
 
     void render(Settings settings, double rotation, Path output) throws IOException {
+        BufferedImage image = renderImage(settings, Math.toRadians(rotation), Math.toRadians(settings.slant()));
+        ImageIO.write(image, "PNG", output.toFile());
+    }
+
+    /**
+     * 烘焙一次性的“可见面网格”：把邻居剔除后保留下来的所有 quad 展平为原始数组，
+     * 之后 renderBaked 每帧只需做旋转/投影/光栅化，不再遍历全部方块和查询邻居。
+     * 交互式预览必须走这条路径——对数百万方块的投影，逐帧全量遍历要数十秒。
+     */
+    BakedMesh bakeMesh() {
+        FloatArray opaquePositions = new FloatArray();
+        FloatArray opaqueUvs = new FloatArray();
+        List<BufferedImage> opaqueTextures = new ArrayList<>();
+        IntArray opaqueTints = new IntArray();
+        FloatArray opaqueShades = new FloatArray();
+        FloatArray translucentPositions = new FloatArray();
+        FloatArray translucentUvs = new FloatArray();
+        List<BufferedImage> translucentTextures = new ArrayList<>();
+        IntArray translucentTints = new IntArray();
+        FloatArray translucentShades = new FloatArray();
+
+        for (Litematic.Block block : schematic.blocks()) {
+            BakedModel model = models.resolve(block.state(), blockEntities.get(new Position(block.x(), block.y(), block.z())));
+            for (Quad quad : model.quads()) {
+                if (hiddenByNeighbor(block, quad.cullFace())) continue;
+                int tint = tint(block.state(), quad.tintIndex());
+                boolean fullBright = isFullBright(block.state());
+                double shade = quadShade(quad, fullBright);
+                if (models.isTranslucent(block.state())) {
+                    appendQuad(translucentPositions, translucentUvs, translucentTextures, translucentTints, translucentShades,
+                        quad, block.x(), block.y(), block.z(), tint, (float) shade);
+                } else {
+                    appendQuad(opaquePositions, opaqueUvs, opaqueTextures, opaqueTints, opaqueShades,
+                        quad, block.x(), block.y(), block.z(), tint, (float) shade);
+                }
+            }
+        }
+        for (Litematic.Entity entity : schematic.entities()) {
+            BakedModel model = entityModels.resolve(entity);
+            for (Quad quad : model.quads()) {
+                appendQuad(opaquePositions, opaqueUvs, opaqueTextures, opaqueTints, opaqueShades,
+                    quad, entity.x(), entity.y(), entity.z(), 0xffffff, 1.0f);
+            }
+        }
+        return new BakedMesh(
+            opaquePositions.toArray(), opaqueUvs.toArray(), opaqueTextures.toArray(new BufferedImage[0]),
+            opaqueTints.toArray(), opaqueShades.toArray(),
+            translucentPositions.toArray(), translucentUvs.toArray(), translucentTextures.toArray(new BufferedImage[0]),
+            translucentTints.toArray(), translucentShades.toArray());
+    }
+
+    private double quadShade(Quad quad, boolean fullBright) {
+        if (fullBright || !quad.shade()) return 1.0;
+        Vec3 first = quad.vertices()[1].position().subtract(quad.vertices()[0].position());
+        Vec3 second = quad.vertices()[2].position().subtract(quad.vertices()[0].position());
+        return 0.70 + 0.30 * Math.max(0, first.cross(second).normalized().dot(light));
+    }
+
+    private static void appendQuad(FloatArray positions, FloatArray uvs, List<BufferedImage> textures,
+                                   IntArray tints, FloatArray shades, Quad quad,
+                                   double offsetX, double offsetY, double offsetZ, int tint, float shade) {
+        for (Vertex vertex : quad.vertices()) {
+            Vec3 world = vertex.position().add(offsetX, offsetY, offsetZ);
+            positions.add((float) world.x()); positions.add((float) world.y()); positions.add((float) world.z());
+            uvs.add((float) vertex.u()); uvs.add((float) vertex.v());
+        }
+        textures.add(quad.texture());
+        tints.add(tint);
+        shades.add(shade);
+    }
+
+    /** 用烘焙网格渲染一帧（yaw/pitch 为弧度）。半透明面每帧按平均深度排序后绘制。 */
+    BufferedImage renderBaked(BakedMesh mesh, int resolution, double yaw, double pitch, double fill) {
+        Settings settings = new Settings(resolution, 1, 0, 0, fill, "#000000", true);
+        int size = resolution;
+        Camera camera = camera(settings, yaw, pitch, size);
+        int[] pixels = new int[size * size];
+        double[] depth = new double[pixels.length];
+        Arrays.fill(depth, Double.NEGATIVE_INFINITY);
+
+        // 不透明面必须写深度：后续半透明面和无深度写的面都依赖它做遮挡测试
+        drawBakedLayer(mesh.opaquePositions(), mesh.opaqueUvs(), mesh.opaqueTextures(), mesh.opaqueTints(),
+            mesh.opaqueShades(), camera, pixels, depth, size, true);
+
+        int translucentQuads = mesh.translucentTints().length;
+        if (translucentQuads > 0) {
+            int quads = translucentQuads;
+            double[] depths = new double[quads];
+            Projected[][] projected = new Projected[quads][];
+            for (int quad = 0; quad < quads; quad++) {
+                projected[quad] = projectQuad(mesh.translucentPositions(), quad, camera);
+                depths[quad] = (projected[quad][0].depth() + projected[quad][1].depth()
+                    + projected[quad][2].depth() + projected[quad][3].depth()) / 4.0;
+            }
+            Integer[] order = new Integer[quads];
+            for (int quad = 0; quad < quads; quad++) order[quad] = quad;
+            Arrays.sort(order, Comparator.comparingDouble(index -> depths[index]));
+            for (Integer index : order) {
+                Projected[] vertices = projected[index];
+                if (allOffScreen(vertices, size)) continue;
+                BufferedImage texture = mesh.translucentTextures()[index];
+                int tint = mesh.translucentTints()[index];
+                float shade = mesh.translucentShades()[index];
+                triangle(vertices[0], vertices[1], vertices[2], texture, shade, tint, pixels, depth, size, false);
+                triangle(vertices[0], vertices[2], vertices[3], texture, shade, tint, pixels, depth, size, false);
+            }
+        }
+
+        BufferedImage image = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+        image.setRGB(0, 0, size, size, pixels, 0, size);
+        return image;
+    }
+
+    private void drawBakedLayer(float[] positions, float[] uvs, BufferedImage[] textures, int[] tints,
+                                float[] shades, Camera camera, int[] pixels, double[] depth, int size,
+                                boolean writeDepth) {
+        int quads = tints.length;
+        for (int quad = 0; quad < quads; quad++) {
+            Projected[] vertices = projectQuad(positions, quad, camera);
+            if (allOffScreen(vertices, size)) continue;
+            int baseUv = quad * 8;
+            for (int vertex = 0; vertex < 4; vertex++) {
+                vertices[vertex] = new Projected(vertices[vertex].x(), vertices[vertex].y(), vertices[vertex].depth(),
+                    uvs[baseUv + vertex * 2], uvs[baseUv + vertex * 2 + 1]);
+            }
+            BufferedImage texture = textures[quad];
+            int tint = tints[quad];
+            float shade = shades[quad];
+            triangle(vertices[0], vertices[1], vertices[2], texture, shade, tint, pixels, depth, size, writeDepth);
+            triangle(vertices[0], vertices[2], vertices[3], texture, shade, tint, pixels, depth, size, writeDepth);
+        }
+    }
+
+    private Projected[] projectQuad(float[] positions, int quad, Camera camera) {
+        int base = quad * 12;
+        Projected[] vertices = new Projected[4];
+        for (int vertex = 0; vertex < 4; vertex++) {
+            double[] rotated = rotate(positions[base + vertex * 3], positions[base + vertex * 3 + 1],
+                positions[base + vertex * 3 + 2], camera.yaw(), camera.pitch());
+            double screenX = camera.size() / 2.0 + (rotated[0] - camera.centerX()) * camera.scale();
+            double screenY = camera.size() / 2.0 - (rotated[1] - camera.centerY()) * camera.scale();
+            vertices[vertex] = new Projected(screenX, screenY, rotated[2], 0, 0);
+        }
+        return vertices;
+    }
+
+    private static boolean allOffScreen(Projected[] vertices, int size) {
+        double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
+        for (Projected vertex : vertices) {
+            minX = Math.min(minX, vertex.x()); maxX = Math.max(maxX, vertex.x());
+            minY = Math.min(minY, vertex.y()); maxY = Math.max(maxY, vertex.y());
+        }
+        return maxX < 0 || minX > size || maxY < 0 || minY > size;
+    }
+
+    /** 烘焙后的可见面网格，所有数组按 quad 排列：positions 每 quad 12 个 float，uvs 每 quad 8 个 float。 */
+    record BakedMesh(float[] opaquePositions, float[] opaqueUvs, BufferedImage[] opaqueTextures,
+                     int[] opaqueTints, float[] opaqueShades,
+                     float[] translucentPositions, float[] translucentUvs, BufferedImage[] translucentTextures,
+                     int[] translucentTints, float[] translucentShades) {}
+
+    private static final class FloatArray {
+        private float[] values = new float[1024];
+        private int length;
+        void add(float value) {
+            if (length == values.length) values = Arrays.copyOf(values, values.length * 2);
+            values[length++] = value;
+        }
+        float[] toArray() { return Arrays.copyOf(values, length); }
+    }
+
+    private static final class IntArray {
+        private int[] values = new int[256];
+        private int length;
+        void add(int value) {
+            if (length == values.length) values = Arrays.copyOf(values, values.length * 2);
+            values[length++] = value;
+        }
+        int[] toArray() { return Arrays.copyOf(values, length); }
+    }
+
+    void renderSixFaces(Settings settings, int outputSize, String layout, Path output) throws IOException {
+        int size = clamp(outputSize, 128, 4096);
+        int gap = Math.max(4, (int) Math.round(size * 0.01));
+        boolean vertical = "vertical".equals(layout);
+        int columns = vertical ? 2 : 3;
+        int rows = vertical ? 3 : 2;
+        int tileSize = (size - gap * ((vertical ? rows : columns) + 1)) / (vertical ? rows : columns);
+        int width = vertical ? columns * tileSize + gap * (columns + 1) : size;
+        int height = vertical ? size : rows * tileSize + gap * (rows + 1);
+        int imageType = settings.transparentBackground() ? BufferedImage.TYPE_INT_ARGB : BufferedImage.TYPE_INT_RGB;
+        BufferedImage target = new BufferedImage(width, height, imageType);
+        Graphics2D graphics = target.createGraphics();
+        if (!settings.transparentBackground()) {
+            graphics.setColor(new Color(parseColor(settings.background()), true));
+            graphics.fillRect(0, 0, width, height);
+        }
+        Settings tileSettings = new Settings(tileSize, settings.supersampling(), settings.rotation(), settings.slant(),
+            Math.max(0.90, settings.fill()), settings.background(), settings.transparentBackground());
+        for (int index = 0; index < SIX_FACES.size(); index++) {
+            OrthographicView view = SIX_FACES.get(index);
+            int column = index % columns;
+            int row = index / columns;
+            int x = gap + column * (tileSize + gap);
+            int y = gap + row * (tileSize + gap);
+            graphics.drawImage(renderImage(tileSettings, view.yaw(), view.pitch()), x, y, null);
+            drawFaceLabel(graphics, view.glyph(), x, y, tileSize, gap);
+        }
+        graphics.dispose();
+        ImageIO.write(target, "PNG", output.toFile());
+    }
+
+    BufferedImage renderImage(Settings settings, double yaw, double pitch) {
         int size = Math.multiplyExact(settings.resolution(), settings.supersampling());
-        Camera camera = camera(settings, rotation, size);
+        Camera camera = camera(settings, yaw, pitch, size);
         int background = settings.transparentBackground() ? 0 : parseColor(settings.background());
         int[] pixels = new int[size * size];
         Arrays.fill(pixels, background);
@@ -100,7 +354,22 @@ final class SoftwareRenderer {
             graphics.drawImage(highResolution, 0, 0, target.getWidth(), target.getHeight(), null);
             graphics.dispose();
         }
-        ImageIO.write(target, "PNG", output.toFile());
+        return target;
+    }
+
+    private static void drawFaceLabel(Graphics2D graphics, String[] glyph, int tileX, int tileY, int tileSize, int gap) {
+        int scale = Math.max(1, Math.min(6, tileSize / 80));
+        int padding = Math.max(1, scale / 2);
+        int x = tileX + Math.max(2, gap / 2);
+        int y = tileY + Math.max(2, gap / 2);
+        graphics.setColor(Color.BLACK);
+        graphics.fillRect(x, y, glyph[0].length() * scale + padding * 2, glyph.length * scale + padding * 2);
+        graphics.setColor(Color.WHITE);
+        for (int row = 0; row < glyph.length; row++) for (int column = 0; column < glyph[row].length(); column++) {
+            if (glyph[row].charAt(column) == '1') {
+                graphics.fillRect(x + padding + column * scale, y + padding + row * scale, scale, scale);
+            }
+        }
     }
 
     private void drawQuad(Quad quad, double offsetX, double offsetY, double offsetZ, int tint, boolean fullBright,
@@ -130,9 +399,7 @@ final class SoftwareRenderer {
         return total / quad.vertices().length;
     }
 
-    private Camera camera(Settings settings, double rotation, int size) {
-        double yaw = Math.toRadians(rotation);
-        double pitch = Math.toRadians(settings.slant());
+    private Camera camera(Settings settings, double yaw, double pitch, int size) {
         Litematic.Bounds bounds = schematic.bounds();
         double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
         double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
@@ -145,7 +412,8 @@ final class SoftwareRenderer {
             minY = Math.min(minY, projected[1]); maxY = Math.max(maxY, projected[1]);
         }
         double span = Math.max(0.001, Math.max(maxX - minX, maxY - minY));
-        double scale = size * Math.max(0.1, Math.min(0.98, settings.fill())) / span;
+        // 命令行入口已在解析时把 fill 钳制到 [0.1, 0.98]；这里放宽以支持预览的连续缩放
+        double scale = size * Math.max(0.05, Math.min(8.0, settings.fill())) / span;
         return new Camera(yaw, pitch, scale, (minX + maxX) / 2, (minY + maxY) / 2, size);
     }
 

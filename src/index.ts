@@ -1,22 +1,46 @@
 import { Context, h, Schema, Session } from 'koishi'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { constants, promises as fs } from 'node:fs'
 import { basename, dirname, extname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { ChildProcess, spawn } from 'node:child_process'
+import { createServer, Socket } from 'node:net'
+import { Client as SshClient } from 'ssh2'
 import { deflateSync, gunzipSync } from 'node:zlib'
+import { PNG } from 'pngjs'
+import { GpuAgentHub, GpuAgentNodeConfig, GpuRenderRequest, RenderView } from './gpu-agent-protocol'
+import type {} from '@koishijs/plugin-console'
+
+declare module '@koishijs/console' {
+  interface Events {
+    'litematic/resource-pack-upload'(filename: unknown, base64: unknown): Promise<string>
+  }
+}
 
 export const name = 'litematic-renderer'
-export const inject = { optional: ['puppeteer', 'server'] }
-const CACHE_FORMAT_VERSION = 13
+export const inject = { optional: ['puppeteer', 'server', 'console'] }
+const CACHE_FORMAT_VERSION = 16
+const RESOURCE_PACK_UPLOAD_LIMIT = 256 * 1024 * 1024
+const GPU_CLIENT_JAR_NAME = 'quickcraft-mc26.2-1.0.5-renderbridge.jar'
 const packageVersion = (require('../package.json') as { version?: unknown }).version
 const PLUGIN_VERSION = typeof packageVersion === 'string' ? packageVersion : 'unknown'
 
 export interface Config {
-  standaloneJavaCommand: string
+  qqBotType: QqBotType
+  officialProxyMode: OfficialProxyMode
+  officialProxyUrl: string
+  sshProxyExecutable: string
+  sshProxyHost: string
+  sshProxyPort: number
+  sshProxyUser: string
+  sshProxyPrivateKey: string
+  sshProxyPassword: string
+  sshProxyLocalPort: number
+  javaPath: string
+  standaloneJavaCommand?: string
   minecraftJarPath: string
   resourcePackPaths: string[]
-  renderEngine: 'standalone' | 'java' | 'webgl' | 'cpu'
+  renderEngine: 'standalone' | 'gpuClient' | 'gpuAgent' | 'remoteAgent' | 'java' | 'webgl' | 'cpu'
   standaloneRendererJar: string
   standaloneRenderTimeout: number
   standaloneJavaMaxHeapMb: number
@@ -24,20 +48,23 @@ export interface Config {
   standaloneJavaMemoryRestartLimit: number
   maxFileSize: number
   outputSize: number
-  cellSize: number
   isometricCellSize: number
   background: string
   transparentBackground: boolean
+  allowPrivateRender: boolean
   sendAsForward: boolean
   showViewTitles: boolean
   replyAndMention: boolean
+  sixFaceOverview: boolean
+  sixFaceLayout: SixFaceLayout
   groupSendOptions: GroupSendOption[]
   renderTimeout: number
   cacheDirectory: string
   cacheMaxSizeGb: number
   diagnosticsFilePath: string
-  diagnosticsExport: string
+  patchOneBotGroupUpload: boolean
   javaBridgeDirectory: string
+  gpuClientGameDirectory: string
   gpuRendererCommand: string
   javaRenderTimeout: number
   javaResolution: number
@@ -49,10 +76,24 @@ export interface Config {
   isometricFill: number
   isometricRotation: number
   isometricSlant: number
+  gpuAgentEnabled: boolean
+  gpuAgentListenHost: string
+  gpuAgentListenPort: number
+  gpuAgentPath: string
+  gpuAgentNodes: GpuAgentNodeConfig[]
+  gpuAgentTimeout: number
+  gpuAgentFallback: boolean
+  remoteAgentUrl: string
+  remoteAgentSecret: string
+  remoteAgentTimeout: number
+  remoteAgentClockSkewSeconds: number
 }
 
 export type SendMode = 'forward' | 'combined'
 export type ReplyAndMentionOverride = 'inherit' | 'enabled' | 'disabled'
+export type SixFaceLayout = 'horizontal' | 'vertical'
+export type QqBotType = 'official' | 'selfHosted'
+export type OfficialProxyMode = 'disabled' | 'proxy' | 'ssh'
 
 export interface GroupSendOption {
   groupId: string
@@ -60,55 +101,118 @@ export interface GroupSendOption {
   replyAndMention: ReplyAndMentionOverride
 }
 
-export const Config: Schema<Config> = Schema.object({
-  standaloneJavaCommand: Schema.string().default('').description('【重点】独立渲染器使用的 Java 可执行文件；推荐 Java 21+，留空自动查找，也可填写自定义路径或命令。'),
-  minecraftJarPath: Schema.string().default('').description('次要设置：可选的 Minecraft 客户端 JAR 或基础资源包；留空或路径不存在时使用插件内置的 26.2 原版资源。'),
-  resourcePackPaths: Schema.array(Schema.string()).default([]).description('次要设置：独立渲染的自定义材质包路径；默认为空，使用插件内置的 26.2 原版资源，越靠后优先级越高。'),
-  renderEngine: Schema.union([Schema.const('standalone'), Schema.const('java'), Schema.const('webgl'), Schema.const('cpu')]).default('standalone').description('渲染引擎；standalone 为无需客户端的独立 Java 资源包渲染器。'),
-  standaloneRendererJar: Schema.string().default('').description('独立渲染器 JAR；留空使用插件内置版本。'),
-  standaloneRenderTimeout: Schema.natural().min(10000).default(180000).description('独立 Java 渲染超时（毫秒）。'),
-  standaloneJavaMaxHeapMb: Schema.natural().min(128).max(32768).step(8).default(200).description('首次独立 Java 渲染的最大堆内存（MiB）。'),
-  standaloneJavaRetryMaxHeapMb: Schema.natural().min(256).max(32768).step(128).default(2048).description('首次渲染内存不足时，新 Java 进程重试使用的最大堆内存（MiB）。'),
-  standaloneJavaMemoryRestartLimit: Schema.natural().max(3).default(1).description('检测到 Java 内存不足后，启动全新进程重试的次数。'),
-  maxFileSize: Schema.natural().min(1).default(1024).description('自动处理的最大文件大小（KB）。'),
-  outputSize: Schema.natural().min(128).max(4096).default(1024).description('正交视图最长边的最大像素数。'),
-  cellSize: Schema.natural().min(1).max(32).default(8).description('正交投影每个方块的基础像素大小。'),
-  isometricCellSize: Schema.natural().min(2).max(32).default(7).description('正二轴测方块菱形半宽。'),
-  background: Schema.string().default('#000000').description('PNG 背景颜色。'),
-  transparentBackground: Schema.boolean().default(false).description('输出透明背景。'),
-  sendAsForward: Schema.boolean().default(false).description('默认发送方式；开启为合并转发，关闭为两张图片和信息组成一条普通消息。'),
-  showViewTitles: Schema.boolean().default(false).description('发送图片时显示正二轴测和反向正二轴测标题；默认关闭以节省空间。'),
-  replyAndMention: Schema.boolean().default(false).description('默认是否引用原消息并 @ 投影发送者。'),
-  groupSendOptions: Schema.array(Schema.object({
-    groupId: Schema.string().description('QQ群号。'),
-    sendMode: Schema.union([
-      Schema.const('forward').description('合并转发'),
-      Schema.const('combined').description('联合发送（一条普通消息）'),
-    ]).default('forward'),
-    replyAndMention: Schema.union([
-      Schema.const('inherit').description('继承全局设置'),
-      Schema.const('enabled').description('开启回复 @'),
-      Schema.const('disabled').description('关闭回复 @'),
-    ]).default('inherit'),
-  })).default([]).description('按群覆盖发送方式和回复 @ 设置；相同群号以最后一项为准。'),
-  renderTimeout: Schema.natural().min(1000).default(30000).description('下载与渲染超时（毫秒）。'),
-  cacheDirectory: Schema.string().default('data/litematic-renderer-cache').description('持久缓存目录；按插件版本和投影 SHA-256 分区。'),
-  cacheMaxSizeGb: Schema.number().min(1).max(1024).step(1).default(20).description('所有版本缓存的总上限（GiB），超出后按最久未使用清理。'),
-  diagnosticsFilePath: Schema.string().default('data/litematic-renderer-diagnostics.json').description('无法正常渲染的方块诊断持久化文件路径。'),
-  diagnosticsExport: Schema.string().default('/litematic-renderer/diagnostics').role('link').description('导出错误报告（点击下载 JSON）。'),
-  javaRenderTimeout: Schema.natural().min(10000).default(180000).description('等待 Minecraft Java 渲染完成的超时（毫秒）。'),
-  javaResolution: Schema.natural().min(256).max(4096).default(1024).description('Java 渲染最终输出边长。'),
-  javaSupersampling: Schema.natural().min(1).max(4).default(2).description('Fabrishot 式离屏超采样倍数。'),
-  webglQuality: Schema.union([Schema.const('standard'), Schema.const('high'), Schema.const('ultra')]).default('high').description('WebGL 渲染质量。'),
-  webglWidth: Schema.natural().min(256).max(2048).default(800).description('WebGL 单张图宽度。'),
-  webglHeight: Schema.natural().min(256).max(2048).default(600).description('WebGL 单张图高度。'),
-  isometricSquare: Schema.boolean().default(true).description('将正二轴测图输出为正方形。'),
-  isometricFill: Schema.percent().default(0.78).description('正二轴测主体在画布中的最大占比。'),
-  isometricRotation: Schema.number().min(0).max(360).step(1).default(135).description('Isometric Renders 绕竖直轴的基准旋转角。'),
-  isometricSlant: Schema.number().min(-90).max(90).step(1).default(36).description('Isometric Renders 俯仰角；36° 为正二轴测预设。'),
-  javaBridgeDirectory: Schema.string().default('').description('Fabric Java 渲染桥任务目录；桥接功能已隐藏，仅保留兼容配置。').hidden(),
-  gpuRendererCommand: Schema.string().default('').description('GPU 渲染器命令；高级功能已隐藏，仅保留兼容配置。').hidden(),
-})
+export const Config: Schema<Config> = Schema.intersect([
+  Schema.object({
+    qqBotType: Schema.union([
+      Schema.const('official').description('QQ 官方机器人'),
+      Schema.const('selfHosted').description('自建 QQ（OneBot / NapCat）'),
+    ]).role('radio').default('selfHosted').description('机器人接入类型；决定图片、合并转发、引用和 @ 的发送方式。'),
+    patchOneBotGroupUpload: Schema.boolean().default(true).description('自建 QQ：启动时修复 OneBot 群文件上传事件；官方机器人不使用此项。'),
+    officialProxyMode: Schema.union([
+      Schema.const('disabled').description('关闭中转'),
+      Schema.const('proxy').description('使用已有代理'),
+      Schema.const('ssh').description('自动建立 SSH 中转'),
+    ]).role('radio').default('disabled').description('仅官方 QQ：让 Koishi 出站请求使用固定公网 IP；SSH 模式会自动创建本机 SOCKS5 隧道。'),
+    officialProxyUrl: Schema.string().default('').description('已有代理地址；支持 socks5h、socks5、http 和 https。SSH 模式会根据本地端口自动生成。'),
+    sshProxyExecutable: Schema.string().default('ssh').description('SSH 可执行文件或命令；Linux 通常为 ssh，Windows 可填写 ssh.exe 的完整路径。'),
+    sshProxyHost: Schema.string().default('').description('SSH 中转服务器的数字 IP，例如 203.0.113.10（IPv4 数字地址）。'),
+    sshProxyPort: Schema.natural().min(1).max(65535).default(22).description('SSH 中转服务器端口。'),
+    sshProxyUser: Schema.string().default('root').description('SSH 登录用户名。'),
+    sshProxyPrivateKey: Schema.path({ filters: ['file'] }).default('').description('SSH 私钥路径（选填）；填写后优先使用密钥登录。Docker 需要先将密钥只读挂载进容器。'),
+    sshProxyPassword: Schema.string().role('secret').default('').description('SSH 登录密码（选填）；私钥为空时使用密码登录。密钥与密码至少填写一项。'),
+    sshProxyLocalPort: Schema.natural().min(1).max(65535).default(1080).description('本机 SOCKS5 监听端口；只监听 127.0.0.1，不对公网开放。'),
+  }).description('机器人接入'),
+  Schema.object({
+    renderEngine: Schema.union([
+      Schema.const('gpuAgent').description('独立 GPU Agent（主动连接）'),
+      Schema.const('standalone').description('真实材质快速渲染（推荐）'),
+      Schema.const('gpuClient').description('Minecraft 26.2 GPU 客户端（最快）').hidden(),
+      Schema.const('remoteAgent').description('旧版 Remote Agent（HTTP / FRP）').hidden(),
+      Schema.const('webgl').description('GPU WebGL（轻量，部分透明材质可能不准确）').hidden(),
+      Schema.const('java').description('Fabric 客户端桥接').hidden(),
+      Schema.const('cpu').description('简化方块颜色渲染').hidden(),
+    ]).default('gpuAgent').description('渲染引擎；真实材质快速渲染无需启动 Minecraft 客户端。'),
+    maxFileSize: Schema.natural().min(1).default(1024).description('自动处理的最大文件大小（KB）。'),
+    outputSize: Schema.natural().min(256).max(4096).default(1024).description('最终输出边长（CPU 渲染时生效）。GPU Agent 模式下分辨率由 Agent 端「分辨率」设置接管，此项不生效。'),
+    background: Schema.string().default('#000000').description('PNG 背景颜色。'),
+    transparentBackground: Schema.boolean().default(false).description('输出透明背景。'),
+    isometricFill: Schema.percent().default(0.78).description('正二轴测主体在画布中的最大占比。'),
+    isometricRotation: Schema.number().min(0).max(360).step(1).default(135).description('Isometric Renders 绕竖直轴的基准旋转角。'),
+    isometricSlant: Schema.number().min(-90).max(90).step(1).default(36).description('Isometric Renders 俯仰角；36° 为正二轴测预设。'),
+  }).description('渲染设置'),
+  Schema.object({
+    allowPrivateRender: Schema.boolean().default(false).description('允许在单人对话中自动识别投影附件，并使用渲染命令；关闭时仅处理群聊和频道消息。'),
+    sendAsForward: Schema.boolean().default(false).description('仅自建 QQ：开启为合并转发，关闭为联合发送；官方 QQ 忽略此项。'),
+    showViewTitles: Schema.boolean().default(false).description('仅自建 QQ：发送图片时显示视图标题。'),
+    replyAndMention: Schema.boolean().default(false).description('自建 QQ 会引用并 @ 发送者；官方 QQ 仅引用，避免显示 OpenID。'),
+    sixFaceOverview: Schema.boolean().default(true).description('合并转发时生成并附加上、下、东、南、西、北六面正交合成图。'),
+    sixFaceLayout: Schema.union([
+      Schema.const('horizontal').description('横向 3×2'),
+      Schema.const('vertical').description('纵向 2×3'),
+    ]).default('horizontal').description('六面正交合成图布局；最长边由 outputSize 控制。'),
+    groupSendOptions: Schema.array(Schema.object({
+      groupId: Schema.string().description('QQ群号。'),
+      sendMode: Schema.union([
+        Schema.const('forward').description('合并转发'),
+        Schema.const('combined').description('联合发送（一条普通消息）'),
+      ]).default('forward'),
+      replyAndMention: Schema.union([
+        Schema.const('inherit').description('继承全局设置'),
+        Schema.const('enabled').description('开启回复 @'),
+        Schema.const('disabled').description('关闭回复 @'),
+      ]).default('inherit'),
+    })).default([]).description('按群覆盖发送方式和回复设置；官方 QQ 只使用引用开关，自建 QQ 同时使用发送模式和 @。'),
+  }).description('发送设置'),
+  Schema.object({
+    javaPath: Schema.path({ filters: ['file'] }).default('').description('Java 路径：独立渲染器使用的 Java 可执行文件；推荐 Java 21+，留空自动查找。'),
+    standaloneJavaCommand: Schema.string().default('').hidden().description('旧版 Java 路径字段，仅用于兼容已有配置。'),
+    minecraftJarPath: Schema.string().default('').description('可选的 Minecraft 客户端 JAR 或基础资源包；留空使用内置 26.2 原版资源。'),
+    resourcePackPaths: Schema.array(Schema.string()).role('table').default([]).description('自定义资源包：点击上传材质包添加 ZIP；越靠后优先级越高，可选中后上移或下移。'),
+    standaloneRendererJar: Schema.string().default('').description('独立渲染器 JAR；留空使用插件内置版本。'),
+    standaloneRenderTimeout: Schema.natural().min(10000).default(180000).description('独立 Java 渲染超时（毫秒）。'),
+    standaloneJavaMaxHeapMb: Schema.natural().min(128).max(32768).step(8).default(200).description('首次独立渲染的最大堆内存（MiB）。'),
+    standaloneJavaRetryMaxHeapMb: Schema.natural().min(256).max(32768).step(128).default(2048).description('内存不足时新进程重试的最大堆内存（MiB）。'),
+    standaloneJavaMemoryRestartLimit: Schema.natural().max(3).default(1).description('检测到内存不足后启动全新进程重试的次数。'),
+    javaResolution: Schema.natural().min(256).max(4096).default(1024).hidden().description('旧版 Java 分辨率字段，仅用于兼容已有配置；现在统一使用图像清晰度。'),
+    javaSupersampling: Schema.natural().min(1).max(4).default(1).description('离屏超采样倍数；1 为按目标分辨率直接输出，速度最快。2 及以上会显著增加耗时和内存。'),
+  }).description('独立渲染器').collapse(),
+  Schema.object({
+    renderTimeout: Schema.natural().min(1000).default(30000).description('文件下载超时（毫秒）。'),
+    cacheDirectory: Schema.string().default('data/litematic-renderer-cache').description('持久缓存目录；按插件版本和投影 SHA-256 分区。'),
+    cacheMaxSizeGb: Schema.number().min(1).max(1024).step(1).default(20).description('所有版本缓存总上限（GiB），超出后按最久未使用清理。'),
+    diagnosticsFilePath: Schema.string().default('data/litematic-renderer-diagnostics.json').description('渲染诊断持久化文件路径；导出地址固定为 /litematic-renderer/diagnostics。'),
+  }).description('缓存与诊断').collapse(),
+  Schema.object({
+    isometricCellSize: Schema.natural().min(2).max(32).default(7).description('仅 CPU 后端：方块菱形半宽；数值越大，原始轴测图越细致，也越耗内存。'),
+    javaRenderTimeout: Schema.natural().min(10000).default(180000).description('Minecraft GPU/Fabric 客户端后端：等待渲染任务完成的超时（毫秒）。'),
+    webglQuality: Schema.union([Schema.const('standard'), Schema.const('high'), Schema.const('ultra')]).default('high').description('仅 WebGL 后端：模型与材质渲染质量；越高越清晰，也越耗浏览器资源。'),
+    webglWidth: Schema.natural().min(256).max(2048).default(800).hidden().description('旧版 WebGL 宽度字段，仅用于兼容；现在统一使用图像清晰度。'),
+    webglHeight: Schema.natural().min(256).max(2048).default(600).hidden().description('旧版 WebGL 高度字段，仅用于兼容；现在统一使用图像清晰度。'),
+    isometricSquare: Schema.boolean().default(true).description('仅 WebGL 后端：将轴测图画布调整为正方形。'),
+    javaBridgeDirectory: Schema.path({ filters: ['directory'] }).default('').description('仅 java/Fabric 桥后端：Minecraft Java 渲染桥任务目录；standalone 后端无需填写。'),
+    gpuClientGameDirectory: Schema.path({ filters: ['directory'] }).default('').description('仅 Minecraft 26.2 GPU 客户端：游戏目录（例如 26.2-Fabricjqr）。插件会自动安装内置单 JAR 渲染端并连接任务队列。'),
+    gpuRendererCommand: Schema.path({ filters: ['file'] }).default('').description('可选外部 GPU 渲染器程序；填写后最先尝试，失败时自动回退到 renderEngine。'),
+  }).description('高级设置').collapse(),
+  Schema.object({
+    gpuAgentEnabled: Schema.boolean().default(false).description('启用由 GPU Agent 主动连接的 WebSocket v2 服务。'),
+    gpuAgentListenHost: Schema.string().default('0.0.0.0').description('GPU Agent WebSocket 监听地址。'),
+    gpuAgentListenPort: Schema.natural().min(1).max(65535).default(39180).description('GPU Agent WebSocket 监听端口。'),
+    gpuAgentPath: Schema.string().default('/litematic-renderer/agent/v2').description('GPU Agent WebSocket 路径。'),
+    gpuAgentNodes: Schema.array(Schema.object({
+      agentId: Schema.string().description('GPU 节点唯一 ID。'),
+      sharedSecret: Schema.string().role('secret').description('该节点的 HMAC 共享密钥，建议至少 32 个字符。'),
+      enabled: Schema.boolean().default(true).description('允许此节点连接。'),
+    })).default([]).description('允许连接的 GPU 节点；每个节点使用独立密钥。'),
+    gpuAgentTimeout: Schema.natural().min(10000).max(3600000).default(240000).description('等待 GPU Agent 完成任务的超时（毫秒）。'),
+    gpuAgentFallback: Schema.boolean().default(true).description('GPU Agent 不可用或失败时自动回退到独立 Java 渲染器。'),
+  }).description('GPU Agent v2').collapse(),
+  Schema.object({
+    remoteAgentUrl: Schema.string().default('').description('旧版 Remote Agent HTTP 地址，用于兼容已有 FRP 部署。'),
+    remoteAgentSecret: Schema.string().role('secret').default('').description('旧版 Remote Agent HMAC 共享密钥。'),
+    remoteAgentTimeout: Schema.natural().min(10000).max(900000).default(240000).description('旧版 Remote Agent 请求超时（毫秒）。'),
+    remoteAgentClockSkewSeconds: Schema.natural().min(10).max(600).default(90).description('旧版 HMAC 请求允许的时钟偏差（秒）。'),
+  }).description('Remote Agent v1 兼容').collapse(),
+])
 
 interface FileElement {
   name?: string
@@ -128,9 +232,18 @@ interface Block { x: number, y: number, z: number, name: string }
 interface Bounds { minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number }
 interface ImageResult { title: string, path: string }
 interface RenderedImage { title: string, png: Buffer }
-interface RenderResult { images: ImageResult[], metadata: string }
+interface RenderResult { images: ImageResult[], metadata: string, projectionName: string }
 
 const activeStandaloneJavaProcesses = new Set<ChildProcess>()
+let standaloneRenderQueue = Promise.resolve()
+
+async function acquireStandaloneRenderSlot() {
+  const previous = standaloneRenderQueue
+  let release!: () => void
+  standaloneRenderQueue = new Promise<void>(resolveRelease => { release = resolveRelease })
+  await previous.catch(() => undefined)
+  return release
+}
 
 export interface LitematicMetadata {
   author: string
@@ -143,10 +256,336 @@ export interface LitematicMetadata {
   minecraftVersion?: string
 }
 
+type OfficialProxyConfig = Pick<Config,
+  'officialProxyMode' | 'officialProxyUrl' | 'sshProxyExecutable' | 'sshProxyHost' | 'sshProxyPort'
+  | 'sshProxyUser' | 'sshProxyPrivateKey' | 'sshProxyPassword' | 'sshProxyLocalPort'>
+
+const SUPPORTED_PROXY_PROTOCOLS = new Set(['http:', 'https:', 'socks:', 'socks5:', 'socks5h:'])
+
+export function resolveOfficialProxyUrl(config: OfficialProxyConfig) {
+  if (config.officialProxyMode === 'disabled') return undefined
+  const value = config.officialProxyMode === 'ssh'
+    ? `socks5h://127.0.0.1:${config.sshProxyLocalPort}`
+    : config.officialProxyUrl.trim()
+  if (!value) throw new Error('已开启官方 QQ 中转，但代理地址为空')
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error(`代理地址格式无效：${value}`)
+  }
+  if (!SUPPORTED_PROXY_PROTOCOLS.has(url.protocol)) {
+    throw new Error(`不支持的代理协议：${url.protocol}`)
+  }
+  return url.href
+}
+
+export function buildSshProxyArguments(config: OfficialProxyConfig) {
+  const host = config.sshProxyHost.trim()
+  const user = config.sshProxyUser.trim()
+  const privateKey = config.sshProxyPrivateKey.trim()
+  if (!host) throw new Error('SSH 中转服务器 IP 不能为空')
+  if (!user) throw new Error('SSH 登录用户名不能为空')
+  if (!privateKey && !config.sshProxyPassword) throw new Error('SSH 私钥和密码至少填写一项')
+  const args = [
+    '-NT',
+    '-D', `127.0.0.1:${config.sshProxyLocalPort}`,
+    '-p', String(config.sshProxyPort),
+    '-o', 'BatchMode=yes',
+    '-o', 'ExitOnForwardFailure=yes',
+    '-o', 'ServerAliveInterval=30',
+    '-o', 'ServerAliveCountMax=3',
+    '-o', 'StrictHostKeyChecking=accept-new',
+  ]
+  if (privateKey) args.push('-i', resolve(privateKey))
+  args.push(`${user}@${host}`)
+  return args
+}
+
+function isTcpPortOpen(host: string, port: number, timeout = 1000) {
+  return new Promise<boolean>((done) => {
+    const socket = new Socket()
+    let settled = false
+    const finish = (result: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      done(result)
+    }
+    socket.setTimeout(timeout)
+    socket.once('connect', () => finish(true))
+    socket.once('timeout', () => finish(false))
+    socket.once('error', () => finish(false))
+    socket.connect(port, host)
+  })
+}
+
+function startPasswordSshProxyTunnel(config: OfficialProxyConfig, logger: PluginLogger) {
+  let client: SshClient | undefined
+  let server: ReturnType<typeof createServer> | undefined
+  let restartTimer: NodeJS.Timeout | undefined
+  let stopped = false
+  const sockets = new Set<Socket>()
+
+  const scheduleRestart = () => {
+    if (stopped || restartTimer) return
+    restartTimer = setTimeout(() => {
+      restartTimer = undefined
+      launch()
+    }, 5000)
+  }
+  const launch = () => {
+    if (stopped) return
+    client = new SshClient()
+    client.once('ready', () => {
+      if (stopped || !client) return
+      server = createServer((socket) => {
+        sockets.add(socket)
+        socket.once('close', () => sockets.delete(socket))
+        handleSocks5Connection(socket, client!)
+      })
+      server.once('error', (error) => {
+        logger.warn(`本地 SOCKS5 监听失败：${error.message}`)
+        client?.end()
+      })
+      server.listen(config.sshProxyLocalPort, '127.0.0.1', () => {
+        logger.info(`官方 QQ 中转已就绪：socks5h://127.0.0.1:${config.sshProxyLocalPort}`)
+      })
+    })
+    client.once('error', (error) => logger.warn(`SSH 密码登录失败：${error.message}`))
+    client.once('close', () => {
+      client = undefined
+      server?.close()
+      server = undefined
+      for (const socket of sockets) socket.destroy()
+      if (!stopped) scheduleRestart()
+    })
+    logger.info(`正在使用密码建立官方 QQ SSH 中转：${config.sshProxyUser}@${config.sshProxyHost}`)
+    client.connect({
+      host: config.sshProxyHost.trim(),
+      port: config.sshProxyPort,
+      username: config.sshProxyUser.trim(),
+      password: config.sshProxyPassword,
+      keepaliveInterval: 30000,
+      keepaliveCountMax: 3,
+      readyTimeout: 15000,
+    })
+  }
+  launch()
+  return () => {
+    stopped = true
+    if (restartTimer) clearTimeout(restartTimer)
+    server?.close()
+    client?.end()
+    for (const socket of sockets) socket.destroy()
+  }
+}
+
+function handleSocks5Connection(socket: Socket, client: SshClient) {
+  let buffer = Buffer.alloc(0)
+  let state: 'greeting' | 'request' = 'greeting'
+  const fail = (code = 1) => {
+    if (state === 'request') socket.write(Buffer.from([5, code, 0, 1, 0, 0, 0, 0, 0, 0]))
+    socket.destroy()
+  }
+  socket.on('data', (chunk) => {
+    buffer = Buffer.concat([buffer, chunk])
+    if (state === 'greeting') {
+      if (buffer.length < 2) return
+      const length = 2 + buffer[1]
+      if (buffer.length < length) return
+      if (buffer[0] !== 5 || !buffer.subarray(2, length).includes(0)) return fail()
+      buffer = buffer.subarray(length)
+      state = 'request'
+      socket.write(Buffer.from([5, 0]))
+    }
+    if (state !== 'request' || buffer.length < 4) return
+    if (buffer[0] !== 5 || buffer[1] !== 1) return fail(7)
+    const type = buffer[3]
+    let host: string
+    let offset: number
+    if (type === 1) {
+      if (buffer.length < 10) return
+      host = [...buffer.subarray(4, 8)].join('.')
+      offset = 8
+    } else if (type === 3) {
+      const length = buffer[4]
+      if (buffer.length < 7 + length) return
+      host = buffer.subarray(5, 5 + length).toString('utf8')
+      offset = 5 + length
+    } else if (type === 4) {
+      if (buffer.length < 22) return
+      const groups = []
+      for (let index = 4; index < 20; index += 2) groups.push(buffer.readUInt16BE(index).toString(16))
+      host = groups.join(':')
+      offset = 20
+    } else {
+      return fail(8)
+    }
+    const port = buffer.readUInt16BE(offset)
+    socket.pause()
+    socket.removeAllListeners('data')
+    client.forwardOut('127.0.0.1', 0, host, port, (error, channel) => {
+      if (error) return fail(5)
+      socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+      socket.pipe(channel).pipe(socket)
+      socket.resume()
+    })
+  })
+  socket.once('error', () => socket.destroy())
+}
+
+function startSshProxyTunnel(config: OfficialProxyConfig, logger: PluginLogger) {
+  buildSshProxyArguments(config)
+  if (!config.sshProxyPrivateKey.trim()) return startPasswordSshProxyTunnel(config, logger)
+  const command = config.sshProxyExecutable.trim() || 'ssh'
+  const args = buildSshProxyArguments(config)
+  let child: ChildProcess | undefined
+  let restartTimer: NodeJS.Timeout | undefined
+  let stopped = false
+
+  const scheduleRestart = () => {
+    if (stopped || restartTimer) return
+    restartTimer = setTimeout(() => {
+      restartTimer = undefined
+      void launch()
+    }, 5000)
+  }
+  const launch = async () => {
+    if (stopped) return
+    if (await isTcpPortOpen('127.0.0.1', config.sshProxyLocalPort)) {
+      logger.info(`官方 QQ 中转已就绪：socks5h://127.0.0.1:${config.sshProxyLocalPort}`)
+      return
+    }
+    try {
+      await fs.access(resolve(config.sshProxyPrivateKey), constants.R_OK)
+    } catch {
+      logger.warn(`SSH 私钥不可读：${resolve(config.sshProxyPrivateKey)}`)
+      scheduleRestart()
+      return
+    }
+    child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
+    let stderr = ''
+    child.stderr?.on('data', (data: Buffer) => {
+      stderr = `${stderr}${data.toString()}`.slice(-2000)
+    })
+    child.once('spawn', () => logger.info(`正在建立官方 QQ SSH 中转：${config.sshProxyUser}@${config.sshProxyHost}`))
+    child.once('error', (error) => {
+      logger.warn(`SSH 中转启动失败：${error.message}`)
+      scheduleRestart()
+    })
+    child.once('close', (code) => {
+      child = undefined
+      if (stopped) return
+      const detail = stderr.trim().split(/\r?\n/).at(-1)
+      logger.warn(`SSH 中转已断开（退出码 ${code ?? 'unknown'}）${detail ? `：${detail}` : ''}`)
+      scheduleRestart()
+    })
+    for (let attempt = 0; attempt < 20 && child && !stopped; attempt++) {
+      if (await isTcpPortOpen('127.0.0.1', config.sshProxyLocalPort, 300)) {
+        logger.info(`官方 QQ 中转已就绪：socks5h://127.0.0.1:${config.sshProxyLocalPort}`)
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+  }
+  void launch()
+  return () => {
+    stopped = true
+    if (restartTimer) clearTimeout(restartTimer)
+    child?.kill()
+  }
+}
+
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger(name)
+  const gpuAgentHub = config.gpuAgentEnabled
+    ? new GpuAgentHub({
+      host: config.gpuAgentListenHost,
+      port: config.gpuAgentListenPort,
+      path: config.gpuAgentPath.startsWith('/') ? config.gpuAgentPath : `/${config.gpuAgentPath}`,
+      nodes: config.gpuAgentNodes,
+      heartbeatTimeout: 30_000,
+      logger,
+    })
+    : undefined
+    gpuAgentHub?.start()
+    if (gpuAgentHub) ctx.on('dispose', () => void gpuAgentHub.close())
+    // GPU Agent 同一时间只接受一个任务；大量文件同时到达时在此排队依次渲染，而不是直接拒绝
+    let gpuAgentQueue: Promise<unknown> = Promise.resolve()
+    const enqueueGpuAgentRender = <T>(task: () => Promise<T>): Promise<T> => {
+      const run = gpuAgentQueue.then(task, task)
+      gpuAgentQueue = run.catch(() => undefined)
+      return run
+    }
+  if (config.renderEngine === 'gpuClient' && config.gpuClientGameDirectory?.trim()) {
+    void installBundledGpuClient(config.gpuClientGameDirectory, logger)
+  }
+  if (config.qqBotType === 'official') {
+    const proxyUrl = resolveOfficialProxyUrl(config)
+    if (proxyUrl) {
+      const removeProxyConfig = ctx.root.on('http/config', (httpConfig) => {
+        ;(httpConfig as typeof httpConfig & { proxyAgent?: string }).proxyAgent = proxyUrl
+      })
+      const stopTunnel = config.officialProxyMode === 'ssh'
+        ? startSshProxyTunnel(config, logger)
+        : () => undefined
+      logger.info(`官方 QQ 出站代理已启用：${proxyUrl}`)
+      // 网关看门狗：官方适配器偶发静默掉线（无报错、不再收消息）。
+      // 每分钟主动请求一次 QQ 网关接口；连续失败（中转断/网络断）只记录，
+      // 但能确保 http 栈经代理保持活跃，适配器底层的 token 刷新会随之自然重连。
+      let lastIncomingMessage = Date.now()
+      ctx.on('message', () => { lastIncomingMessage = Date.now() })
+      const keepalive = setInterval(async () => {
+        try {
+          await ctx.http.get('https://api.sgroup.qq.com/gateway', { timeout: 10_000, responseType: 'json' })
+        } catch {
+          // 401/4xx 属预期（无凭证也能到达网关），静默；网络级失败同样只记录
+        }
+      }, 60_000)
+      // 网关看门狗：官方适配器偶发“静默掉线”（WebSocket 半死、不报错、不重连、收不到任何消息）。
+      // 超过 8 分钟没有任何入站消息时，热重载本插件所在 loader 中的 QQ 适配器，强制重新鉴权。
+      const reloadAdapter = async () => {
+        try {
+          const loader = (ctx as any).loader
+          if (!loader?.entries) return
+          for (const entry of loader.entries.values()) {
+            if (entry?.config && 'secret' in entry.config && 'intents' in entry.config && String(entry.name ?? '').includes('adapter-qq')) {
+              logger.warn('网关看门狗：超过 8 分钟未收到任何 QQ 消息，热重载 QQ 适配器以重建网关连接')
+              await loader.reload(entry)
+              lastIncomingMessage = Date.now()
+              return
+            }
+          }
+        } catch (error) {
+          logger.warn(`网关看门狗热重载失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      const watchdog = setInterval(() => {
+        if (Date.now() - lastIncomingMessage > 8 * 60_000) void reloadAdapter()
+      }, 60_000)
+      ctx.on('dispose', () => { clearInterval(keepalive); clearInterval(watchdog) })
+      ctx.on('dispose', () => {
+        removeProxyConfig()
+        stopTunnel()
+      })
+    }
+  }
+  ctx.inject(['console'], (consoleCtx) => {
+    const root = resolve(__dirname, '..')
+    consoleCtx.console.addEntry({
+      dev: join(root, 'client/index.ts'),
+      prod: join(root, 'dist'),
+    })
+    consoleCtx.console.addListener('litematic/resource-pack-upload', async (filename, base64) => {
+      return saveUploadedResourcePack(filename, base64, resolve(consoleCtx.baseDir, 'data/litematic-resource-packs'))
+    }, { authority: 4 })
+  })
   const maxFileSizeBytes = config.maxFileSize * 1024
   ctx.on('dispose', () => terminateActiveStandaloneJavaProcesses(logger))
+  if (config.qqBotType === 'selfHosted') {
+    void ensureOneBotGroupUploadCompatibility(logger, config.patchOneBotGroupUpload)
+  }
   const diagnosticsPath = resolve(stringOrDefault(config.diagnosticsFilePath, 'data/litematic-renderer-diagnostics.json'))
   const diagnosticsArchiveDirectory = join(dirname(diagnosticsPath), 'litematic-renderer-diagnostics-archive')
   const diagnosticsDisabledDirectory = join(dirname(diagnosticsPath), 'litematic-renderer-diagnostics-disabled')
@@ -159,29 +598,32 @@ export function apply(ctx: Context, config: Config) {
     .then(() => enforceCacheLimit(cacheDirectory, cacheMaxBytes))
     .catch(error => logger.warn(`缓存初始化失败：${error instanceof Error ? error.message : String(error)}`))
 
-  const render = async (url: string, filename = 'schematic.litematic', preparedBytes?: Buffer): Promise<RenderResult> => {
+  const render = async (url: string, filename = 'schematic.litematic', preparedBytes?: Buffer, includeSixFace = false,
+                        source?: { group?: string, user?: string }): Promise<RenderResult> => {
+    const renderSource = source
     const bytes = preparedBytes ?? await download(ctx, url, maxFileSizeBytes, config.renderTimeout)
-    const metadata = formatLitematicMetadata(parseLitematicMetadata(bytes), filename)
+    const parsedMetadata = parseLitematicMetadata(bytes)
+    const metadata = formatLitematicMetadata(parsedMetadata, filename)
+    const projectionName = projectionNameFromFilename(filename)
     const fileHash = createHash('sha256').update(bytes).digest('hex')
-    const minecraftJarPath = config.renderEngine === 'standalone'
+    const needsStandaloneResources = config.renderEngine === 'standalone'
+      || (config.renderEngine === 'gpuAgent' && config.gpuAgentFallback)
+    const minecraftJarPath = needsStandaloneResources
       ? await resolveMinecraftResources(config)
       : ''
-    const resourceFingerprint = config.renderEngine === 'standalone'
+    const resourceFingerprint = needsStandaloneResources
       ? await fingerprintFiles([minecraftJarPath, ...resourcePackPaths(config.resourcePackPaths)])
       : []
     const renderHash = hashRenderConfiguration({
         version: CACHE_FORMAT_VERSION,
         outputSize: config.outputSize,
-        cellSize: config.cellSize,
         isometricCellSize: config.isometricCellSize,
         background: config.background,
         transparentBackground: config.transparentBackground,
-        showViewTitles: config.showViewTitles,
         gpuRendererCommand: config.gpuRendererCommand,
         renderEngine: config.renderEngine,
         standaloneRendererJar: config.standaloneRendererJar,
         resourceFingerprint,
-        javaResolution: config.javaResolution,
         javaSupersampling: config.javaSupersampling,
         webglQuality: config.webglQuality,
         webglWidth: config.webglWidth,
@@ -190,9 +632,11 @@ export function apply(ctx: Context, config: Config) {
         isometricFill: config.isometricFill,
         isometricRotation: config.isometricRotation,
         isometricSlant: config.isometricSlant,
+        sixFaceLayout: config.sixFaceLayout,
+        gpuAgentFingerprint: config.renderEngine === 'gpuAgent' ? gpuAgentHub?.capabilityFingerprint() ?? 'disabled' : undefined,
       })
-    const projectionName = cacheNameSegment(filename)
-    const output = join(versionCacheDirectory, `${projectionName}-${fileHash}-${renderHash}`)
+    const cacheProjectionName = cacheNameSegment(filename)
+    const output = join(versionCacheDirectory, `${cacheProjectionName}-${fileHash}-${renderHash}`)
     const input = join(output, 'projection.litematic')
     await fs.mkdir(output, { recursive: true })
     if (!(await exists(input))) await fs.writeFile(input, bytes)
@@ -205,7 +649,8 @@ export function apply(ctx: Context, config: Config) {
       createdAt: new Date().toISOString(),
     })
     const expected = ['isometric.png', 'isometric-reverse.png'].map(file => join(output, file))
-    if (!(await Promise.all(expected.map(exists))).every(Boolean)) {
+    const mergedExpected = join(output, 'isometric.png')
+    if (!(await Promise.all(expected.map(exists))).every(Boolean) && !(await exists(mergedExpected))) {
       let task = inFlight.get(output)
       if (!task) {
         task = (async () => {
@@ -217,7 +662,31 @@ export function apply(ctx: Context, config: Config) {
             if (config.renderEngine === 'standalone') {
               await renderWithStandalone(input, output, minecraftJarPath, config, logger)
               await mergeRenderDiagnostics(output, diagnosticsPath, logger)
-            } else if (config.renderEngine === 'java') {
+            } else if (config.renderEngine === 'gpuAgent') {
+              try {
+                if (!gpuAgentHub) throw new Error('GPU Agent v2 服务未启用')
+                const result = await enqueueGpuAgentRender(() => gpuAgentHub.render(createGpuRenderRequest(filename, config, renderSource), bytes, config.gpuAgentTimeout))
+                for (const image of result.images) {
+                  if (image.id === 'merged' || image.name === 'merged.png') {
+                    // Agent 已把正反两图拼为一张：直接作为唯一结果
+                    await fs.writeFile(join(output, 'isometric.png'), image.png)
+                    break
+                  }
+                  if (image.id === 'isometric' || image.name === 'isometric.png') {
+                    await fs.writeFile(join(output, 'isometric.png'), image.png)
+                  } else if (image.id === 'isometric-reverse' || image.name === 'isometric-reverse.png') {
+                    await fs.writeFile(join(output, 'isometric-reverse.png'), image.png)
+                  }
+                }
+              } catch (error) {
+                if (!config.gpuAgentFallback) throw error
+                logger.warn(`GPU Agent 渲染失败，回退独立 Java：${error instanceof Error ? error.message : String(error)}`)
+                await renderWithStandalone(input, output, minecraftJarPath, config, logger)
+                await mergeRenderDiagnostics(output, diagnosticsPath, logger)
+              }
+            } else if (config.renderEngine === 'remoteAgent') {
+              await renderWithRemoteAgent(bytes, output, filename, config)
+            } else if (config.renderEngine === 'java' || config.renderEngine === 'gpuClient') {
               await renderWithJavaBridge(input, output, config)
             } else {
               const schematic = parseLitematic(bytes)
@@ -235,7 +704,8 @@ export function apply(ctx: Context, config: Config) {
               await Promise.all(images.map(image => fs.writeFile(join(output, image.title), image.png)))
             }
           }
-          if (!(await Promise.all(expected.map(exists))).every(Boolean)) throw new Error('渲染器没有生成两张正二轴测 PNG')
+          // Agent 合并模式下只生成一张拼接图（isometric.png），此时不要求两张
+          if (!(await Promise.all(expected.map(exists))).every(Boolean) && !(await exists(mergedExpected))) throw new Error('渲染器没有生成两张正二轴测 PNG')
           } catch (error) {
             await appendRenderError(output, diagnosticsPath, config.renderEngine, error, logger)
             throw error
@@ -249,38 +719,77 @@ export function apply(ctx: Context, config: Config) {
     } else {
       logger.debug(`命中投影缓存：${fileHash}`)
     }
+    const images: ImageResult[] = (await exists(expected[1]))
+      ? expected.map((path, index) => ({
+          title: ['正二轴测', '反向正二轴测（旋转 180°）'][index],
+          path,
+        }))
+      : [{ title: '正二轴测', path: expected[0] }]
+    if (includeSixFace) {
+      const sixFacePath = join(output, 'six-faces.png')
+      if (!(await exists(sixFacePath))) {
+        const sixFaceTaskKey = `${output}:six-face`
+        let task = inFlight.get(sixFaceTaskKey)
+        if (!task) {
+          task = (async () => {
+            try {
+              if (config.renderEngine === 'standalone') {
+                try {
+                  await renderWithStandalone(input, output, minecraftJarPath, config, logger, 'six-face')
+                } catch (error) {
+                  logger.warn(`真实材质六面图生成失败，回退方块颜色投影：${error instanceof Error ? error.message : String(error)}`)
+                }
+              }
+              if (!(await exists(sixFacePath))) {
+                const blocks = parseLitematic(bytes)
+                const png = renderSixFaceOverview(blocks, config, config.sixFaceLayout)
+                await fs.writeFile(sixFacePath, png)
+              }
+            } catch (error) {
+              logger.warn(`六面正交图生成失败，继续发送轴测图：${error instanceof Error ? error.message : String(error)}`)
+            }
+          })().finally(() => inFlight.delete(sixFaceTaskKey))
+          inFlight.set(sixFaceTaskKey, task)
+        }
+        await task
+      }
+      if (await exists(sixFacePath)) images.push({ title: '六面正投影', path: sixFacePath })
+    }
     await touchCacheEntry(output)
     await enforceCacheLimit(cacheDirectory, cacheMaxBytes, output)
     return {
-      images: expected.map((path, index) => ({ title: ['正二轴测', '反向正二轴测（旋转 180°）'][index], path })),
+      images,
       metadata,
+      projectionName,
     }
   }
 
   ctx.middleware(async (session, next) => {
-    if (!session.guildId) return next()
+    if (!canRenderInSession(session, config.allowPrivateRender)) return next()
     const file = findLitematicFile(session)
     if (!file) return next()
     const url = await resolveFileUrl(session, file)
     if (!url) {
       logger.warn(`检测到 Litematic 文件但无法获取下载地址：${fileName(file) ?? 'unknown.litematic'}；请检查 OneBot/NapCat 的 get_group_file_url 接口。`)
-      await session.send([...replyElements(session), h('text', { content: '检测到投影文件，但无法获取群文件下载地址，请检查 OneBot/NapCat 文件接口。' })])
+      await session.send([...replyElements(session, config.qqBotType), h('text', { content: '检测到投影文件，但无法获取群文件下载地址，请检查机器人文件接口。' })])
       return next()
     }
     if (isOverLimit(file.size, maxFileSizeBytes)) {
       await appendGlobalRenderError(diagnosticsPath, `input:${basename(fileName(file) ?? 'unknown.litematic')}`, 'input', `file size exceeds ${config.maxFileSize} KB`, logger)
-      await session.send([...replyElements(session), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
+      await session.send([...replyElements(session, config.qqBotType), h('text', { content: `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。` })])
       return next()
       await session.send(`文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，无法渲染。`)
       return next()
     }
     if (!isUnderLimit(file.size, maxFileSizeBytes)) return next()
     try {
-      const result = await render(url, fileName(file) ?? 'schematic.litematic')
-      await sendImages(session, result.images, result.metadata, resolveSendOptions(config, session.guildId))
+      const sendOptions = resolveSendOptions(config, session.guildId)
+      const result = await render(url, fileName(file) ?? 'schematic.litematic', undefined, sendOptions.sixFaceOverview,
+        { group: session.guildId ?? undefined, user: session.userId ?? undefined })
+      await sendImages(session, result.images, result.metadata, sendOptions, result.projectionName)
     } catch (error) {
       logger.warn(error)
-      await session.send([...replyElements(session), h('text', { content: formatRenderError(error, config) })])
+      await session.send([...replyElements(session, config.qqBotType), h('text', { content: formatRenderError(error, config) })])
       return next()
       // @ts-expect-error unreachable legacy error text is retained for compatibility
       await session.send(`投影渲染失败：${error instanceof Error ? error.message : String(error)}`)
@@ -292,9 +801,11 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }, url) => {
       if (!url) return '请提供 .litematic 文件的直链。'
       if (!session) return '此命令只能在消息会话中执行。'
+      if (!canRenderInSession(session, config.allowPrivateRender)) return '单人对话渲染未开启，请在插件发送设置中启用。'
       try {
-        const result = await render(url)
-        await sendImages(session, result.images, result.metadata, resolveSendOptions(config, session.guildId))
+        const sendOptions = resolveSendOptions(config, session.guildId)
+        const result = await render(url, 'schematic.litematic', undefined, sendOptions.sixFaceOverview)
+        await sendImages(session, result.images, result.metadata, sendOptions, result.projectionName)
       } catch (error) {
         return formatRenderError(error, config)
         // @ts-expect-error unreachable legacy error text is retained for compatibility
@@ -311,6 +822,19 @@ export function apply(ctx: Context, config: Config) {
     .action(async () => `Diagnostics file: ${diagnosticsPath}`)
   ctx.command('litematic.errors.disable', 'disable current render diagnostics snapshot', { authority: 3 })
     .action(async () => disableDiagnosticsSnapshot(diagnosticsPath, diagnosticsDisabledDirectory))
+  ctx.command('litematic.proxy.check', '检查 Koishi 当前公网出口 IP', { authority: 3 })
+    .action(async () => {
+      try {
+        const address = await ctx.http.get<string>('https://ifconfig.me/ip', {
+          responseType: 'text',
+          timeout: 10000,
+          headers: { 'User-Agent': 'koishi-plugin-litematic-renderer' },
+        })
+        return `当前 Koishi 出口 IP：${String(address).trim()}`
+      } catch (error) {
+        return `出口 IP 检查失败：${error instanceof Error ? error.message : String(error)}`
+      }
+    })
   const server = (ctx as any).server
   if (server?.get) {
     server.get('/litematic-renderer/diagnostics', async (koa: any) => {
@@ -319,6 +843,32 @@ export function apply(ctx: Context, config: Config) {
       koa.body = await fs.readFile(diagnosticsPath, 'utf8').catch(() => '{\"format\":2,\"blocks\":[],\"errors\":[]}')
     })
   }
+}
+
+export async function saveUploadedResourcePack(filename: unknown, base64: unknown, directory: string) {
+  if (typeof filename !== 'string' || !/\.zip$/i.test(filename)) {
+    throw new Error('只允许上传 ZIP 材质包')
+  }
+  if (typeof base64 !== 'string' || !base64.length) {
+    throw new Error('材质包内容为空')
+  }
+  const bytes = Buffer.from(base64, 'base64')
+  if (!bytes.length) throw new Error('材质包内容为空')
+  if (bytes.length > RESOURCE_PACK_UPLOAD_LIMIT) {
+    throw new Error('材质包超过 256 MB 上传上限')
+  }
+  const signature = bytes.readUInt32LE(0)
+  if (![0x04034b50, 0x06054b50, 0x08074b50].includes(signature)) {
+    throw new Error('文件不是有效的 ZIP 材质包')
+  }
+
+  const original = basename(filename).replace(/\.zip$/i, '')
+  const stem = original.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').trim() || 'resource-pack'
+  const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 12)
+  const output = join(directory, `${stem}-${hash}.zip`)
+  await fs.mkdir(directory, { recursive: true })
+  await fs.writeFile(output, bytes)
+  return output.replace(/\\/g, '/')
 }
 
 interface CacheMetadata {
@@ -334,6 +884,79 @@ export function hashRenderConfiguration(configuration: unknown) {
   return createHash('sha256').update(JSON.stringify(configuration)).digest('hex').slice(0, 16)
 }
 
+interface SourcePatchResult {
+  source: string
+  changed: boolean
+  alreadyCompatible: boolean
+}
+
+type PluginLogger = {
+  info(message: string): void
+  warn(message: string): void
+  debug(message: string): void
+}
+
+export function patchOneBotAdapterSource(source: string): SourcePatchResult {
+  const activeGroupUpload = /^\s*case ["']group_upload["']:/m.test(source)
+  if (activeGroupUpload) return { source, changed: false, alreadyCompatible: true }
+
+  const importName = source.match(/\(0,\s*(import_[\w$]+)\.hyphenate\)\(data\.sub_type\)/)?.[1] ?? 'import_koishi2'
+  const commentedBlock = /      \/\/ https:\/\/github\.com\/koishijs\/koishi-plugin-adapter-onebot\/issues\/33\r?\n      \/\/ case 'offline_file':\r?\n      \/\/   session\.elements = \[h\('file', data\.file\)\]\r?\n      \/\/   session\.type = 'message'\r?\n      \/\/   session\.subtype = 'private'\r?\n      \/\/   session\.isDirect = true\r?\n      \/\/   session\.subsubtype = 'offline-file-added'\r?\n      \/\/   break\r?\n      \/\/ case 'group_upload':\r?\n      \/\/   session\.elements = \[h\('file', data\.file\)\]\r?\n      \/\/   session\.type = 'message'\r?\n      \/\/   session\.subtype = 'group'\r?\n      \/\/   session\.subsubtype = 'guild-file-added'\r?\n      \/\/   break/
+  if (!commentedBlock.test(source)) return { source, changed: false, alreadyCompatible: false }
+
+  const replacement = [
+    '      // Restored by koishi-plugin-litematic-renderer so NapCat group file uploads reach middleware.',
+    '      case "offline_file":',
+    `        session.elements = [(0, ${importName}.h)("file", data.file)];`,
+    '        session.type = "message";',
+    '        session.subtype = "private";',
+    '        session.isDirect = true;',
+    '        session.subsubtype = "offline-file-added";',
+    '        break;',
+    '      case "group_upload":',
+    `        session.elements = [(0, ${importName}.h)("file", data.file)];`,
+    '        session.type = "message";',
+    '        session.subtype = "group";',
+    '        session.subsubtype = "guild-file-added";',
+    '        break;',
+  ].join('\n')
+  return { source: source.replace(commentedBlock, replacement), changed: true, alreadyCompatible: false }
+}
+
+async function ensureOneBotGroupUploadCompatibility(logger: PluginLogger, enabled: boolean) {
+  if (!enabled) return
+  let packageJsonPath: string
+  try {
+    packageJsonPath = require.resolve('koishi-plugin-adapter-onebot/package.json', { paths: [process.cwd(), __dirname] })
+  } catch {
+    logger.debug('未安装 koishi-plugin-adapter-onebot，跳过群文件上传事件兼容修复。')
+    return
+  }
+
+  try {
+    const packageDirectory = dirname(packageJsonPath)
+    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf8')) as { version?: string }
+    const adapterEntry = join(packageDirectory, 'lib', 'index.js')
+    const source = await fs.readFile(adapterEntry, 'utf8')
+    const patch = patchOneBotAdapterSource(source)
+    if (patch.alreadyCompatible) {
+      logger.debug(`koishi-plugin-adapter-onebot@${packageJson.version ?? 'unknown'} 已支持 group_upload。`)
+      return
+    }
+    if (!patch.changed) {
+      logger.warn(`koishi-plugin-adapter-onebot@${packageJson.version ?? 'unknown'} 未识别到可自动修复的 group_upload 代码段。`)
+      return
+    }
+
+    const backup = `${adapterEntry}.litematic-renderer.bak`
+    if (!(await exists(backup))) await fs.writeFile(backup, source)
+    await fs.writeFile(adapterEntry, patch.source)
+    logger.warn(`已修复 koishi-plugin-adapter-onebot@${packageJson.version ?? 'unknown'} 的群文件上传事件映射；请重启 Koishi 让已加载的 OneBot 适配器生效。`)
+  } catch (error) {
+    logger.warn(`修复 OneBot 群文件上传事件失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 function cachePathSegment(value: string) {
   return value.replace(/[^a-zA-Z0-9._-]/g, '_') || 'unknown'
 }
@@ -344,6 +967,10 @@ export function cacheNameSegment(filename: string) {
     .replace(/[. ]+$/g, '')
     .trim()
   return (name || 'schematic').slice(0, 80)
+}
+
+function projectionNameFromFilename(filename: string) {
+  return basename(filename || 'schematic.litematic').replace(/\.litematic$/i, '').trim() || 'schematic'
 }
 
 async function ensureCacheMetadata(directory: string, metadata: CacheMetadata) {
@@ -429,6 +1056,13 @@ export function findLitematicFile(session: Pick<Session, 'elements' | 'content'>
     return { ...(elements[0].attrs as FileElement), name: inferredName }
   }
   return undefined
+}
+
+export function canRenderInSession(
+  session: Pick<Session, 'guildId' | 'isDirect'>,
+  allowPrivateRender: boolean,
+) {
+  return Boolean(session.guildId) || (Boolean(session.isDirect) && allowPrivateRender)
 }
 
 function findLitematicInFilePayload(value: unknown, seen = new Set<object>(), depth = 0): FileElement | undefined {
@@ -549,7 +1183,7 @@ async function resolveStandaloneJavaCommand(configuredCommand: string) {
   for (const candidate of candidates) {
     if (supportsStandaloneJavaVersion(await javaMajorVersion(candidate))) return candidate
   }
-  throw new Error('未找到 Java 21+；请安装 Java 21 或更高版本，设置 JAVA_HOME，或填写 standaloneJavaCommand')
+  throw new Error('未找到 Java 21+；请安装 Java 21 或更高版本，设置 JAVA_HOME，或填写 javaPath')
 }
 
 function isOverLimit(size: string | number | undefined, limit: number) {
@@ -599,8 +1233,12 @@ export function standaloneJvmOptions(maxHeapMb: number) {
   ]
 }
 
+export function effectiveRenderResolution(config: Pick<Config, 'outputSize'>) {
+  return Math.max(256, Math.min(4096, Math.floor(config.outputSize)))
+}
+
 export function isJavaMemoryFailure(output: string, exitCode?: number | null) {
-  if (exitCode === 137) return true
+  if (exitCode === 3 || exitCode === 137) return true
   return /outofmemoryerror|java heap space|gc overhead limit|cannot reserve enough space|native memory allocation|insufficient memory|malloc failed|os::commit_memory/i.test(output)
 }
 
@@ -613,8 +1251,10 @@ async function resolveMinecraftResources(config: Config) {
 }
 
 async function renderWithStandalone(input: string, output: string, minecraftJarPath: string, config: Config,
-                                    logger: ReturnType<Context['logger']>) {
-  const rendererJar = resolve(config.standaloneRendererJar || join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.2.6.jar'))
+                                    logger: ReturnType<Context['logger']>, mode: 'isometric' | 'six-face' = 'isometric') {
+  const releaseRenderSlot = await acquireStandaloneRenderSlot()
+  try {
+  const rendererJar = resolve(config.standaloneRendererJar || join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.2.8.jar'))
   if (!(await exists(rendererJar))) throw new Error(`独立 Java 渲染器不存在：${rendererJar}`)
   if (!(await exists(minecraftJarPath))) throw new Error(`Minecraft 资源 JAR 不存在：${minecraftJarPath}`)
   for (const pack of resourcePackPaths(config.resourcePackPaths)) {
@@ -625,16 +1265,23 @@ async function renderWithStandalone(input: string, output: string, minecraftJarP
     '-Djava.awt.headless=true', '-jar', rendererJar,
     '--input', resolve(input), '--output', resolve(output),
     '--minecraft-jar', minecraftJarPath,
-    '--resolution', String(config.javaResolution),
+    '--resolution', String(effectiveRenderResolution(config)),
     '--supersampling', String(config.javaSupersampling),
     '--rotation', String(config.isometricRotation),
     '--slant', String(config.isometricSlant),
     '--fill', String(config.isometricFill),
     '--background', config.background,
   ]
+  if (mode === 'six-face') {
+    rendererArgs.push(
+      '--six-face-only',
+      '--six-face-resolution', String(config.outputSize),
+      '--six-face-layout', config.sixFaceLayout,
+    )
+  }
   if (config.transparentBackground) rendererArgs.push('--transparent-background')
   for (const pack of resourcePackPaths(config.resourcePackPaths)) rendererArgs.push('--resource-pack', resolve(pack))
-  const javaCommand = await resolveStandaloneJavaCommand(config.standaloneJavaCommand)
+  const javaCommand = await resolveStandaloneJavaCommand(config.javaPath || config.standaloneJavaCommand || '')
 
   for (let attempt = 0; attempt <= config.standaloneJavaMemoryRestartLimit; attempt++) {
     const heap = attempt === 0 ? config.standaloneJavaMaxHeapMb : config.standaloneJavaRetryMaxHeapMb
@@ -643,13 +1290,17 @@ async function renderWithStandalone(input: string, output: string, minecraftJarP
     const memoryFailure = isJavaMemoryFailure(result.stderr, result.code)
     if (memoryFailure && attempt < config.standaloneJavaMemoryRestartLimit) {
       logger.warn(`独立 Java 渲染超出 ${config.standaloneJavaMaxHeapMb} MiB 堆内存限制；正在启动全新进程重试（${attempt + 1}/${config.standaloneJavaMemoryRestartLimit}）`)
-      await Promise.all(['isometric.png', 'isometric-reverse.png'].map(file => fs.rm(join(output, file), { force: true })))
+      const outputs = mode === 'six-face' ? ['six-faces.png'] : ['isometric.png', 'isometric-reverse.png']
+      await Promise.all(outputs.map(file => fs.rm(join(output, file), { force: true })))
       continue
     }
     const memoryHint = memoryFailure
-      ? `；Java 内存不足（最大堆 ${config.standaloneJavaMaxHeapMb} MiB，已重启 ${attempt} 次）`
+      ? `；Java 内存不足（本次最大堆 ${heap} MiB，已重启 ${attempt} 次）`
       : ''
     throw new Error(`独立 Java 渲染器退出码 ${result.code}${memoryHint}${result.stderr ? `：${result.stderr.trim()}` : ''}`)
+  }
+  } finally {
+    releaseRenderSlot()
   }
 }
 
@@ -710,10 +1361,53 @@ async function terminateActiveStandaloneJavaProcesses(logger: ReturnType<Context
   logger.info(`已终止 ${processes.length} 个独立渲染 Java 进程并回收其子进程`)
 }
 
+async function installBundledGpuClient(gameDirectory: string, logger: ReturnType<Context['logger']>) {
+  const game = resolve(gameDirectory)
+  const source = resolve(join(__dirname, `../assets/gpu-client/${GPU_CLIENT_JAR_NAME}`))
+  if (!(await exists(source))) {
+    logger.warn(`内置 GPU 客户端 JAR 不存在：${source}`)
+    return
+  }
+  if (!(await exists(game))) {
+    logger.warn(`GPU 客户端游戏目录不存在：${game}`)
+    return
+  }
+  const mods = join(game, 'mods')
+  const destination = join(mods, GPU_CLIENT_JAR_NAME)
+  try {
+    await fs.mkdir(mods, { recursive: true })
+    const sourceHash = await fileSha256(source)
+    const destinationHash = await fileSha256(destination)
+    if (sourceHash !== destinationHash) {
+      await fs.copyFile(source, destination)
+    }
+    for (const entry of await fs.readdir(mods)) {
+      if (entry === GPU_CLIENT_JAR_NAME || !/^quickcraft-mc26\.2-.*\.jar$/i.test(entry)) continue
+      const path = join(mods, entry)
+      const disabled = `${path}.disabled`
+      if (!(await exists(disabled))) await fs.rename(path, disabled)
+    }
+    logger.info(`Minecraft 26.2 GPU 渲染端已安装：${destination}`)
+  } catch (error) {
+    logger.warn(`GPU 渲染端安装失败，请关闭 Minecraft 后重载插件：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+async function fileSha256(path: string) {
+  try {
+    return createHash('sha256').update(await fs.readFile(path)).digest('hex')
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
 interface JavaBridgeStatus {
   timestamp?: number
   inWorld?: boolean
   resourcePacks?: string[]
+  renderer?: string
+  rendererVersion?: string
 }
 
 interface JavaBridgeResult {
@@ -722,23 +1416,33 @@ interface JavaBridgeResult {
 }
 
 async function renderWithJavaBridge(input: string, output: string, config: Config) {
-  if (!config.javaBridgeDirectory.trim()) {
+  const quickCraftGpu = config.renderEngine === 'gpuClient'
+  if (quickCraftGpu && !config.gpuClientGameDirectory?.trim()) {
+    throw new Error('Minecraft 26.2 GPU 客户端游戏目录未配置')
+  }
+  if (!quickCraftGpu && !config.javaBridgeDirectory.trim()) {
     throw new Error('Fabric Java 渲染桥任务目录未配置；使用 java 后端时请填写 javaBridgeDirectory')
   }
-  const bridge = resolve(config.javaBridgeDirectory)
+  const bridge = quickCraftGpu
+    ? join(resolve(config.gpuClientGameDirectory), 'quickcraft-render-bridge')
+    : resolve(config.javaBridgeDirectory)
   const status = await readJson<JavaBridgeStatus>(join(bridge, 'status.json'))
   if (!status?.timestamp || Date.now() - status.timestamp > 5000) {
-    throw new Error('Minecraft Java 渲染桥未运行；请启动 1.21.1-Fabric 客户端并进入一个世界')
+    throw new Error(quickCraftGpu
+      ? 'Minecraft 26.2 GPU 渲染端未运行；请启动已配置的 Fabric 客户端，无需手动进入存档'
+      : 'Minecraft Java 渲染桥未运行；请启动 1.21.1-Fabric 客户端并进入一个世界')
   }
-  if (!status.inWorld) throw new Error('Minecraft Java 渲染桥已启动，但客户端尚未进入世界')
+  if (!quickCraftGpu && !status.inWorld) throw new Error('Minecraft Java 渲染桥已启动，但客户端尚未进入世界')
 
-  const packs = status.resourcePacks ?? []
-  const required = [
-    ['XeKr', '3.6forMC1.20.2~1.21.5.zip'],
-    ['XKRDA', '1.19.4~1.21snapshot.zip'],
-  ]
-  if (!required.every(parts => packs.some(id => parts.every(part => id.includes(part))))) {
-    throw new Error('Minecraft 客户端没有同时启用 XeKr 红显基础包和 XKRDA 附加包')
+  if (!quickCraftGpu) {
+    const packs = status.resourcePacks ?? []
+    const required = [
+      ['XeKr', '3.6forMC1.20.2~1.21.5.zip'],
+      ['XKRDA', '1.19.4~1.21snapshot.zip'],
+    ]
+    if (!required.every(parts => packs.some(id => parts.every(part => id.includes(part))))) {
+      throw new Error('Minecraft 客户端没有同时启用 XeKr 红显基础包和 XKRDA 附加包')
+    }
   }
 
   const id = randomUUID()
@@ -752,9 +1456,10 @@ async function renderWithJavaBridge(input: string, output: string, config: Confi
     id,
     input: resolve(input),
     outputDirectory: resolve(output),
-    resolution: config.javaResolution,
+    resolution: effectiveRenderResolution(config),
     supersampling: config.javaSupersampling,
     rotation: config.isometricRotation,
+    pitch: config.isometricSlant,
     slant: config.isometricSlant,
     fill: config.isometricFill,
     background: config.background,
@@ -773,6 +1478,104 @@ async function renderWithJavaBridge(input: string, output: string, config: Confi
     await new Promise(resolveDelay => setTimeout(resolveDelay, 200))
   }
   throw new Error(`Minecraft Java 渲染超过 ${Math.round(config.javaRenderTimeout / 1000)} 秒`)
+}
+
+export function createGpuRenderRequest(filename: string, config: Pick<Config,
+  'outputSize' | 'background' | 'transparentBackground' | 'javaSupersampling'
+  | 'isometricRotation' | 'isometricSlant' | 'isometricFill'>,
+  source?: { group?: string, user?: string }): GpuRenderRequest {
+  const size = effectiveRenderResolution(config)
+  const view = (id: string, name: string, yaw: number): RenderView => ({
+    id,
+    name,
+    yaw,
+    pitch: config.isometricSlant,
+    zoom: Math.max(0.05, config.isometricFill / 0.95),
+    autoFill: true,
+    width: size,
+    height: size,
+    background: config.background,
+    transparentBackground: config.transparentBackground,
+    supersampling: config.javaSupersampling,
+  })
+  return {
+    version: 2,
+    id: randomUUID(),
+    filename: basename(filename),
+    views: [
+      view('isometric', '正二轴测', config.isometricRotation),
+      view('isometric-reverse', '反向正二轴测（旋转 180°）', config.isometricRotation + 180),
+    ],
+    sourceGroup: source?.group,
+    sourceUser: source?.user,
+  }
+}
+
+export function createRemoteAgentSignature(secret: string, timestamp: string, nonce: string, body: Buffer) {
+  return createHmac('sha256', secret)
+    .update(timestamp).update('.').update(nonce).update('.').update(body).digest('hex')
+}
+
+async function renderWithRemoteAgent(bytes: Buffer, output: string, filename: string, config: Config) {
+  const endpoint = config.remoteAgentUrl.trim()
+  const secret = config.remoteAgentSecret.trim()
+  if (!endpoint) throw new Error('Remote GPU Agent URL 未配置')
+  if (!secret) throw new Error('Remote GPU Agent HMAC 密钥未配置')
+  let target: URL
+  try { target = new URL(endpoint) } catch { throw new Error(`Remote GPU Agent URL 无效：${endpoint}`) }
+  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Remote GPU Agent URL 必须使用 HTTP(S)')
+  const id = randomUUID()
+  const body = Buffer.from(JSON.stringify({
+    version: 1,
+    id,
+    filename: basename(filename),
+    litematicBase64: bytes.toString('base64'),
+    options: {
+      outputSize: effectiveRenderResolution(config),
+      background: config.background,
+      transparentBackground: config.transparentBackground,
+      supersampling: config.javaSupersampling,
+      rotation: config.isometricRotation,
+      slant: config.isometricSlant,
+      fill: config.isometricFill,
+      timeout: config.remoteAgentTimeout,
+    },
+  }))
+  const timestamp = String(Date.now())
+  const nonce = randomUUID()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), config.remoteAgentTimeout)
+  let raw: Response
+  try {
+    raw = await fetch(target, {
+      method: 'POST', body, signal: controller.signal,
+      headers: {
+        'content-type': 'application/json',
+        'x-litematic-agent-timestamp': timestamp,
+        'x-litematic-agent-nonce': nonce,
+        'x-litematic-agent-signature': createRemoteAgentSignature(secret, timestamp, nonce, body),
+      },
+    })
+  } catch (error) {
+    throw new Error(`Remote GPU Agent 请求失败：${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!raw.ok) throw new Error(`Remote GPU Agent HTTP ${raw.status}: ${(await raw.text()).slice(0, 500)}`)
+  const response = await raw.json() as any
+  if (response?.version !== 1 || response.id !== id || !Array.isArray(response.images)) {
+    throw new Error('Remote GPU Agent 返回了无效响应')
+  }
+  const accepted = new Set(['isometric.png', 'isometric-reverse.png'])
+  const written = new Set<string>()
+  for (const image of response.images) {
+    if (!accepted.has(image?.title) || typeof image?.base64 !== 'string') continue
+    const png = Buffer.from(image.base64, 'base64')
+    if (png.length < 8 || !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) continue
+    await fs.writeFile(join(output, image.title), png)
+    written.add(image.title)
+  }
+  if (written.size !== accepted.size) throw new Error('Remote GPU Agent 返回的 PNG 不完整')
 }
 
 async function readJson<T>(path: string): Promise<T | undefined> {
@@ -869,6 +1672,9 @@ async function appendRenderError(output: string, destination: string, engine: Co
 
 export function formatRenderError(error: unknown, config: Pick<Config, 'maxFileSize'>) {
   const message = error instanceof Error ? error.message : String(error)
+  if (/投影方块数或区域体积超过/i.test(message)) {
+    return `${message}，不渲染。`
+  }
   if (/文件超过|file size|file.*limit/i.test(message)) {
     return `文件大小超过 ${(config.maxFileSize / 1024).toFixed(2)} MB，不渲染。`
   }
@@ -880,6 +1686,9 @@ export function formatRenderError(error: unknown, config: Pick<Config, 'maxFileS
   }
   if (/minecraft.*resource|resource pack|原版资源|材质包.*不存在/i.test(message)) {
     return 'Minecraft 原版资源包不可用，请检查资源包配置。'
+  }
+  if (/Minecraft 26\.2 GPU 渲染端未运行/i.test(message)) {
+    return '请启动 Minecraft 26.2-Fabricjqr GPU 渲染客户端，停在主菜单即可，无需手动进入存档。'
   }
   return '投影渲染失败，请检查渲染器配置或导出诊断文件。'
 }
@@ -913,7 +1722,7 @@ async function renderWithWebgl(ctx: Context, data: Buffer, config: Config): Prom
       const file = new File([bytes], 'schematic.litematic', { type: 'application/octet-stream' })
       await (window as any).litematicViewerAPI.loadFromFile(file)
       return (window as any).litematicViewerAPI.renderIsometricViews({ width, height, quality, isometricSquare, isometricFill, isometricRotation, isometricSlant })
-    }, { base64: data.toString('base64'), width: config.webglWidth, height: config.webglHeight, quality: config.webglQuality, isometricSquare: config.isometricSquare, isometricFill: config.isometricFill, isometricRotation: config.isometricRotation, isometricSlant: config.isometricSlant })
+    }, { base64: data.toString('base64'), width: effectiveRenderResolution(config), height: effectiveRenderResolution(config), quality: config.webglQuality, isometricSquare: config.isometricSquare, isometricFill: config.isometricFill, isometricRotation: config.isometricRotation, isometricSlant: config.isometricSlant })
     return [
       { title: 'isometric.png', png: decodeDataUrl(views.isometricView) },
       { title: 'isometric-reverse.png', png: decodeDataUrl(views.reverseIsometricView) },
@@ -931,12 +1740,15 @@ function decodeDataUrl(value: unknown) {
 }
 
 export interface ResolvedSendOptions {
+  qqBotType: QqBotType
   sendMode: SendMode
   replyAndMention: boolean
   showViewTitles: boolean
+  sixFaceOverview: boolean
 }
 
-type SendConfig = Pick<Config, 'sendAsForward' | 'replyAndMention' | 'groupSendOptions'> & Partial<Pick<Config, 'showViewTitles'>>
+type SendConfig = Pick<Config, 'sendAsForward' | 'replyAndMention' | 'groupSendOptions'>
+  & Partial<Pick<Config, 'qqBotType' | 'showViewTitles' | 'sixFaceOverview'>>
 
 export function resolveSendOptions(config: SendConfig, groupId?: string): ResolvedSendOptions {
   const override = groupId
@@ -947,38 +1759,108 @@ export function resolveSendOptions(config: SendConfig, groupId?: string): Resolv
     : override?.replyAndMention === 'disabled'
       ? false
       : config.replyAndMention
+  const sendMode = override?.sendMode ?? (config.sendAsForward ? 'forward' : 'combined')
+  const qqBotType = config.qqBotType ?? 'selfHosted'
   return {
-    sendMode: override?.sendMode ?? (config.sendAsForward ? 'forward' : 'combined'),
+    qqBotType,
+    sendMode,
     replyAndMention,
     showViewTitles: config.showViewTitles ?? false,
+    sixFaceOverview: (qqBotType === 'official' || sendMode === 'forward') && (config.sixFaceOverview ?? true),
   }
 }
 
-export async function sendImages(session: Session, images: ImageResult[], metadata: string, options: ResolvedSendOptions) {
+export async function sendImages(session: Session, images: ImageResult[], metadata: string, options: ResolvedSendOptions, projectionName = 'schematic') {
   const messages = images.map(({ title, path }) => h('message', { userId: session.selfId, nickname: '投影渲染' }, [
     ...(options.showViewTitles ? [h('text', { content: title })] : []), h.image(path),
   ]))
   const metadataMessage = h('message', { userId: session.selfId, nickname: '投影信息' }, [h('text', { content: metadata })])
-  const reply = options.replyAndMention ? replyElements(session) : []
+  const reply = options.replyAndMention ? replyElements(session, options.qqBotType) : []
+  // 「结果如上」仅自建 QQ 开启合并转发时提示准确；官方 QQ 不发成功文案，只发图和投影信息
+  const successMessage = options.qqBotType === 'selfHosted' && options.sendMode === 'forward'
+    ? `${projectionName} 已渲染成功，结果如上`
+    : `${projectionName} 已渲染成功`
+  if (options.qqBotType === 'official') {
+    const overviewPath = await composeQqOverview(images)
+    const message = [
+      ...(options.replyAndMention && session.messageId ? [h('quote', { id: session.messageId })] : []),
+      h.image(pathToFileURL(overviewPath).href),
+      ...(metadata ? [h('text', { content: metadata })] : []),
+    ]
+    await session.send(message)
+    return
+  }
   if (options.sendMode === 'forward') {
     await session.send(h('figure', {}, [...messages, metadataMessage]))
-    if (options.replyAndMention && session.userId) {
-      await session.send([h('at', { id: session.userId }), h('text', { content: '渲染结果如上' })])
-    }
+    await session.send(options.replyAndMention
+      ? [...reply, h('text', { content: successMessage })]
+      : successMessage)
     return
   }
   const combined = images.flatMap(({ title, path }, index) => [
     ...(options.showViewTitles ? [h('text', { content: `${index ? '\n' : ''}${title}\n` })] : []),
     h.image(path),
   ])
-  await session.send([...reply, ...combined, h('text', { content: `\n${metadata}` })])
+  await session.send([...reply, ...combined, h('text', { content: `\n${metadata}\n${successMessage}` })])
 }
 
-function replyElements(session: Session) {
+export async function composeQqOverview(images: ImageResult[]) {
+  if (!images.length) throw new Error('没有可合并的渲染图片')
+  const sources = await Promise.all(images.map(async image => PNG.sync.read(await fs.readFile(resolve(image.path)))))
+  const width = Math.max(...sources.map(image => image.width))
+  const gap = Math.max(4, Math.round(width * 0.01))
+  const placements: Array<{ image: PNG, x: number, y: number, width: number, height: number }> = []
+  let y = 0
+  const top = sources.slice(0, Math.min(2, sources.length))
+  const topWidth = top.length === 1 ? width : Math.floor((width - gap) / 2)
+  const topHeights = top.map(image => Math.max(1, Math.round(image.height * topWidth / image.width)))
+  const topHeight = Math.max(...topHeights)
+  for (let index = 0; index < top.length; index++) {
+    placements.push({
+      image: top[index],
+      x: index * (topWidth + gap),
+      y: Math.floor((topHeight - topHeights[index]) / 2),
+      width: topWidth,
+      height: topHeights[index],
+    })
+  }
+  y += topHeight
+  for (const image of sources.slice(2)) {
+    y += gap
+    const height = Math.max(1, Math.round(image.height * width / image.width))
+    placements.push({ image, x: 0, y, width, height })
+    y += height
+  }
+  const output = new PNG({ width, height: y })
+  for (const placement of placements) drawScaledPng(output, placement)
+  const outputPath = resolve(dirname(images[0].path), 'qq-overview.png')
+  await fs.writeFile(outputPath, PNG.sync.write(output))
+  return outputPath
+}
+
+function drawScaledPng(target: PNG, placement: { image: PNG, x: number, y: number, width: number, height: number }) {
+  const { image, x: targetX, y: targetY, width, height } = placement
+  for (let y = 0; y < height; y++) {
+    const sourceY = Math.min(image.height - 1, Math.floor((y + 0.5) * image.height / height))
+    for (let x = 0; x < width; x++) {
+      const sourceX = Math.min(image.width - 1, Math.floor((x + 0.5) * image.width / width))
+      const sourceOffset = (sourceY * image.width + sourceX) * 4
+      const targetOffset = ((targetY + y) * target.width + targetX + x) * 4
+      target.data[targetOffset] = image.data[sourceOffset]
+      target.data[targetOffset + 1] = image.data[sourceOffset + 1]
+      target.data[targetOffset + 2] = image.data[sourceOffset + 2]
+      target.data[targetOffset + 3] = image.data[sourceOffset + 3]
+    }
+  }
+}
+
+export function replyElements(session: Session, qqBotType: QqBotType = session.platform === 'qq' ? 'official' : 'selfHosted') {
   const result = []
   if (session.messageId) result.push(h('quote', { id: session.messageId }))
-  if (session.userId) result.push(h('at', { id: session.userId }))
-  if (result.length) result.push(h('text', { content: '\n' }))
+  if (qqBotType === 'selfHosted' && session.userId) {
+    result.push(h('at', { id: session.userId }))
+    result.push(h('text', { content: '\n' }))
+  }
   return result
 }
 
@@ -1127,7 +2009,7 @@ export function formatLitematicMetadata(metadata: LitematicMetadata, filename?: 
   const gameVersion = metadata.minecraftVersion ?? '未知'
   const dataVersion = metadata.minecraftDataVersion == null ? '' : `（数据版本：${metadata.minecraftDataVersion}）`
   const projectionName = typeof filename === 'string' && filename.trim()
-    ? basename(filename).replace(/\.litematic$/i, '')
+    ? projectionNameFromFilename(filename)
     : ''
   return [
     ...(projectionName ? [`投影名称：${projectionName}`] : []),
@@ -1191,26 +2073,128 @@ function getBounds(blocks: Block[]): Bounds {
   return blocks.reduce((box, block) => ({ minX: Math.min(box.minX, block.x), minY: Math.min(box.minY, block.y), minZ: Math.min(box.minZ, block.z), maxX: Math.max(box.maxX, block.x), maxY: Math.max(box.maxY, block.y), maxZ: Math.max(box.maxZ, block.z) }), { minX: Infinity, minY: Infinity, minZ: Infinity, maxX: -Infinity, maxY: -Infinity, maxZ: -Infinity })
 }
 
-type View = 'top' | 'front' | 'side'
-function renderOrthographic(blocks: Block[], bounds: Bounds, view: View, config: Config) {
-  const spanA = view === 'side' ? bounds.maxZ - bounds.minZ + 1 : bounds.maxX - bounds.minX + 1
-  const spanB = view === 'top' ? bounds.maxZ - bounds.minZ + 1 : bounds.maxY - bounds.minY + 1
-  const scale = Math.max(1, Math.min(config.cellSize, Math.floor(config.outputSize / Math.max(spanA, spanB))))
-  const canvas = new Raster(spanA * scale, spanB * scale, config)
-  const visible = new Map<string, Block>()
-  for (const block of blocks) {
-    const a = view === 'side' ? block.z - bounds.minZ : block.x - bounds.minX
-    const b = view === 'top' ? bounds.maxZ - block.z : bounds.maxY - block.y
-    const depth = view === 'top' ? block.y : view === 'front' ? -block.z : block.x
-    const key = `${a},${b}`, old = visible.get(key)
-    const oldDepth = old && (view === 'top' ? old.y : view === 'front' ? -old.z : old.x)
-    if (!old || depth > oldDepth!) visible.set(key, block)
-  }
-  for (const [key, block] of visible) {
-    const [a, b] = key.split(',').map(Number)
-    canvas.rect(a * scale, b * scale, scale, scale, colorFor(block.name))
+type OrthographicFace = 'up' | 'down' | 'east' | 'south' | 'west' | 'north'
+
+const SIX_FACE_ORDER: OrthographicFace[] = ['up', 'down', 'east', 'south', 'west', 'north']
+export const SIX_FACE_LABELS: Record<OrthographicFace, string[]> = {
+  up: [
+    '0000011000000000', '0000011000000000', '0000011000000000', '0000011000000000',
+    '0000011111110000', '0000011111110000', '0000011000000000', '0000011000000000',
+    '0000011000000000', '0000011000000000', '0000011000000000', '0000011000000000',
+    '1111111111111000', '0000000000000000', '0000000000000000', '0000000000000000',
+  ],
+  down: [
+    '0000000000000000', '1111111111111000', '0000011000000000', '0000011000000000',
+    '0000011000000000', '0000011010000000', '0000011011000000', '0000011001100000',
+    '0000011000110000', '0000011000000000', '0000011000000000', '0000011000000000',
+    '0000011000000000', '0000000000000000', '0000000000000000', '0000000000000000',
+  ],
+  east: [
+    '0000011000000000', '0000010000000000', '0111111111110000', '0000100000000000',
+    '0001001100000000', '0011001100000000', '0110001100000000', '0111111111110000',
+    '0000001100000000', '0001001101100000', '0011001100110000', '0110001100011000',
+    '0100011000000000', '0000000000000000', '0000000000000000', '0000000000000000',
+  ],
+  south: [
+    '0000001000000000', '1111111111111000', '0000001000000000', '0000001000000000',
+    '1111111111110000', '1100100010010000', '1100110110010000', '1101111111010000',
+    '1100001000010000', '1111111111110000', '1100001000010000', '1100001000010000',
+    '1100001000110000', '0000000000000000', '0000000000000000', '0000000000000000',
+  ],
+  west: [
+    '0000000000000000', '1111111111111000', '0000010100000000', '0000010100000000',
+    '0111111111110000', '0100010100010000', '0100100100010000', '0100100100010000',
+    '0101100111010000', '0101000000010000', '0100000000010000', '0111111111110000',
+    '0100000000010000', '0000000000000000', '0000000000000000', '0000000000000000',
+  ],
+  north: [
+    '0000100110000000', '0000100110000000', '0000100110000000', '0000100110000000',
+    '1111100110110000', '0000100111100000', '0000100110000000', '0000100110000000',
+    '0000100110000000', '0000100110000000', '0111100110001000', '1100100110001000',
+    '0000100011111000', '0000000000000000', '0000000000000000', '0000000000000000',
+  ],
+}
+
+export function renderSixFaceOverview(blocks: Block[], config: Config, layout: SixFaceLayout = config.sixFaceLayout ?? 'horizontal') {
+  if (!blocks.length) throw new Error('投影中没有可生成六面图的方块')
+  const outputSize = Math.max(128, Math.floor(config.outputSize))
+  const gap = Math.max(4, Math.round(outputSize * 0.01))
+  const columns = layout === 'vertical' ? 2 : 3
+  const rows = layout === 'vertical' ? 3 : 2
+  const tileSize = Math.floor((outputSize - gap * (layout === 'vertical' ? rows + 1 : columns + 1))
+    / (layout === 'vertical' ? rows : columns))
+  const width = layout === 'vertical' ? columns * tileSize + gap * (columns + 1) : outputSize
+  const height = layout === 'vertical' ? outputSize : rows * tileSize + gap * (rows + 1)
+  const canvas = new Raster(width, height, config)
+  const bounds = getBounds(blocks)
+  for (const [index, face] of SIX_FACE_ORDER.entries()) {
+    const column = index % columns
+    const row = Math.floor(index / columns)
+    const x = gap + column * (tileSize + gap)
+    const y = gap + row * (tileSize + gap)
+    drawOrthographicFace(canvas, blocks, bounds, face, x, y, tileSize, gap)
+    drawFaceLabel(canvas, face, x, y, tileSize, gap)
   }
   return canvas.png()
+}
+
+function drawOrthographicFace(canvas: Raster, blocks: Block[], bounds: Bounds, face: OrthographicFace,
+  tileX: number, tileY: number, tileSize: number, gap: number) {
+  const horizontalSpan = face === 'east' || face === 'west'
+    ? bounds.maxZ - bounds.minZ + 1
+    : bounds.maxX - bounds.minX + 1
+  const verticalSpan = face === 'up' || face === 'down'
+    ? bounds.maxZ - bounds.minZ + 1
+    : bounds.maxY - bounds.minY + 1
+  const visible = new Map<string, { block: Block, a: number, b: number, depth: number }>()
+  for (const block of blocks) {
+    const projected = orthographicCoordinates(block, bounds, face)
+    const key = `${projected.a},${projected.b}`
+    const old = visible.get(key)
+    if (!old || projected.depth > old.depth) visible.set(key, { block, ...projected })
+  }
+  const padding = Math.max(2, Math.floor(gap / 2))
+  const available = Math.max(1, tileSize - padding * 2)
+  const scale = Math.min(available / horizontalSpan, available / verticalSpan)
+  const renderedWidth = horizontalSpan * scale
+  const renderedHeight = verticalSpan * scale
+  const originX = tileX + padding + (available - renderedWidth) / 2
+  const originY = tileY + padding + (available - renderedHeight) / 2
+  const projectedBlocks = [...visible.values()].sort((first, second) => first.b - second.b || first.a - second.a)
+  for (const { block, a, b } of projectedBlocks) {
+    const x0 = Math.floor(originX + a * scale)
+    const y0 = Math.floor(originY + b * scale)
+    const x1 = Math.max(x0 + 1, Math.ceil(originX + (a + 1) * scale))
+    const y1 = Math.max(y0 + 1, Math.ceil(originY + (b + 1) * scale))
+    canvas.rect(x0, y0, x1 - x0, y1 - y0, colorFor(block.name))
+  }
+}
+
+function orthographicCoordinates(block: Block, bounds: Bounds, face: OrthographicFace) {
+  switch (face) {
+    case 'up': return { a: block.x - bounds.minX, b: block.z - bounds.minZ, depth: block.y }
+    case 'down': return { a: bounds.maxX - block.x, b: block.z - bounds.minZ, depth: -block.y }
+    case 'east': return { a: bounds.maxZ - block.z, b: bounds.maxY - block.y, depth: block.x }
+    case 'south': return { a: block.x - bounds.minX, b: bounds.maxY - block.y, depth: block.z }
+    case 'west': return { a: block.z - bounds.minZ, b: bounds.maxY - block.y, depth: -block.x }
+    case 'north': return { a: bounds.maxX - block.x, b: bounds.maxY - block.y, depth: -block.z }
+  }
+}
+
+function drawFaceLabel(canvas: Raster, face: OrthographicFace, tileX: number, tileY: number, tileSize: number, gap: number) {
+  const glyph = SIX_FACE_LABELS[face]
+  const scale = Math.max(1, Math.min(6, Math.floor(tileSize / 80)))
+  const padding = Math.max(1, Math.floor(scale / 2))
+  const x = tileX + Math.max(2, Math.floor(gap / 2))
+  const y = tileY + Math.max(2, Math.floor(gap / 2))
+  canvas.rect(x, y, glyph[0].length * scale + padding * 2, glyph.length * scale + padding * 2, '#000000')
+  for (let row = 0; row < glyph.length; row++) {
+    for (let column = 0; column < glyph[row].length; column++) {
+      if (glyph[row][column] === '1') {
+        canvas.rect(x + padding + column * scale, y + padding + row * scale, scale, scale, '#ffffff')
+      }
+    }
+  }
 }
 
 function renderIsometric(blocks: Block[], bounds: Bounds, config: Config, reverse: boolean) {

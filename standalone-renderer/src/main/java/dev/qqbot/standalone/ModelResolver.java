@@ -191,7 +191,13 @@ final class ModelResolver {
     }
 
     private static boolean isHead(String path) {
-        return path.endsWith("_head") || path.endsWith("_wall_head") || path.endsWith("_skull") || path.endsWith("_wall_skull");
+        return switch (path) {
+            case "player_head", "player_wall_head", "skeleton_skull", "skeleton_wall_skull",
+                "wither_skeleton_skull", "wither_skeleton_wall_skull", "zombie_head", "zombie_wall_head",
+                "creeper_head", "creeper_wall_head", "dragon_head", "dragon_wall_head",
+                "piglin_head", "piglin_wall_head" -> true;
+            default -> false;
+        };
     }
 
     private static int rotation(Litematic.BlockState state) {

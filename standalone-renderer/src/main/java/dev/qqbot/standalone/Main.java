@@ -5,10 +5,8 @@ import com.google.gson.JsonObject;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 
 public final class Main {
@@ -42,8 +40,13 @@ public final class Main {
                     options.background, options.transparentBackground
                 );
 
-                renderer.render(settings, options.rotation, options.output.resolve("isometric.png"));
-                renderer.render(settings, options.rotation + 180, options.output.resolve("isometric-reverse.png"));
+                if (options.sixFaceOnly) {
+                    renderer.renderSixFaces(settings, options.sixFaceResolution, options.sixFaceLayout,
+                        options.output.resolve("six-faces.png"));
+                } else {
+                    renderer.render(settings, options.rotation, options.output.resolve("isometric.png"));
+                    renderer.render(settings, options.rotation + 180, options.output.resolve("isometric-reverse.png"));
+                }
                 writeDiagnostics(options.output.resolve("render-diagnostics.json"), schematic, models);
             }
             System.out.println("Standalone render completed: " + options.output);
@@ -104,9 +107,12 @@ public final class Main {
         double rotation = 135;
         double slant = 36;
         double fill = 0.78;
+        int sixFaceResolution = 1024;
+        String sixFaceLayout = "horizontal";
         String background = "#000000";
         boolean debugStates;
         boolean transparentBackground;
+        boolean sixFaceOnly;
 
         static Options parse(String[] args) {
             Options options = new Options();
@@ -118,6 +124,10 @@ public final class Main {
                 }
                 if (key.equals("--transparent-background")) {
                     options.transparentBackground = true;
+                    continue;
+                }
+                if (key.equals("--six-face-only")) {
+                    options.sixFaceOnly = true;
                     continue;
                 }
                 if (key.equals("--resource-pack")) {
@@ -134,12 +144,14 @@ public final class Main {
                     case "--rotation" -> options.rotation = Double.parseDouble(value);
                     case "--slant" -> options.slant = Math.max(-90, Math.min(90, Double.parseDouble(value)));
                     case "--fill" -> options.fill = Math.max(0.1, Math.min(0.98, Double.parseDouble(value)));
+                    case "--six-face-resolution" -> options.sixFaceResolution = clamp(Integer.parseInt(value), 128, 4096);
+                    case "--six-face-layout" -> options.sixFaceLayout = requireLayout(value);
                     case "--background" -> options.background = value;
                     default -> throw new IllegalArgumentException("Unknown option: " + key);
                 }
             }
             if (options.input == null || options.output == null || options.minecraftJar == null) {
-                throw new IllegalArgumentException("Required: --input FILE --output DIR --minecraft-jar FILE [--resource-pack FILE ...]");
+                throw new IllegalArgumentException("Required: --input FILE --output DIR --minecraft-jar FILE [--resource-pack FILE ...] [--six-face-only]");
             }
             return options;
         }
@@ -147,6 +159,11 @@ public final class Main {
         private static String requireValue(String[] args, int index, String key) {
             if (index >= args.length) throw new IllegalArgumentException("Missing value for " + key);
             return args[index];
+        }
+
+        private static String requireLayout(String value) {
+            if (value.equals("horizontal") || value.equals("vertical")) return value;
+            throw new IllegalArgumentException("--six-face-layout must be horizontal or vertical");
         }
 
         private static int clamp(int value, int min, int max) { return Math.max(min, Math.min(max, value)); }

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "litematic_gpu_runtime",
+  "version": "${version}",
+  "name": "Litematic GPU Runtime",
+  "description": "Hidden Minecraft 26.2 GPU renderer for Litematic GPU Agent.",
+  "authors": ["halfkite", "QuickCraft contributors"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.qqbot.gpuruntime.GpuRuntimeClient"]
+  },
+  "mixins": ["litematic-gpu-runtime.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "26.2",
+    "java": ">=25",
+    "fabric-api": "*",
+    "malilib": ">=0.29.2 <0.30.0",
+    "litematica": ">=0.28.3 <0.29.0"
+  }
+}

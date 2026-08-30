@@ -26,6 +26,9 @@ public final class RendererSmokeTest {
             Litematic.Entity itemFrame = new Litematic.Entity("minecraft:item_frame", 0.5, 0.5, 0.5, 0, 0,
                 Map.of("Facing", 3, "Item", Map.of("id", "minecraft:diamond", "Count", 1)));
             require(entityModels.resolve(itemFrame).quads().size() > 6, "item frame and contained item were not rendered");
+            require(Litematic.isContainerBlockEntity("minecraft:chest"), "chest container was not filtered");
+            require(Litematic.isContainerBlockEntity("minecraft:shulker_box"), "shulker container was not filtered");
+            require(!Litematic.isContainerBlockEntity("minecraft:banner"), "banner data must remain available for rendering");
 
             BakedModel playerHead = models.resolve(
                 state("minecraft:player_head", Map.of("rotation", "4")),
@@ -75,17 +78,44 @@ public final class RendererSmokeTest {
                 List.of(), new Litematic.Bounds(0, 0, 0, 2, 1, 0));
             SoftwareRenderer renderer = new SoftwareRenderer(schematic, models, entityModels);
             Path output = Files.createTempFile("litematic-head-banner-smoke-", ".png");
+            Path sixFaceOutput = Files.createTempFile("litematic-six-face-smoke-", ".png");
+            Path verticalOutput = Files.createTempFile("litematic-six-face-vertical-smoke-", ".png");
             try {
-                renderer.render(new SoftwareRenderer.Settings(256, 1, 135, 36, 0.78, "#000000", true), 135, output);
+                SoftwareRenderer.Settings settings = new SoftwareRenderer.Settings(256, 1, 135, 36, 0.78, "#000000", true);
+                renderer.render(settings, 135, output);
                 BufferedImage rendered = javax.imageio.ImageIO.read(output.toFile());
                 require(rendered != null && rendered.getWidth() == 256 && rendered.getHeight() == 256,
                     "head and banner integration render did not create a valid PNG");
                 require(opaquePixels(rendered) > 100, "head and banner integration render was empty");
+
+                renderer.renderSixFaces(settings, 300, "horizontal", sixFaceOutput);
+                BufferedImage sixFaces = javax.imageio.ImageIO.read(sixFaceOutput.toFile());
+                require(sixFaces != null && sixFaces.getWidth() == 300 && sixFaces.getHeight() == 200,
+                    "horizontal six-face render did not use the requested 3x2 dimensions");
+                require(opaquePixels(sixFaces) > 500, "horizontal six-face material render was empty");
+                requireWhitePixel(sixFaces, 7, 19, "up label");
+                requireWhitePixel(sixFaces, 105, 8, "down label");
+                requireWhitePixel(sixFaces, 204, 9, "east label");
+                requireWhitePixel(sixFaces, 7, 114, "south label");
+                requireWhitePixel(sixFaces, 106, 116, "west label");
+                requireWhitePixel(sixFaces, 207, 117, "north label");
+
+                renderer.renderSixFaces(settings, 300, "vertical", verticalOutput);
+                BufferedImage vertical = javax.imageio.ImageIO.read(verticalOutput.toFile());
+                require(vertical != null && vertical.getWidth() == 200 && vertical.getHeight() == 300,
+                    "vertical six-face render did not use the requested 2x3 dimensions");
+                require(opaquePixels(vertical) > 500, "vertical six-face material render was empty");
             } finally {
                 Files.deleteIfExists(output);
+                Files.deleteIfExists(sixFaceOutput);
+                Files.deleteIfExists(verticalOutput);
             }
         }
         System.out.println("Renderer smoke test passed: heads and banners");
+    }
+
+    private static void requireWhitePixel(BufferedImage image, int x, int y, String label) {
+        require((image.getRGB(x, y) & 0xffffffffL) == 0xffffffffL, label + " bitmap stroke is missing");
     }
 
     private static Litematic.BlockState state(String name, Map<String, String> properties) {

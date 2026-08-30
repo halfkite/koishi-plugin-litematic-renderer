@@ -89,6 +89,9 @@ final class Litematic {
                 for (Object tileEntityValue : tileEntityValues) {
                     Map<String, Object> data = compound(tileEntityValue);
                     if (data == null || !(data.get("id") instanceof String id)) continue;
+                    // Inventory contents are not visible in a schematic preview. Do not retain
+                    // container NBT, which can be very large for storage and redstone builds.
+                    if (isContainerBlockEntity(id)) continue;
                     Number x = number(data.get("x")), y = number(data.get("y")), z = number(data.get("z"));
                     if (x == null || y == null || z == null) continue;
                     blockEntities.add(new BlockEntity(ox + x.intValue(), oy + y.intValue(), oz + z.intValue(), id, data));
@@ -188,5 +191,16 @@ final class Litematic {
         if (values == null || index < 0 || index >= values.size()) return fallback;
         Number number = number(values.get(index));
         return number == null ? fallback : number;
+    }
+
+    static boolean isContainerBlockEntity(String id) {
+        String path = id.startsWith("minecraft:") ? id.substring("minecraft:".length()) : id;
+        return switch (path) {
+            case "chest", "trapped_chest", "ender_chest", "barrel", "shulker_box",
+                "hopper", "dropper", "dispenser", "furnace", "blast_furnace", "smoker",
+                "brewing_stand", "crafter", "chiseled_bookshelf", "decorated_pot",
+                "jukebox", "campfire", "suspicious_sand", "suspicious_gravel" -> true;
+            default -> false;
+        };
     }
 }

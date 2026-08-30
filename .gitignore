@@ -39,3 +39,24 @@ webgl-centered-isometric.png
 
 /mod-builds/
 /plugin-archives/
+
+/gpu-render-agent/.gradle/
+/gpu-render-agent/build/
+/gpu-render-runtime/.gradle/
+/gpu-render-runtime/build/
+/.yarn/
+/.pnp.cjs
+/.pnp.loader.mjs
+/dist/
+/留档-部署架构.md
+/conversation-handoff.md
+/conversation-handoff.zip
+/deploy-*.sh
+/inspect-container-plugin.sh
+/restore-*.sh
+/package-verify-*/
+/inspect-container-plugin.sh
+
+/gpu-render-agent/plugins/
+/assets/standalone-renderer/litematic-standalone-renderer-0.2.7.jar
+/.zcode/

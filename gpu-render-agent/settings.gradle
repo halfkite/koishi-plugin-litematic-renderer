@@ -1,0 +1,3 @@
+rootProject.name = 'litematic-gpu-agent'
+
+includeBuild('../standalone-renderer')

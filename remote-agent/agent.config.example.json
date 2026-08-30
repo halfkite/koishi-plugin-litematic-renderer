@@ -1,0 +1,10 @@
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 39080,
+  "sharedSecret": "replace-with-a-random-secret-of-at-least-32-characters",
+  "gameDirectory": "C:/Minecraft/26.2-Fabricjqr",
+  "outputDirectory": "C:/Minecraft/26.2-Fabricjqr/quickcraft-render-agent",
+  "renderTimeout": 240000,
+  "maxRequestBytes": 25165824,
+  "maxClockSkewSeconds": 90
+}

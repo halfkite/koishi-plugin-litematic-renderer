@@ -1,0 +1,25 @@
+# Merge this fragment into the cloud Docker Compose project.
+# Replace the existing Koishi service name if it is not "koishi".
+services:
+  frps:
+    image: snowdreamtech/frps:latest
+    restart: unless-stopped
+    command: ["-c", "/etc/frp/frps.toml"]
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./frps.toml:/etc/frp/frps.toml:ro
+
+  frpc-visitor:
+    image: snowdreamtech/frpc:latest
+    restart: unless-stopped
+    command: ["-c", "/etc/frp/frpc-visitor.toml"]
+    volumes:
+      - ./frpc-visitor.toml:/etc/frp/frpc-visitor.toml:ro
+    depends_on:
+      - frps
+
+  koishi:
+    depends_on:
+      - frpc-visitor
+    # Set litematic-renderer.remoteAgentUrl to http://frpc-visitor:39080

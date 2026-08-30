@@ -1,0 +1,41 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+base { archivesName = 'litematic-gpu-runtime-mc26.2' }
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://api.modrinth.com/maven' }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+    include(implementation("net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"))
+    compileOnly "maven.modrinth:malilib:${project.malilib_version}"
+    runtimeOnly "maven.modrinth:malilib:${project.malilib_version}"
+    include(implementation("maven.modrinth:malilib:${project.malilib_version}"))
+    compileOnly "maven.modrinth:litematica:${project.litematica_version}"
+    runtimeOnly "maven.modrinth:litematica:${project.litematica_version}"
+    include(implementation("maven.modrinth:litematica:${project.litematica_version}"))
+    testImplementation platform('org.junit:junit-bom:5.13.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') { expand 'version': project.version }
+}
+
+tasks.withType(JavaCompile).configureEach { options.release = 25 }
+tasks.test { useJUnitPlatform() }
+java { withSourcesJar(); sourceCompatibility = JavaVersion.VERSION_25; targetCompatibility = JavaVersion.VERSION_25 }
+
+jar {
+    from('LICENSE') { rename { 'LICENSE_quickcraft' } }
+}

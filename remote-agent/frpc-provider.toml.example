@@ -1,0 +1,15 @@
+# Run this on the local computer that runs Minecraft and remote-render-agent.js.
+# It provides the local Agent to an STCP visitor; no Agent port is published publicly.
+serverAddr = "203.0.113.10"
+serverPort = 7000
+
+[auth]
+method = "token"
+token = "replace-with-a-long-frp-token"
+
+[[proxies]]
+name = "litematic-gpu-agent"
+type = "stcp"
+secretKey = "replace-with-a-second-long-random-secret"
+localIP = "127.0.0.1"
+localPort = 39080

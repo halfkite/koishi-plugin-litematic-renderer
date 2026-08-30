@@ -1,0 +1,16 @@
+# Run this as a small sidecar in the same Docker network as Koishi.
+# Do not publish bindPort to the host or public Internet.
+serverAddr = "frps"
+serverPort = 7000
+
+[auth]
+method = "token"
+token = "replace-with-the-same-long-frp-token"
+
+[[visitors]]
+name = "litematic-gpu-agent-visitor"
+type = "stcp"
+serverName = "litematic-gpu-agent"
+secretKey = "replace-with-the-same-second-long-random-secret"
+bindAddr = "0.0.0.0"
+bindPort = 39080
