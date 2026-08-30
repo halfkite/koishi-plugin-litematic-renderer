@@ -445,16 +445,21 @@ test('gates private rendering without affecting group and channel sessions', () 
   assert.equal(canRenderInSession({ guildId: undefined, isDirect: false }, true), false)
 })
 
-test('applies group whitelist and blacklist with blacklist precedence', () => {
-  const both = { groupWhitelist: ['g1', ' g2 '], groupBlacklist: ['bad'] }
+test('applies group whitelist and blacklist with independent switches and blacklist precedence', () => {
+  const both = { groupWhitelistEnabled: true, groupWhitelist: ['g1', ' g2 '], groupBlacklistEnabled: true, groupBlacklist: ['bad'] }
   assert.equal(isGroupAllowed(both, 'g1'), true)
   assert.equal(isGroupAllowed(both, 'g2'), true, '白名单匹配应忽略首尾空格')
   assert.equal(isGroupAllowed(both, 'g3'), false, '白名单非空时未列出的群不可用')
   assert.equal(isGroupAllowed(both, 'bad'), false, '黑名单优先于白名单')
-  const blacklistOnly = { groupWhitelist: [], groupBlacklist: ['bad'] }
+  const blacklistOnly = { groupWhitelistEnabled: false, groupWhitelist: [], groupBlacklistEnabled: true, groupBlacklist: ['bad'] }
   assert.equal(isGroupAllowed(blacklistOnly, 'any-group'), true)
   assert.equal(isGroupAllowed(blacklistOnly, 'bad'), false)
-  assert.equal(isGroupAllowed({ groupWhitelist: [], groupBlacklist: [] }, 'any-group'), true)
+  const allOff = { groupWhitelistEnabled: false, groupWhitelist: ['g1'], groupBlacklistEnabled: false, groupBlacklist: ['bad'] }
+  assert.equal(isGroupAllowed(allOff, 'bad'), true, '开关关闭时黑名单不生效')
+  assert.equal(isGroupAllowed(allOff, 'other'), true, '开关关闭时白名单不生效')
+  const whitelistOnly = { groupWhitelistEnabled: true, groupWhitelist: ['g1'], groupBlacklistEnabled: false, groupBlacklist: [] }
+  assert.equal(isGroupAllowed(whitelistOnly, 'g1'), true)
+  assert.equal(isGroupAllowed(whitelistOnly, 'g2'), false)
   assert.equal(isGroupAllowed(both, undefined), true, '私聊不受名单约束')
 })
 

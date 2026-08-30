@@ -55,7 +55,9 @@ export interface Config {
   sixFaceOverview: boolean
   sixFaceLayout: SixFaceLayout
   groupSendOptions: GroupSendOption[]
+  groupWhitelistEnabled: boolean
   groupWhitelist: string[]
+  groupBlacklistEnabled: boolean
   groupBlacklist: string[]
   renderTimeout: number
   cacheDirectory: string
@@ -136,8 +138,10 @@ export const Config: Schema<Config> = Schema.intersect([
         Schema.const('disabled').description('关闭回复 @'),
       ]).default('inherit'),
     })).default([]).description('按群覆盖发送方式和回复设置；官方 QQ 只使用引用开关，自建 QQ 同时使用发送模式和 @。'),
-    groupWhitelist: Schema.array(Schema.string()).default([]).description('群白名单：非空时只有列表内的群可以渲染（官方 QQ 填开放平台群哈希，自建 QQ 填群号）。'),
-    groupBlacklist: Schema.array(Schema.string()).default([]).description('群黑名单：列表内的群始终不渲染，优先级高于白名单。'),
+    groupWhitelistEnabled: Schema.boolean().default(false).description('启用群白名单：开启后仅白名单内的群可以渲染。'),
+    groupWhitelist: Schema.array(Schema.string()).default([]).description('群白名单（需开启上面的开关）：官方 QQ 填开放平台群哈希，自建 QQ 填群号。'),
+    groupBlacklistEnabled: Schema.boolean().default(false).description('启用群黑名单：开启后黑名单内的群始终不渲染，优先级高于白名单。'),
+    groupBlacklist: Schema.array(Schema.string()).default([]).description('群黑名单（需开启上面的开关）。'),
     showViewTitles: Schema.boolean().default(false).description('仅自建 QQ：发送图片时显示视图标题。'),
     replyAndMention: Schema.boolean().default(false).description('自建 QQ 会引用并 @ 发送者；官方 QQ 仅引用，避免显示 OpenID。'),
     sixFaceOverview: Schema.boolean().default(true).description('合并转发时生成并附加上、下、东、南、西、北六面正交合成图。'),
@@ -1009,18 +1013,19 @@ export function canRenderInSession(
 }
 
 /**
- * 群白/黑名单判定：黑名单优先；白名单非空时仅白名单内群可用。
+ * 群白/黑名单判定：各自由独立开关控制；黑名单优先。
  * 私聊（无群 ID）不参与名单判定，由 allowPrivateRender 单独控制。
  */
 export function isGroupAllowed(
-  config: Pick<Config, 'groupWhitelist' | 'groupBlacklist'>,
+  config: Pick<Config, 'groupWhitelist' | 'groupBlacklist' | 'groupWhitelistEnabled' | 'groupBlacklistEnabled'>,
   groupId?: string | null,
 ): boolean {
   if (!groupId) return true
   const id = groupId.trim()
   if (!id) return true
-  if (config.groupBlacklist.some(item => item.trim() === id)) return false
-  if (config.groupWhitelist.length > 0 && !config.groupWhitelist.some(item => item.trim() === id)) return false
+  if (config.groupBlacklistEnabled && config.groupBlacklist.some(item => item.trim() === id)) return false
+  if (config.groupWhitelistEnabled && config.groupWhitelist.length > 0
+    && !config.groupWhitelist.some(item => item.trim() === id)) return false
   return true
 }
 
