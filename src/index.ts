@@ -1,5 +1,5 @@
 import { Context, h, Schema, Session } from 'koishi'
-import { createHash, createHmac, randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { constants, promises as fs } from 'node:fs'
 import { basename, dirname, extname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -37,11 +37,9 @@ export interface Config {
   sshProxyPassword: string
   sshProxyLocalPort: number
   javaPath: string
-  standaloneJavaCommand?: string
   minecraftJarPath: string
   resourcePackPaths: string[]
-  renderEngine: 'standalone' | 'gpuClient' | 'gpuAgent' | 'remoteAgent' | 'java' | 'webgl' | 'cpu'
-  standaloneRendererJar: string
+  renderEngine: 'standalone' | 'gpuClient' | 'gpuAgent' | 'java' | 'webgl' | 'cpu'
   standaloneRenderTimeout: number
   standaloneJavaMaxHeapMb: number
   standaloneJavaRetryMaxHeapMb: number
@@ -68,7 +66,6 @@ export interface Config {
   gpuRendererCommand: string
   javaRenderTimeout: number
   javaResolution: number
-  javaSupersampling: number
   webglQuality: 'standard' | 'high' | 'ultra'
   webglWidth: number
   webglHeight: number
@@ -83,10 +80,6 @@ export interface Config {
   gpuAgentNodes: GpuAgentNodeConfig[]
   gpuAgentTimeout: number
   gpuAgentFallback: boolean
-  remoteAgentUrl: string
-  remoteAgentSecret: string
-  remoteAgentTimeout: number
-  remoteAgentClockSkewSeconds: number
 }
 
 export type SendMode = 'forward' | 'combined'
@@ -112,22 +105,21 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const('disabled').description('关闭中转'),
       Schema.const('proxy').description('使用已有代理'),
       Schema.const('ssh').description('自动建立 SSH 中转'),
-    ]).role('radio').default('disabled').description('仅官方 QQ：让 Koishi 出站请求使用固定公网 IP；SSH 模式会自动创建本机 SOCKS5 隧道。'),
-    officialProxyUrl: Schema.string().default('').description('已有代理地址；支持 socks5h、socks5、http 和 https。SSH 模式会根据本地端口自动生成。'),
-    sshProxyExecutable: Schema.string().default('ssh').description('SSH 可执行文件或命令；Linux 通常为 ssh，Windows 可填写 ssh.exe 的完整路径。'),
-    sshProxyHost: Schema.string().default('').description('SSH 中转服务器的数字 IP，例如 203.0.113.10（IPv4 数字地址）。'),
-    sshProxyPort: Schema.natural().min(1).max(65535).default(22).description('SSH 中转服务器端口。'),
-    sshProxyUser: Schema.string().default('root').description('SSH 登录用户名。'),
-    sshProxyPrivateKey: Schema.path({ filters: ['file'] }).default('').description('SSH 私钥路径（选填）；填写后优先使用密钥登录。Docker 需要先将密钥只读挂载进容器。'),
-    sshProxyPassword: Schema.string().role('secret').default('').description('SSH 登录密码（选填）；私钥为空时使用密码登录。密钥与密码至少填写一项。'),
-    sshProxyLocalPort: Schema.natural().min(1).max(65535).default(1080).description('本机 SOCKS5 监听端口；只监听 127.0.0.1，不对公网开放。'),
+    ]).role('radio').default('disabled').hidden().description('仅官方 QQ：让 Koishi 出站请求使用固定公网 IP；SSH 模式会自动创建本机 SOCKS5 隧道。'),
+    officialProxyUrl: Schema.string().default('').hidden().description('已有代理地址；支持 socks5h、socks5、http 和 https。SSH 模式会根据本地端口自动生成。'),
+    sshProxyExecutable: Schema.string().default('ssh').hidden().description('SSH 可执行文件或命令；Linux 通常为 ssh，Windows 可填写 ssh.exe 的完整路径。'),
+    sshProxyHost: Schema.string().default('').hidden().description('SSH 中转服务器的数字 IP，例如 203.0.113.10（IPv4 数字地址）。'),
+    sshProxyPort: Schema.natural().min(1).max(65535).default(22).hidden().description('SSH 中转服务器端口。'),
+    sshProxyUser: Schema.string().default('root').hidden().description('SSH 登录用户名。'),
+    sshProxyPrivateKey: Schema.path({ filters: ['file'] }).default('').hidden().description('SSH 私钥路径（选填）；填写后优先使用密钥登录。Docker 需要先将密钥只读挂载进容器。'),
+    sshProxyPassword: Schema.string().role('secret').default('').hidden().description('SSH 登录密码（选填）；私钥为空时使用密码登录。密钥与密码至少填写一项。'),
+    sshProxyLocalPort: Schema.natural().min(1).max(65535).default(1080).hidden().description('本机 SOCKS5 监听端口；只监听 127.0.0.1，不对公网开放。'),
   }).description('机器人接入'),
   Schema.object({
     renderEngine: Schema.union([
       Schema.const('gpuAgent').description('独立 GPU Agent（主动连接）'),
       Schema.const('standalone').description('真实材质快速渲染（推荐）'),
       Schema.const('gpuClient').description('Minecraft 26.2 GPU 客户端（最快）').hidden(),
-      Schema.const('remoteAgent').description('旧版 Remote Agent（HTTP / FRP）').hidden(),
       Schema.const('webgl').description('GPU WebGL（轻量，部分透明材质可能不准确）').hidden(),
       Schema.const('java').description('Fabric 客户端桥接').hidden(),
       Schema.const('cpu').description('简化方块颜色渲染').hidden(),
@@ -143,13 +135,6 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     allowPrivateRender: Schema.boolean().default(false).description('允许在单人对话中自动识别投影附件，并使用渲染命令；关闭时仅处理群聊和频道消息。'),
     sendAsForward: Schema.boolean().default(false).description('仅自建 QQ：开启为合并转发，关闭为联合发送；官方 QQ 忽略此项。'),
-    showViewTitles: Schema.boolean().default(false).description('仅自建 QQ：发送图片时显示视图标题。'),
-    replyAndMention: Schema.boolean().default(false).description('自建 QQ 会引用并 @ 发送者；官方 QQ 仅引用，避免显示 OpenID。'),
-    sixFaceOverview: Schema.boolean().default(true).description('合并转发时生成并附加上、下、东、南、西、北六面正交合成图。'),
-    sixFaceLayout: Schema.union([
-      Schema.const('horizontal').description('横向 3×2'),
-      Schema.const('vertical').description('纵向 2×3'),
-    ]).default('horizontal').description('六面正交合成图布局；最长边由 outputSize 控制。'),
     groupSendOptions: Schema.array(Schema.object({
       groupId: Schema.string().description('QQ群号。'),
       sendMode: Schema.union([
@@ -162,19 +147,23 @@ export const Config: Schema<Config> = Schema.intersect([
         Schema.const('disabled').description('关闭回复 @'),
       ]).default('inherit'),
     })).default([]).description('按群覆盖发送方式和回复设置；官方 QQ 只使用引用开关，自建 QQ 同时使用发送模式和 @。'),
+    showViewTitles: Schema.boolean().default(false).description('仅自建 QQ：发送图片时显示视图标题。'),
+    replyAndMention: Schema.boolean().default(false).description('自建 QQ 会引用并 @ 发送者；官方 QQ 仅引用，避免显示 OpenID。'),
+    sixFaceOverview: Schema.boolean().default(true).description('合并转发时生成并附加上、下、东、南、西、北六面正交合成图。'),
+    sixFaceLayout: Schema.union([
+      Schema.const('horizontal').description('横向 3×2'),
+      Schema.const('vertical').description('纵向 2×3'),
+    ]).default('horizontal').description('六面正交合成图布局；最长边由 outputSize 控制。'),
   }).description('发送设置'),
   Schema.object({
     javaPath: Schema.path({ filters: ['file'] }).default('').description('Java 路径：独立渲染器使用的 Java 可执行文件；推荐 Java 21+，留空自动查找。'),
-    standaloneJavaCommand: Schema.string().default('').hidden().description('旧版 Java 路径字段，仅用于兼容已有配置。'),
     minecraftJarPath: Schema.string().default('').description('可选的 Minecraft 客户端 JAR 或基础资源包；留空使用内置 26.2 原版资源。'),
     resourcePackPaths: Schema.array(Schema.string()).role('table').default([]).description('自定义资源包：点击上传材质包添加 ZIP；越靠后优先级越高，可选中后上移或下移。'),
-    standaloneRendererJar: Schema.string().default('').description('独立渲染器 JAR；留空使用插件内置版本。'),
     standaloneRenderTimeout: Schema.natural().min(10000).default(180000).description('独立 Java 渲染超时（毫秒）。'),
     standaloneJavaMaxHeapMb: Schema.natural().min(128).max(32768).step(8).default(200).description('首次独立渲染的最大堆内存（MiB）。'),
     standaloneJavaRetryMaxHeapMb: Schema.natural().min(256).max(32768).step(128).default(2048).description('内存不足时新进程重试的最大堆内存（MiB）。'),
     standaloneJavaMemoryRestartLimit: Schema.natural().max(3).default(1).description('检测到内存不足后启动全新进程重试的次数。'),
     javaResolution: Schema.natural().min(256).max(4096).default(1024).hidden().description('旧版 Java 分辨率字段，仅用于兼容已有配置；现在统一使用图像清晰度。'),
-    javaSupersampling: Schema.natural().min(1).max(4).default(1).description('离屏超采样倍数；1 为按目标分辨率直接输出，速度最快。2 及以上会显著增加耗时和内存。'),
   }).description('独立渲染器').collapse(),
   Schema.object({
     renderTimeout: Schema.natural().min(1000).default(30000).description('文件下载超时（毫秒）。'),
@@ -206,12 +195,6 @@ export const Config: Schema<Config> = Schema.intersect([
     gpuAgentTimeout: Schema.natural().min(10000).max(3600000).default(240000).description('等待 GPU Agent 完成任务的超时（毫秒）。'),
     gpuAgentFallback: Schema.boolean().default(true).description('GPU Agent 不可用或失败时自动回退到独立 Java 渲染器。'),
   }).description('GPU Agent v2').collapse(),
-  Schema.object({
-    remoteAgentUrl: Schema.string().default('').description('旧版 Remote Agent HTTP 地址，用于兼容已有 FRP 部署。'),
-    remoteAgentSecret: Schema.string().role('secret').default('').description('旧版 Remote Agent HMAC 共享密钥。'),
-    remoteAgentTimeout: Schema.natural().min(10000).max(900000).default(240000).description('旧版 Remote Agent 请求超时（毫秒）。'),
-    remoteAgentClockSkewSeconds: Schema.natural().min(10).max(600).default(90).description('旧版 HMAC 请求允许的时钟偏差（秒）。'),
-  }).description('Remote Agent v1 兼容').collapse(),
 ])
 
 interface FileElement {
@@ -622,9 +605,7 @@ export function apply(ctx: Context, config: Config) {
         transparentBackground: config.transparentBackground,
         gpuRendererCommand: config.gpuRendererCommand,
         renderEngine: config.renderEngine,
-        standaloneRendererJar: config.standaloneRendererJar,
         resourceFingerprint,
-        javaSupersampling: config.javaSupersampling,
         webglQuality: config.webglQuality,
         webglWidth: config.webglWidth,
         webglHeight: config.webglHeight,
@@ -684,8 +665,6 @@ export function apply(ctx: Context, config: Config) {
                 await renderWithStandalone(input, output, minecraftJarPath, config, logger)
                 await mergeRenderDiagnostics(output, diagnosticsPath, logger)
               }
-            } else if (config.renderEngine === 'remoteAgent') {
-              await renderWithRemoteAgent(bytes, output, filename, config)
             } else if (config.renderEngine === 'java' || config.renderEngine === 'gpuClient') {
               await renderWithJavaBridge(input, output, config)
             } else {
@@ -1254,7 +1233,7 @@ async function renderWithStandalone(input: string, output: string, minecraftJarP
                                     logger: ReturnType<Context['logger']>, mode: 'isometric' | 'six-face' = 'isometric') {
   const releaseRenderSlot = await acquireStandaloneRenderSlot()
   try {
-  const rendererJar = resolve(config.standaloneRendererJar || join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.2.8.jar'))
+  const rendererJar = resolve(join(__dirname, '../assets/standalone-renderer/litematic-standalone-renderer-0.2.8.jar'))
   if (!(await exists(rendererJar))) throw new Error(`独立 Java 渲染器不存在：${rendererJar}`)
   if (!(await exists(minecraftJarPath))) throw new Error(`Minecraft 资源 JAR 不存在：${minecraftJarPath}`)
   for (const pack of resourcePackPaths(config.resourcePackPaths)) {
@@ -1266,7 +1245,7 @@ async function renderWithStandalone(input: string, output: string, minecraftJarP
     '--input', resolve(input), '--output', resolve(output),
     '--minecraft-jar', minecraftJarPath,
     '--resolution', String(effectiveRenderResolution(config)),
-    '--supersampling', String(config.javaSupersampling),
+    '--supersampling', '1',
     '--rotation', String(config.isometricRotation),
     '--slant', String(config.isometricSlant),
     '--fill', String(config.isometricFill),
@@ -1281,7 +1260,7 @@ async function renderWithStandalone(input: string, output: string, minecraftJarP
   }
   if (config.transparentBackground) rendererArgs.push('--transparent-background')
   for (const pack of resourcePackPaths(config.resourcePackPaths)) rendererArgs.push('--resource-pack', resolve(pack))
-  const javaCommand = await resolveStandaloneJavaCommand(config.javaPath || config.standaloneJavaCommand || '')
+  const javaCommand = await resolveStandaloneJavaCommand(config.javaPath || '')
 
   for (let attempt = 0; attempt <= config.standaloneJavaMemoryRestartLimit; attempt++) {
     const heap = attempt === 0 ? config.standaloneJavaMaxHeapMb : config.standaloneJavaRetryMaxHeapMb
@@ -1457,7 +1436,7 @@ async function renderWithJavaBridge(input: string, output: string, config: Confi
     input: resolve(input),
     outputDirectory: resolve(output),
     resolution: effectiveRenderResolution(config),
-    supersampling: config.javaSupersampling,
+    supersampling: 1,
     rotation: config.isometricRotation,
     pitch: config.isometricSlant,
     slant: config.isometricSlant,
@@ -1481,7 +1460,7 @@ async function renderWithJavaBridge(input: string, output: string, config: Confi
 }
 
 export function createGpuRenderRequest(filename: string, config: Pick<Config,
-  'outputSize' | 'background' | 'transparentBackground' | 'javaSupersampling'
+  'outputSize' | 'background' | 'transparentBackground'
   | 'isometricRotation' | 'isometricSlant' | 'isometricFill'>,
   source?: { group?: string, user?: string }): GpuRenderRequest {
   const size = effectiveRenderResolution(config)
@@ -1496,7 +1475,7 @@ export function createGpuRenderRequest(filename: string, config: Pick<Config,
     height: size,
     background: config.background,
     transparentBackground: config.transparentBackground,
-    supersampling: config.javaSupersampling,
+    supersampling: 1,
   })
   return {
     version: 2,
@@ -1509,73 +1488,6 @@ export function createGpuRenderRequest(filename: string, config: Pick<Config,
     sourceGroup: source?.group,
     sourceUser: source?.user,
   }
-}
-
-export function createRemoteAgentSignature(secret: string, timestamp: string, nonce: string, body: Buffer) {
-  return createHmac('sha256', secret)
-    .update(timestamp).update('.').update(nonce).update('.').update(body).digest('hex')
-}
-
-async function renderWithRemoteAgent(bytes: Buffer, output: string, filename: string, config: Config) {
-  const endpoint = config.remoteAgentUrl.trim()
-  const secret = config.remoteAgentSecret.trim()
-  if (!endpoint) throw new Error('Remote GPU Agent URL 未配置')
-  if (!secret) throw new Error('Remote GPU Agent HMAC 密钥未配置')
-  let target: URL
-  try { target = new URL(endpoint) } catch { throw new Error(`Remote GPU Agent URL 无效：${endpoint}`) }
-  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Remote GPU Agent URL 必须使用 HTTP(S)')
-  const id = randomUUID()
-  const body = Buffer.from(JSON.stringify({
-    version: 1,
-    id,
-    filename: basename(filename),
-    litematicBase64: bytes.toString('base64'),
-    options: {
-      outputSize: effectiveRenderResolution(config),
-      background: config.background,
-      transparentBackground: config.transparentBackground,
-      supersampling: config.javaSupersampling,
-      rotation: config.isometricRotation,
-      slant: config.isometricSlant,
-      fill: config.isometricFill,
-      timeout: config.remoteAgentTimeout,
-    },
-  }))
-  const timestamp = String(Date.now())
-  const nonce = randomUUID()
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), config.remoteAgentTimeout)
-  let raw: Response
-  try {
-    raw = await fetch(target, {
-      method: 'POST', body, signal: controller.signal,
-      headers: {
-        'content-type': 'application/json',
-        'x-litematic-agent-timestamp': timestamp,
-        'x-litematic-agent-nonce': nonce,
-        'x-litematic-agent-signature': createRemoteAgentSignature(secret, timestamp, nonce, body),
-      },
-    })
-  } catch (error) {
-    throw new Error(`Remote GPU Agent 请求失败：${error instanceof Error ? error.message : String(error)}`)
-  } finally {
-    clearTimeout(timer)
-  }
-  if (!raw.ok) throw new Error(`Remote GPU Agent HTTP ${raw.status}: ${(await raw.text()).slice(0, 500)}`)
-  const response = await raw.json() as any
-  if (response?.version !== 1 || response.id !== id || !Array.isArray(response.images)) {
-    throw new Error('Remote GPU Agent 返回了无效响应')
-  }
-  const accepted = new Set(['isometric.png', 'isometric-reverse.png'])
-  const written = new Set<string>()
-  for (const image of response.images) {
-    if (!accepted.has(image?.title) || typeof image?.base64 !== 'string') continue
-    const png = Buffer.from(image.base64, 'base64')
-    if (png.length < 8 || !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) continue
-    await fs.writeFile(join(output, image.title), png)
-    written.add(image.title)
-  }
-  if (written.size !== accepted.size) throw new Error('Remote GPU Agent 返回的 PNG 不完整')
 }
 
 async function readJson<T>(path: string): Promise<T | undefined> {

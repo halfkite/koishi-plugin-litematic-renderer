@@ -107,7 +107,7 @@ test('parses packed Litematica block states and renders two opposite isometric P
     background: '#182026', transparentBackground: false, sendAsForward: true,
     renderTimeout: 1000, cacheDirectory: '.', gpuRendererCommand: '',
     renderEngine: 'cpu', javaBridgeDirectory: '.', javaRenderTimeout: 10000,
-    javaResolution: 256, javaSupersampling: 1, webglQuality: 'standard',
+    javaResolution: 256, webglQuality: 'standard',
     webglWidth: 256, webglHeight: 256, isometricSquare: true, isometricFill: 0.78,
     isometricRotation: 135, isometricSlant: 36,
   })
@@ -207,8 +207,9 @@ test('shows every effective config field and omits obsolete fields', () => {
   assert.equal(fields.maxBlocks, undefined)
   assert.equal(fields.javaPath.meta.role, 'path')
   assert.equal(fields.resourcePackPaths.meta.role, 'table')
-  assert.equal(fields.standaloneJavaCommand.meta.hidden, true)
-  assert.equal(fields.javaSupersampling.meta.default, 1)
+  assert.equal(fields.standaloneJavaCommand, undefined)
+  assert.equal(fields.javaSupersampling, undefined)
+  assert.equal(fields.remoteAgentUrl, undefined)
   assert.ok(fields.javaBridgeDirectory)
   assert.ok(fields.gpuClientGameDirectory)
   assert.ok(fields.gpuRendererCommand)
@@ -218,7 +219,9 @@ test('shows every effective config field and omits obsolete fields', () => {
     assert.equal(RendererConfig.list[index].meta.collapse, true, `${RendererConfig.list[index].meta.description} should be collapsed`)
   }
   for (const [name, schema] of Object.entries(fields)) {
-    if (['standaloneJavaCommand', 'javaResolution', 'webglWidth', 'webglHeight'].includes(name)) continue
+    if (['javaResolution', 'webglWidth', 'webglHeight', 'officialProxyMode', 'officialProxyUrl',
+      'sshProxyExecutable', 'sshProxyHost', 'sshProxyPort', 'sshProxyUser', 'sshProxyPrivateKey',
+      'sshProxyPassword', 'sshProxyLocalPort'].includes(name)) continue
     assert.notEqual(schema.meta.hidden, true, `${name} should be visible`)
   }
 })
