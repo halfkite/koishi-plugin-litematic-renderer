@@ -8,6 +8,11 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.worldselection.WorldOpenFlows;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.gamerules.GameRules;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
 import org.slf4j.Logger;
@@ -43,6 +48,9 @@ public final class GpuRuntimeClient implements ClientModInitializer {
     private ActiveJob active;
     private boolean openingWorld;
     private boolean windowHidden;
+    private boolean clientDefaultsApplied;
+    private boolean worldDefaultsScheduled;
+    private volatile boolean worldDefaultsApplied;
     private int scanCooldown;
     private int statusCooldown;
     private String gpu = "unknown";
@@ -54,12 +62,15 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             installRenderWorld();
         } catch (IOException error) { throw new IllegalStateException("Unable to initialize GPU render queue", error); }
         ClientTickEvents.END_CLIENT_TICK.register(this::tick);
-        LOGGER.info("Litematic GPU runtime queue: {}", root);
+        LOGGER.info("Litematic GPU runtime queue: {}, night vision={}, brightness level={}",
+                root, QuickLitematicaPreview3D.nightVisionEnabled(), QuickLitematicaPreview3D.nightVisionLevel());
     }
 
     private void tick(Minecraft client) {
         try {
             hideWindow(client);
+            applyClientDefaults(client);
+            applyWorldDefaults(client);
             if (--statusCooldown <= 0) { statusCooldown = 20; writeStatus(client); }
             if (active != null) { advanceActive(); return; }
             if (--scanCooldown > 0) return;
@@ -69,6 +80,34 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             if (client.level == null) { openRenderWorld(client); return; }
             startJob(queued);
         } catch (Throwable error) { failActive(error); }
+    }
+
+    private void applyClientDefaults(Minecraft client) {
+        if (clientDefaultsApplied) return;
+        client.options.getSoundSourceOptionInstance(SoundSource.MASTER).set(0.0D);
+        clientDefaultsApplied = true;
+        LOGGER.info("Runtime defaults applied: master volume 0");
+    }
+
+    private void applyWorldDefaults(Minecraft client) {
+        if (client.level == null) {
+            worldDefaultsScheduled = false;
+            worldDefaultsApplied = false;
+            return;
+        }
+        if (client.gameMode != null) client.gameMode.setLocalMode(GameType.SPECTATOR);
+        if (worldDefaultsScheduled || client.player == null) return;
+        MinecraftServer server = client.getSingleplayerServer();
+        if (server == null) return;
+        worldDefaultsScheduled = true;
+        java.util.UUID playerId = client.player.getUUID();
+        server.execute(() -> {
+            server.getGameRules().set(GameRules.SPECTATORS_GENERATE_CHUNKS, false, server);
+            ServerPlayer player = server.getPlayerList().getPlayer(playerId);
+            if (player != null) player.setGameMode(GameType.SPECTATOR);
+            worldDefaultsApplied = true;
+            LOGGER.info("Render world defaults applied: world={}, spectator=true, spectatorsGenerateChunks=false", RENDER_WORLD);
+        });
     }
 
     private void hideWindow(Minecraft client) {
@@ -114,7 +153,8 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             job.exporting = true;
             event("progress", job.request.id, (double) job.viewIndex / job.request.views.size(), "rendering-" + view.id);
             job.preview.export(raw, captureWidth, captureHeight, background(view), view.yaw, view.pitch,
-                    value(view.zoom, 1.0), error -> finishView(job, view, raw, error));
+                    value(view.zoom, 1.0), Boolean.TRUE.equals(view.autoFill), effectiveBrightness(view),
+                    error -> finishView(job, view, raw, error));
         } catch (Throwable error) { failActive(error); }
     }
 
@@ -208,7 +248,9 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             String stage = active == null ? "idle" : active.exporting ? "rendering" : "building";
             writeAtomic(root.resolve("status.json"), GSON.toJson(new RenderStatus(System.currentTimeMillis(),
                     active == null, active != null, client.level != null,
-                    "0.1.0", "26.2", gpu, maxTextureSize, fingerprint, progress, stage)));
+                    "0.1.0", "26.2", gpu, maxTextureSize, fingerprint, progress, stage,
+                    clientDefaultsApplied, worldDefaultsApplied, worldDefaultsApplied, RENDER_WORLD,
+                    QuickLitematicaPreview3D.nightVisionEnabled(), QuickLitematicaPreview3D.nightVisionLevel())));
         } catch (IOException error) { LOGGER.warn("Unable to write GPU runtime status", error); }
     }
 
@@ -220,18 +262,29 @@ public final class GpuRuntimeClient implements ClientModInitializer {
     private void cleanup(ActiveJob job) { job.preview.close(); try { Files.deleteIfExists(job.jobFile); } catch (IOException ignored) {} }
     private static int background(View view) { if (view.transparentBackground) return 0; try { return 0xFF000000 | Integer.parseInt(view.background.replace("#", ""),16); } catch(Exception ignored){return 0xFF000000;} }
     private static double value(Double value, double fallback) { return value == null ? fallback : value; }
+    private static double effectiveBrightness(View view) {
+        if (view.brightness != null) return clampBrightness(view.brightness);
+        // 老版本任务没有亮度字段，保留底视图的默认补光行为。
+        return view.pitch <= -80.0 ? 1.50 : 1.0;
+    }
+    private static double clampBrightness(double value) {
+        return Math.max(0.25, Math.min(3.0, Double.isFinite(value) ? value : 1.0));
+    }
     private static void resize(Path source, Path target, int width, int height) throws IOException { BufferedImage input=ImageIO.read(source.toFile());BufferedImage output=new BufferedImage(width,height,BufferedImage.TYPE_INT_ARGB);Graphics2D g=output.createGraphics();try{g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,RenderingHints.VALUE_INTERPOLATION_BICUBIC);g.drawImage(input,0,0,width,height,null);}finally{g.dispose();}ImageIO.write(output,"PNG",target.toFile()); }
     private static void event(String type, String id, double progress, String stage) { System.out.println("GPU_AGENT_JSON:" + GSON.toJson(new RuntimeEvent(type,id,progress,stage))); }
 
     private record RenderJob(String id, String input, String outputDirectory, List<View> views) {}
     private record View(String id, String name, double yaw, double pitch, Double zoom, Boolean autoFill,
-                        int width, int height, String background, boolean transparentBackground, int supersampling) {}
+                        int width, int height, String background, boolean transparentBackground, int supersampling,
+                        Double brightness) {}
     private record ResultImage(String id, String name, int width, int height, String path) {}
     private record RenderResult(String id, boolean success, String errorCode, String error, long elapsedMillis,
                                 boolean cacheHit, String gpu, List<ResultImage> images) {}
     private record RenderStatus(long timestamp, boolean ready, boolean busy, boolean inWorld, String rendererVersion,
                                 String minecraftVersion, String gpu, int maxTextureSize, String resourcePackFingerprint,
-                                double progress, String stage) {}
+                                double progress, String stage, boolean silent, boolean spectator,
+                                 boolean spectatorsGenerateChunksDisabled, String renderWorld,
+                                 boolean nightVisionEnabled, int nightVisionLevel) {}
     private record RuntimeEvent(String type, String id, double progress, String stage) {}
     private static final class ActiveJob { final RenderJob request;final Path jobFile;final Path output;final QuickLitematicaPreview3D.HeadlessPreview preview;final long startedAt;final List<ResultImage> images=new ArrayList<>();final java.util.Set<String> retriedViews=new java.util.HashSet<>();volatile Throwable error;boolean exporting;int viewIndex;ActiveJob(RenderJob r,Path j,Path o,QuickLitematicaPreview3D.HeadlessPreview p,long s){request=r;jobFile=j;output=o;preview=p;startedAt=s;} }
     private static final class RenderException extends Exception { final String code;RenderException(String code,String message){super(message);this.code=code;} }

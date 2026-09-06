@@ -28,6 +28,8 @@ export interface GpuRenderRequest {
   resourcePackProfile?: string
   sourceGroup?: string
   sourceUser?: string
+  pluginVersion?: string
+  renderConfigSha256?: string
 }
 
 export interface GpuAgentNodeConfig {
@@ -42,6 +44,11 @@ export interface GpuAgentCapabilities {
   gpu?: string
   maxTextureSize?: number
   resourcePackFingerprint?: string
+  nightVisionEnabled?: boolean
+  nightVisionLevel?: number
+  lightingProfile?: string
+  localViewsFingerprint?: string
+  cloudMergeLayout?: string
 }
 
 export interface GpuRenderImage {
@@ -58,6 +65,7 @@ export interface GpuRenderResult {
   elapsedMillis?: number
   cacheHit?: boolean
   gpu?: string
+  rendererVersion?: string
 }
 
 interface BinaryHeader {
@@ -181,7 +189,10 @@ export class GpuAgentHub extends EventEmitter {
     return [...this.states.values()]
       .filter(state => state.authenticated)
       .map(state => [state.agentId, state.capabilities.rendererVersion ?? '',
-        state.capabilities.minecraftVersion ?? '', state.capabilities.resourcePackFingerprint ?? ''].join(':'))
+        state.capabilities.minecraftVersion ?? '', state.capabilities.resourcePackFingerprint ?? '',
+        state.capabilities.nightVisionEnabled === true ? '1' : '0',
+        String(state.capabilities.nightVisionLevel ?? ''), state.capabilities.lightingProfile ?? '', state.capabilities.localViewsFingerprint ?? '',
+        state.capabilities.cloudMergeLayout ?? 'horizontal'].join(':'))
       .sort().join('|') || 'offline'
   }
 
@@ -266,7 +277,8 @@ export class GpuAgentHub extends EventEmitter {
       else {
         this.options.logger.info(`GPU Agent ${state.agentId} 回传结果：任务 ${message.taskId}，${pending.images.length} 张图`)
         pending.resolve({ agentId: state.agentId, images: pending.images, elapsedMillis: message.elapsedMillis,
-          cacheHit: message.cacheHit, gpu: state.capabilities.gpu })
+          cacheHit: message.cacheHit, gpu: state.capabilities.gpu,
+          rendererVersion: state.capabilities.rendererVersion })
       }
     }
   }

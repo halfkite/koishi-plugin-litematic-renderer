@@ -19,7 +19,7 @@ declare module '@koishijs/console' {
 
 export const name = 'litematic-renderer'
 export const inject = { optional: ['puppeteer', 'server', 'console'] }
-const CACHE_FORMAT_VERSION = 16
+const CACHE_FORMAT_VERSION = 17
 const RESOURCE_PACK_UPLOAD_LIMIT = 256 * 1024 * 1024
 const packageVersion = (require('../package.json') as { version?: unknown }).version
 const PLUGIN_VERSION = typeof packageVersion === 'string' ? packageVersion : 'unknown'
@@ -51,6 +51,13 @@ export interface Config {
   allowPrivateRender: boolean
   sendAsForward: boolean
   showViewTitles: boolean
+  showMetadataProjectionName: boolean
+  showMetadataAuthor: boolean
+  showMetadataCreatedAt: boolean
+  showMetadataBlockStats: boolean
+  showMetadataSize: boolean
+  showMetadataLitematicVersion: boolean
+  showMetadataGameVersion: boolean
   replyAndMention: boolean
   sixFaceOverview: boolean
   sixFaceLayout: SixFaceLayout
@@ -143,6 +150,13 @@ export const Config: Schema<Config> = Schema.intersect([
     groupBlacklistEnabled: Schema.boolean().default(false).description('启用群黑名单：开启后黑名单内的群始终不渲染，优先级高于白名单。'),
     groupBlacklist: Schema.array(Schema.string()).default([]).description('群黑名单（需开启上面的开关）。'),
     showViewTitles: Schema.boolean().default(false).description('仅自建 QQ：发送图片时显示视图标题。'),
+    showMetadataProjectionName: Schema.boolean().default(true).description('投影信息：显示投影名称。'),
+    showMetadataAuthor: Schema.boolean().default(true).description('投影信息：显示保存者游戏 ID。'),
+    showMetadataCreatedAt: Schema.boolean().default(true).description('投影信息：显示创建时间。'),
+    showMetadataBlockStats: Schema.boolean().default(true).description('投影信息：显示方块数/体积。'),
+    showMetadataSize: Schema.boolean().default(true).description('投影信息：显示尺寸。'),
+    showMetadataLitematicVersion: Schema.boolean().default(true).description('投影信息：显示 Litematic 版本。'),
+    showMetadataGameVersion: Schema.boolean().default(true).description('投影信息：显示游戏版本和数据版本。'),
     replyAndMention: Schema.boolean().default(false).description('自建 QQ 会引用并 @ 发送者；官方 QQ 仅引用，避免显示 OpenID。'),
     sixFaceOverview: Schema.boolean().default(true).description('合并转发时生成并附加上、下、东、南、西、北六面正交合成图。'),
     sixFaceLayout: Schema.union([
@@ -161,8 +175,8 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('独立渲染器').collapse(),
   Schema.object({
     renderTimeout: Schema.natural().min(1000).default(30000).description('文件下载超时（毫秒）。'),
-    cacheDirectory: Schema.string().default('data/litematic-renderer-cache').description('持久缓存目录；按插件版本和投影 SHA-256 分区。'),
-    cacheMaxSizeGb: Schema.number().min(1).max(1024).step(1).default(20).description('所有版本缓存总上限（GiB），超出后按最久未使用清理。'),
+    cacheDirectory: Schema.string().default('data/litematic-renderer-cache').description('持久缓存目录；按投影 SHA-256 分区，方便 Koishi 与本地 Agent 共用。'),
+    cacheMaxSizeGb: Schema.number().min(1).max(1024).step(1).default(20).description('统一缓存总上限（GiB），超出后按最久未使用清理。'),
     diagnosticsFilePath: Schema.string().default('data/litematic-renderer-diagnostics.json').description('渲染诊断持久化文件路径；导出地址固定为 /litematic-renderer/diagnostics。'),
   }).description('缓存与诊断').collapse(),
   Schema.object({
@@ -554,10 +568,9 @@ export function apply(ctx: Context, config: Config) {
   const diagnosticsDisabledDirectory = join(dirname(diagnosticsPath), 'litematic-renderer-diagnostics-disabled')
   void rotateDiagnosticsFile(diagnosticsPath, diagnosticsArchiveDirectory, logger)
   const cacheDirectory = resolve(stringOrDefault(config.cacheDirectory, 'data/litematic-renderer-cache'))
-  const versionCacheDirectory = join(cacheDirectory, `v${cachePathSegment(PLUGIN_VERSION)}`)
   const cacheMaxBytes = Math.floor(config.cacheMaxSizeGb * 1024 ** 3)
   const inFlight = new Map<string, Promise<void>>()
-  void fs.mkdir(versionCacheDirectory, { recursive: true })
+  void fs.mkdir(cacheDirectory, { recursive: true })
     .then(() => enforceCacheLimit(cacheDirectory, cacheMaxBytes))
     .catch(error => logger.warn(`缓存初始化失败：${error instanceof Error ? error.message : String(error)}`))
 
@@ -566,7 +579,15 @@ export function apply(ctx: Context, config: Config) {
     const renderSource = source
     const bytes = preparedBytes ?? await download(ctx, url, limitBytes ?? maxFileSizeBytes, config.renderTimeout)
     const parsedMetadata = parseLitematicMetadata(bytes)
-    const metadata = formatLitematicMetadata(parsedMetadata, filename)
+    const metadata = formatLitematicMetadata(parsedMetadata, filename, {
+      showProjectionName: config.showMetadataProjectionName,
+      showAuthor: config.showMetadataAuthor,
+      showCreatedAt: config.showMetadataCreatedAt,
+      showBlockStats: config.showMetadataBlockStats,
+      showSize: config.showMetadataSize,
+      showLitematicVersion: config.showMetadataLitematicVersion,
+      showGameVersion: config.showMetadataGameVersion,
+    })
     const projectionName = projectionNameFromFilename(filename)
     const fileHash = createHash('sha256').update(bytes).digest('hex')
     const needsStandaloneResources = config.renderEngine === 'standalone'
@@ -587,37 +608,37 @@ export function apply(ctx: Context, config: Config) {
         isometricFill: config.isometricFill,
         isometricRotation: config.isometricRotation,
         isometricSlant: config.isometricSlant,
+        sixFaceOverview: config.sixFaceOverview,
         sixFaceLayout: config.sixFaceLayout,
         gpuAgentFingerprint: config.renderEngine === 'gpuAgent' ? gpuAgentHub?.capabilityFingerprint() ?? 'disabled' : undefined,
       })
-    const cacheProjectionName = cacheNameSegment(filename)
-    const output = join(versionCacheDirectory, `${cacheProjectionName}-${fileHash}-${renderHash}`)
-    const input = join(output, 'projection.litematic')
+    const output = join(cacheDirectory, fileHash)
+    const aboutPath = join(output, 'about.json5')
+    const storedFilename = await cachedProjectionFilename(output, filename)
+    const input = join(output, storedFilename)
     await fs.mkdir(output, { recursive: true })
     if (!(await exists(input))) await fs.writeFile(input, bytes)
-    await ensureCacheMetadata(output, {
-      pluginVersion: PLUGIN_VERSION,
-      cacheFormatVersion: CACHE_FORMAT_VERSION,
-      contentSha256: fileHash,
-      renderConfigSha256: renderHash,
-      sourceFilename: basename(filename),
-      createdAt: new Date().toISOString(),
-    })
     const expected = ['isometric.png', 'isometric-reverse.png'].map(file => join(output, file))
-    const mergedExpected = join(output, 'isometric.png')
-    if (!(await Promise.all(expected.map(exists))).every(Boolean) && !(await exists(mergedExpected))) {
+    const about = await readJson<any>(aboutPath)
+    const metadataMatches = about && (about['配置指纹'] === renderHash || about.renderConfigSha256 === renderHash)
+    let effectiveToolVersion = config.renderEngine === 'standalone' ? '0.2.8' : '0'
+    if (metadataMatches && typeof about['有效工具版本'] === 'string') effectiveToolVersion = about['有效工具版本']
+    if (!(metadataMatches && (await exists(expected[0])) && ((await exists(expected[1])) || true))) {
       let task = inFlight.get(output)
       if (!task) {
         task = (async () => {
           try {
-          if ((await Promise.all(expected.map(exists))).every(Boolean)) return
+           const current = await readJson<any>(aboutPath)
+           const currentMatches = current && (current['配置指纹'] === renderHash || current.renderConfigSha256 === renderHash)
+           if (currentMatches && await exists(expected[0]) && (await exists(expected[1]) || true)) return
           if (config.renderEngine === 'standalone') {
             await renderWithStandalone(input, output, minecraftJarPath, config, logger)
             await mergeRenderDiagnostics(output, diagnosticsPath, logger)
           } else {
             try {
               if (!gpuAgentHub) throw new Error('GPU Agent v2 服务未启用')
-              const result = await enqueueGpuAgentRender(() => gpuAgentHub.render(createGpuRenderRequest(filename, config, renderSource), bytes, config.gpuAgentTimeout))
+               const result = await enqueueGpuAgentRender(() => gpuAgentHub.render(createGpuRenderRequest(filename, config, renderSource, renderHash), bytes, config.gpuAgentTimeout))
+               effectiveToolVersion = result.rendererVersion ?? effectiveToolVersion
               for (const image of result.images) {
                 if (image.id === 'merged' || image.name === 'merged.png') {
                   // Agent 已把正反两图拼为一张：直接作为唯一结果
@@ -634,11 +655,12 @@ export function apply(ctx: Context, config: Config) {
               if (!config.gpuAgentFallback) throw error
               logger.warn(`GPU Agent 渲染失败，回退独立 Java：${error instanceof Error ? error.message : String(error)}`)
               await renderWithStandalone(input, output, minecraftJarPath, config, logger)
+              effectiveToolVersion = '0.2.8'
               await mergeRenderDiagnostics(output, diagnosticsPath, logger)
             }
           }
-          // Agent 合并模式下只生成一张拼接图（isometric.png），此时不要求两张
-          if (!(await Promise.all(expected.map(exists))).every(Boolean) && !(await exists(mergedExpected))) throw new Error('渲染器没有生成两张正二轴测 PNG')
+           // Agent 合并模式可以只回传一张拼接图；统一缓存仍固定使用 isometric.png。
+           if (!(await exists(expected[0]))) throw new Error('渲染器没有生成正二轴测 PNG')
           } catch (error) {
             await appendRenderError(output, diagnosticsPath, config.renderEngine, error, logger)
             throw error
@@ -688,6 +710,23 @@ export function apply(ctx: Context, config: Config) {
       }
       if (await exists(sixFacePath)) images.push({ title: '六面正投影', path: sixFacePath })
     }
+    await writeUnifiedCacheMetadata(output, {
+      缓存格式版本: CACHE_FORMAT_VERSION,
+      文件哈希: fileHash,
+      投影文件名: basename(filename || 'schematic.litematic'),
+      存储投影文件名: storedFilename,
+      云端插件版本: PLUGIN_VERSION,
+      本地工具版本: config.renderEngine === 'gpuAgent' ? effectiveToolVersion : '0',
+      有效工具版本: effectiveToolVersion,
+      有效工具: config.renderEngine,
+      配置指纹: renderHash,
+      renderConfigSha256: renderHash,
+      视角: createGpuRenderRequest(filename, config, renderSource, renderHash).views,
+      图片: await cacheImageMetadata(output),
+      材质包指纹: resourceFingerprint,
+      更新时间: new Date().toISOString(),
+      投影大小: bytes.length,
+    })
     await touchCacheEntry(output)
     await enforceCacheLimit(cacheDirectory, cacheMaxBytes, output)
     return {
@@ -762,7 +801,7 @@ export function apply(ctx: Context, config: Config) {
   ctx.command('litematic.cache.clear', '清理投影渲染缓存', { authority: 3 })
     .action(async () => {
       await fs.rm(cacheDirectory, { recursive: true, force: true })
-      await fs.mkdir(versionCacheDirectory, { recursive: true })
+      await fs.mkdir(cacheDirectory, { recursive: true })
       return '投影渲染缓存已清理。'
     })
   ctx.command('litematic.errors.export', 'export render diagnostics', { authority: 3 })
@@ -819,12 +858,7 @@ export async function saveUploadedResourcePack(filename: unknown, base64: unknow
 }
 
 interface CacheMetadata {
-  pluginVersion: string
-  cacheFormatVersion: number
-  contentSha256: string
-  renderConfigSha256: string
-  sourceFilename: string
-  createdAt: string
+  [key: string]: unknown
 }
 
 export function hashRenderConfiguration(configuration: unknown) {
@@ -920,10 +954,52 @@ function projectionNameFromFilename(filename: string) {
   return basename(filename || 'schematic.litematic').replace(/\.litematic$/i, '').trim() || 'schematic'
 }
 
-async function ensureCacheMetadata(directory: string, metadata: CacheMetadata) {
-  const path = join(directory, 'cache.json')
-  if (await exists(path)) return
-  await fs.writeFile(path, JSON.stringify(metadata, null, 2) + '\n')
+async function cachedProjectionFilename(directory: string, requested: string) {
+  const about = await readJson<any>(join(directory, 'about.json5'))
+  if (typeof about?.存储投影文件名 === 'string' && about.存储投影文件名) return about.存储投影文件名
+  const raw = basename(requested || 'schematic.litematic')
+  const safe = raw.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '').trim()
+  const result = safe || 'schematic.litematic'
+  return result.toLowerCase().endsWith('.litematic') ? result : `${result}.litematic`
+}
+
+async function writeUnifiedCacheMetadata(directory: string, metadata: CacheMetadata) {
+  const aboutPath = join(directory, 'about.json5')
+  await writeJsonAtomic(aboutPath, metadata)
+  const hash = typeof metadata.文件哈希 === 'string' ? metadata.文件哈希 : basename(directory)
+  const indexPath = join(dirname(directory), 'index.json5')
+  const existing = await readJson<any>(indexPath)
+  const entries: any[] = Array.isArray(existing) ? existing : []
+  const filename = typeof metadata.存储投影文件名 === 'string' && metadata.存储投影文件名
+    ? metadata.存储投影文件名
+    : typeof metadata.投影文件名 === 'string' ? metadata.投影文件名 : 'schematic.litematic'
+  const next = entries.filter(entry => entry && typeof entry === 'object' && entry.哈希值 !== hash)
+  next.push({ 投影文件名称: filename, 哈希值: hash, 相对路径: hash })
+  await writeJsonAtomic(indexPath, next)
+}
+
+async function cacheImageMetadata(directory: string) {
+  const names = ['isometric.png', 'isometric-reverse.png', 'six-faces.png']
+  const output: any[] = []
+  for (const name of names) {
+    const path = join(directory, name)
+    try {
+      const bytes = await fs.readFile(path)
+      const png = PNG.sync.read(bytes)
+      output.push({ 文件名: name, 宽: png.width, 高: png.height, 大小: bytes.length,
+        'SHA-256': createHash('sha256').update(bytes).digest('hex') })
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+  }
+  return output
+}
+
+async function writeJsonAtomic(path: string, value: unknown) {
+  await fs.mkdir(dirname(path), { recursive: true })
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
+  await fs.writeFile(temporary, JSON.stringify(value, null, 2) + '\n')
+  await fs.rename(temporary, path)
 }
 
 async function touchCacheEntry(directory: string) {
@@ -947,17 +1023,23 @@ async function directorySize(directory: string): Promise<number> {
 
 export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number, protectedDirectory?: string) {
   const entries: Array<{ path: string, size: number, lastUsed: number }> = []
-  const versions = await fs.readdir(cacheDirectory, { withFileTypes: true }).catch((error: any) => {
+  const cachedEntries = await fs.readdir(cacheDirectory, { withFileTypes: true }).catch((error: any) => {
     if (error?.code === 'ENOENT') return []
     throw error
   })
-  for (const version of versions) {
-    if (!version.isDirectory()) continue
-    const versionPath = join(cacheDirectory, version.name)
-    const cached = await fs.readdir(versionPath, { withFileTypes: true })
-    for (const item of cached) {
-      if (!item.isDirectory()) continue
-      const path = join(versionPath, item.name)
+  for (const item of cachedEntries) {
+    if (!item.isDirectory()) continue
+    const directPath = join(cacheDirectory, item.name)
+    if (/^[0-9a-f]{64}$/i.test(item.name)) {
+      const [size, stat] = await Promise.all([directorySize(directPath), fs.stat(directPath)])
+      entries.push({ path: directPath, size, lastUsed: stat.mtimeMs })
+      continue
+    }
+    // 旧版 v<plugin> / <agent-version> 缓存不参与查询，但仍纳入容量清理。
+    const legacyEntries = await fs.readdir(directPath, { withFileTypes: true }).catch(() => [])
+    for (const legacy of legacyEntries) {
+      if (!legacy.isDirectory()) continue
+      const path = join(directPath, legacy.name)
       const [size, stat] = await Promise.all([directorySize(path), fs.stat(path)])
       entries.push({ path, size, lastUsed: stat.mtimeMs })
     }
@@ -1337,7 +1419,7 @@ async function fileSha256(path: string) {
 export function createGpuRenderRequest(filename: string, config: Pick<Config,
   'outputSize' | 'background' | 'transparentBackground'
   | 'isometricRotation' | 'isometricSlant' | 'isometricFill'>,
-  source?: { group?: string, user?: string }): GpuRenderRequest {
+  source?: { group?: string, user?: string }, renderConfigSha256?: string): GpuRenderRequest {
   const size = effectiveRenderResolution(config)
   const view = (id: string, name: string, yaw: number): RenderView => ({
     id,
@@ -1362,6 +1444,8 @@ export function createGpuRenderRequest(filename: string, config: Pick<Config,
     ],
     sourceGroup: source?.group,
     sourceUser: source?.user,
+    pluginVersion: PLUGIN_VERSION,
+    renderConfigSha256,
   }
 }
 
@@ -1522,9 +1606,11 @@ export async function sendImages(session: Session, images: ImageResult[], metada
   const messages = images.map(({ title, path }) => h('message', { userId: session.selfId, nickname: '投影渲染' }, [
     ...(options.showViewTitles ? [h('text', { content: title })] : []), h.image(path),
   ]))
-  const metadataMessage = h('message', { userId: session.selfId, nickname: '投影信息' }, [h('text', { content: metadata })])
+  const metadataMessage = metadata
+    ? h('message', { userId: session.selfId, nickname: '投影信息' }, [h('text', { content: metadata })])
+    : undefined
   const reply = options.replyAndMention ? replyElements(session, options.qqBotType) : []
-  // 「结果如上」仅自建 QQ 开启合并转发时提示准确；官方 QQ 不发成功文案，只发图和投影信息
+  // 「结果如上」仅自建 QQ 开启合并转发时提示准确；官方 QQ 发送合成图片和元数据
   const successMessage = options.qqBotType === 'selfHosted' && options.sendMode === 'forward'
     ? `${projectionName} 已渲染成功，结果如上`
     : `${projectionName} 已渲染成功`
@@ -1533,13 +1619,13 @@ export async function sendImages(session: Session, images: ImageResult[], metada
     const message = [
       ...(options.replyAndMention && session.messageId ? [h('quote', { id: session.messageId })] : []),
       h.image(pathToFileURL(overviewPath).href),
-      ...(metadata ? [h('text', { content: metadata })] : []),
+      ...(metadata ? [h('text', { content: `\n${metadata}` })] : []),
     ]
     await session.send(message)
     return
   }
   if (options.sendMode === 'forward') {
-    await session.send(h('figure', {}, [...messages, metadataMessage]))
+    await session.send(h('figure', {}, [...messages, ...(metadataMessage ? [metadataMessage] : [])]))
     await session.send(options.replyAndMention
       ? [...reply, h('text', { content: successMessage })]
       : successMessage)
@@ -1549,7 +1635,8 @@ export async function sendImages(session: Session, images: ImageResult[], metada
     ...(options.showViewTitles ? [h('text', { content: `${index ? '\n' : ''}${title}\n` })] : []),
     h.image(path),
   ])
-  await session.send([...reply, ...combined, h('text', { content: `\n${metadata}\n${successMessage}` })])
+  const footer = metadata ? `\n${metadata}\n${successMessage}` : `\n${successMessage}`
+  await session.send([...reply, ...combined, h('text', { content: footer })])
 }
 
 export async function composeQqOverview(images: ImageResult[]) {
@@ -1749,7 +1836,17 @@ export function parseLitematicMetadata(data: Buffer): LitematicMetadata {
   }
 }
 
-export function formatLitematicMetadata(metadata: LitematicMetadata, filename?: string) {
+export interface MetadataDisplayOptions {
+  showProjectionName?: boolean
+  showAuthor?: boolean
+  showCreatedAt?: boolean
+  showBlockStats?: boolean
+  showSize?: boolean
+  showLitematicVersion?: boolean
+  showGameVersion?: boolean
+}
+
+export function formatLitematicMetadata(metadata: LitematicMetadata, filename?: string, options: MetadataDisplayOptions = {}) {
   const blocks = metadata.totalBlocks == null ? '未知' : String(metadata.totalBlocks)
   const volume = metadata.totalVolume == null ? '未知' : String(metadata.totalVolume)
   const size = metadata.size?.join(' × ') ?? '未知'
@@ -1760,13 +1857,13 @@ export function formatLitematicMetadata(metadata: LitematicMetadata, filename?: 
     ? projectionNameFromFilename(filename)
     : ''
   return [
-    ...(projectionName ? [`投影名称：${projectionName}`] : []),
-    `保存者游戏 ID：${metadata.author}`,
-    `创建时间：${metadata.createdAt}`,
-    `方块数/体积：${blocks}/${volume}`,
-    `尺寸：${size}`,
-    `Litematic 版本：${litematicVersion}`,
-    `游戏版本：${gameVersion}${dataVersion}`,
+    ...(options.showProjectionName !== false && projectionName ? [`投影名称：${projectionName}`] : []),
+    ...(options.showAuthor !== false ? [`保存者游戏 ID：${metadata.author}`] : []),
+    ...(options.showCreatedAt !== false ? [`创建时间：${metadata.createdAt}`] : []),
+    ...(options.showBlockStats !== false ? [`方块数/体积：${blocks}/${volume}`] : []),
+    ...(options.showSize !== false ? [`尺寸：${size}`] : []),
+    ...(options.showLitematicVersion !== false ? [`Litematic 版本：${litematicVersion}`] : []),
+    ...(options.showGameVersion !== false ? [`游戏版本：${gameVersion}${dataVersion}`] : []),
   ].join('\n')
 }
 

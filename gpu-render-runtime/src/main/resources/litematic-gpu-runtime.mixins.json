@@ -4,7 +4,9 @@
   "compatibilityLevel": "JAVA_25",
   "client": [
     "LitematicaFeatureRenderDispatcherAccessor",
-    "LitematicaStagedVertexBufferAccessor"
+    "LitematicaStagedVertexBufferAccessor",
+    "RenderSetupAccessor",
+    "RenderTypePreviewMixin"
   ],
   "injectors": { "defaultRequire": 1 }
 }

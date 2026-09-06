@@ -13,11 +13,14 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.HexFormat;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 import java.util.zip.ZipInputStream;
@@ -25,6 +28,12 @@ import java.util.zip.ZipInputStream;
 final class RuntimeInstaller {
     static final String MINECRAFT_VERSION = "26.2";
     static final String FABRIC_LOADER_VERSION = "0.19.3";
+    /**
+     * Bump this whenever the Fabric launch/class-loader setup changes. Fabric's
+     * processed nested-mod output is not compatible across those changes even
+     * when the bundled renderer JAR itself has the same SHA-256.
+     */
+    private static final String FABRIC_CACHE_FORMAT = "fabric-cache-v2";
     private static final String VERSION_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     private static final String FABRIC_PROFILE = "https://meta.fabricmc.net/v2/versions/loader/%s/%s/profile/json";
 
@@ -71,8 +80,9 @@ final class RuntimeInstaller {
         installLibraries(fabric.getAsJsonArray("libraries"), classpath, natives);
         classpath.add(clientJar);
         for (int index = 0; index < classpath.size(); index++) {
-            classpath.set(index, classpath.get(index).toRealPath());
+            classpath.set(index, normalizeClasspathEntry(classpath.get(index)));
         }
+        orderClasspathForLaunch(classpath);
 
         List<String> gameArguments = resolveGameArguments(version);
         List<String> fabricJvmArguments = resolveArguments(fabric.getAsJsonObject("arguments"), "jvm");
@@ -80,16 +90,71 @@ final class RuntimeInstaller {
         return new LaunchSpec(fabric.get("mainClass").getAsString(), classpath, natives, fabricJvmArguments, gameArguments, assetId);
     }
 
+    static Path normalizeClasspathEntry(Path path) {
+        // Keep the logical runtime root: resolving junctions can mix libraries from
+        // different installations and split Fabric/Mixin across class loaders.
+        return path.toAbsolutePath().normalize();
+    }
+
+    static void orderClasspathForLaunch(List<Path> classpath) {
+        // Fabric's launcher and Mixin must be resolved from one deterministic
+        // application class path. The metadata order can put sponge-mixin before
+        // fabric-loader, which makes companion mixin plugins load in Knot while
+        // IMixinConfigPlugin comes from the app loader.
+        classpath.sort(Comparator.comparing(path -> path.toString().toLowerCase(java.util.Locale.ROOT)));
+    }
+
     private void installBundledMods() throws IOException {
-        copyResource("/renderer/litematic-gpu-runtime.jar",
-                gameDirectory.resolve("mods/litematic-gpu-runtime.jar"));
+        Path target = gameDirectory.resolve("mods/litematic-gpu-runtime.jar");
+        copyResource("/renderer/litematic-gpu-runtime.jar", target);
+        ensureFabricCacheCurrent(gameDirectory, target, log);
     }
 
     /** 为并行渲染的额外客户端槽位准备 mods 目录（其余运行时文件都在共享的 runtime 根目录）。 */
     void copyBundledMods(Path targetGameDirectory) throws IOException {
         Files.createDirectories(targetGameDirectory.resolve("mods"));
-        copyResource("/renderer/litematic-gpu-runtime.jar",
-                targetGameDirectory.resolve("mods/litematic-gpu-runtime.jar"));
+        Path target = targetGameDirectory.resolve("mods/litematic-gpu-runtime.jar");
+        copyResource("/renderer/litematic-gpu-runtime.jar", target);
+        ensureFabricCacheCurrent(targetGameDirectory, target, log);
+    }
+
+    /**
+     * Fabric caches nested JARs under the game directory. Keep a content marker
+     * so an upgraded runtime cannot reuse processed modules from an older JAR.
+     */
+    static void ensureFabricCacheCurrent(Path gameDirectory, Path runtimeJar, Consumer<String> log) throws IOException {
+        String fingerprint = FABRIC_CACHE_FORMAT + ":" + sha256(runtimeJar);
+        Path fabricDirectory = gameDirectory.resolve(".fabric");
+        Path marker = fabricDirectory.resolve("litematic-gpu-runtime.sha256");
+        String previous = Files.isRegularFile(marker) ? Files.readString(marker).trim() : "";
+        if (fingerprint.equalsIgnoreCase(previous)) return;
+
+        boolean hadProcessedCache = Files.exists(fabricDirectory.resolve("processedMods"))
+                || Files.exists(fabricDirectory.resolve("remappedJars"));
+        clearFabricProcessingCaches(gameDirectory);
+        Files.createDirectories(fabricDirectory);
+        Files.writeString(marker, fingerprint + System.lineSeparator());
+        if (hadProcessedCache && log != null) log.accept("渲染组件版本变化，已清理 Fabric 处理缓存");
+    }
+
+    static void clearFabricProcessingCaches(Path gameDirectory) throws IOException {
+        Path fabricDirectory = gameDirectory.resolve(".fabric");
+        for (String name : List.of("processedMods", "remappedJars")) {
+            Path cache = fabricDirectory.resolve(name);
+            if (!Files.exists(cache)) continue;
+            try (var paths = Files.walk(cache)) {
+                for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+            }
+        }
+    }
+
+    private static String sha256(Path file) throws IOException {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(file));
+            return HexFormat.of().formatHex(digest);
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new AssertionError(impossible);
+        }
     }
 
     private void copyResource(String resource, Path target) throws IOException {
@@ -101,19 +166,26 @@ final class RuntimeInstaller {
             Files.createDirectories(target.getParent());
             Path temporary = target.resolveSibling(target.getFileName() + ".tmp");
             Files.copy(input, temporary, StandardCopyOption.REPLACE_EXISTING);
-            // 目标文件被占用（如另一实例的 Minecraft 正在运行）且内容一致时，跳过覆盖
-            if (Files.exists(target) && Files.size(target) == Files.size(temporary)) {
+            // 目标文件被占用（如另一实例的 Minecraft 正在运行）且内容一致时，跳过覆盖。
+            // JAR 内容变化后文件大小可能不变，不能只比较长度。
+            if (Files.exists(target) && sameFileContent(target, temporary)) {
                 Files.deleteIfExists(temporary);
                 return;
             }
             try {
                 Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException locked) {
-                // 目标正被运行中的 Minecraft 锁定：内容不同但无法替换，提示后沿用旧文件
                 Files.deleteIfExists(temporary);
-                System.out.println("[install] " + target.getFileName() + " 被占用且内容有更新，将在下次渲染端重启时更新");
+                throw new IOException(
+                        "渲染组件 " + target.getFileName() + " 有更新但文件被占用，请关闭残留 Minecraft 渲染进程后重试",
+                        locked
+                );
             }
         }
+    }
+
+    static boolean sameFileContent(Path first, Path second) throws IOException {
+        return Files.size(first) == Files.size(second) && Files.mismatch(first, second) == -1L;
     }
 
     private void installAssets(JsonObject index) throws Exception {
@@ -157,9 +229,7 @@ final class RuntimeInstaller {
             }
             if (downloads != null && downloads.has("classifiers")) {
                 JsonObject classifiers = downloads.getAsJsonObject("classifiers");
-                JsonObject nativeArtifact = classifiers.has("natives-windows")
-                        ? classifiers.getAsJsonObject("natives-windows")
-                        : classifiers.has("natives-windows-64") ? classifiers.getAsJsonObject("natives-windows-64") : null;
+                JsonObject nativeArtifact = selectNativeClassifier(classifiers);
                 if (nativeArtifact != null) {
                     Path zip = runtimeRoot.resolve("libraries").resolve(nativeArtifact.get("path").getAsString());
                     download(nativeArtifact, zip);
@@ -218,11 +288,52 @@ final class RuntimeInstaller {
         for (JsonElement element : rules) {
             JsonObject rule = element.getAsJsonObject();
             JsonObject os = rule.getAsJsonObject("os");
-            if (os != null && os.has("name") && !"windows".equals(os.get("name").getAsString())) continue;
+            if (os != null && os.has("name") && !currentOsName().equals(os.get("name").getAsString())) continue;
+            if (os != null && os.has("arch") && !matchesArch(os.get("arch").getAsString())) continue;
             if (rule.has("features")) continue;
             allowed = "allow".equals(rule.get("action").getAsString());
         }
         return allowed;
+    }
+
+    private static JsonObject selectNativeClassifier(JsonObject classifiers) {
+        String os = currentOsName();
+        String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+        boolean is64 = arch.contains("64") || arch.contains("amd64") || arch.contains("aarch64") || arch.contains("arm64");
+        List<String> preferred = new ArrayList<>();
+        if ("windows".equals(os)) {
+            if (is64) preferred.add("natives-windows-64");
+            preferred.add("natives-windows");
+        } else if ("linux".equals(os)) {
+            if (is64) preferred.add("natives-linux-64");
+            preferred.add("natives-linux");
+        } else {
+            preferred.add("natives-osx");
+            preferred.add("natives-macos");
+        }
+        for (String name : preferred) if (classifiers.has(name)) return classifiers.getAsJsonObject(name);
+        for (Map.Entry<String, JsonElement> entry : classifiers.entrySet()) {
+            String name = entry.getKey();
+            if (name.startsWith("natives-" + os) && (!is64 || !name.matches(".*-(arm|x86)$"))) return entry.getValue().getAsJsonObject();
+        }
+        return null;
+    }
+
+    private static String currentOsName() {
+        String name = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        if (name.contains("win")) return "windows";
+        if (name.contains("mac") || name.contains("darwin")) return "osx";
+        return "linux";
+    }
+
+    private static boolean matchesArch(String requested) {
+        String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+        return switch (requested.toLowerCase(java.util.Locale.ROOT)) {
+            case "x86", "i386", "i686" -> arch.matches("i[3-6]86|x86");
+            case "x86_64", "amd64" -> arch.contains("64") || arch.contains("amd64");
+            case "aarch64", "arm64" -> arch.contains("aarch64") || arch.contains("arm64");
+            default -> true;
+        };
     }
 
     private JsonObject json(String url) throws Exception {

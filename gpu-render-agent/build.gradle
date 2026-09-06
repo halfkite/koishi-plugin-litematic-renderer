@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'dev.qqbot'
-version = '0.2.26'
+version = '0.4.4'
 
 repositories { mavenCentral() }
 
@@ -35,17 +35,10 @@ tasks.test { useJUnitPlatform() }
 
 tasks.register('fatJar', Jar) {
     archiveClassifier = 'all'
+    archiveFileName = "litematic-gpu-agent-${project.version}-all.jar"
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     manifest { attributes 'Main-Class': application.mainClass.get() }
     from sourceSets.main.output
     dependsOn configurations.runtimeClasspath
     from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
-}
-
-tasks.register('portableZip', Zip) {
-    dependsOn tasks.fatJar
-    archiveClassifier = 'windows-portable'
-    into('app') { from tasks.fatJar }
-    from('README.md')
-    from('package-windows.ps1')
 }

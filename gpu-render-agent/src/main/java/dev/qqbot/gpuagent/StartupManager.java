@@ -7,6 +7,7 @@ final class StartupManager {
     private StartupManager() {}
 
     static void setEnabled(boolean enabled) throws IOException, InterruptedException {
+        if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win")) return;
         String command = ProcessHandle.current().info().command().orElseThrow(() -> new IOException("无法确定 Agent 可执行文件"));
         String value = '"' + command + '"';
         ProcessBuilder builder = enabled

@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Litematic GPU Agent</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; --bg:#f5f7f9; --surface:#fff; --surface-subtle:#f8fafb; --text:#18242d; --muted:#63727c; --border:#d7e0e5; --input:#fff; --accent:#18795d; --accent-soft:#e4f3ed; --danger:#a33f49; --danger-soft:#fbecef; --shadow:0 12px 34px #17304212; }
+    :root[data-theme="dark"] { color-scheme: dark; --bg:#101418; --surface:#182127; --surface-subtle:#1d2930; --text:#e9eef2; --muted:#91a0a8; --border:#2e3b43; --input:#0d1114; --accent:#3ca783; --accent-soft:#1b4036; --danger:#db747b; --danger-soft:#4b292d; --shadow:0 12px 34px #0005; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    button, input, textarea, select { font: inherit; }
+    button { border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text); padding: 8px 12px; cursor: pointer; }
+    button:hover { border-color: var(--accent); background: var(--accent-soft); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { color: var(--danger); border-color: #dba1a6; background: var(--danger-soft); }
+    button.small { padding: 5px 8px; font-size: 12px; }
+    input, textarea, select { width: 100%; background: var(--input); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 8px; }
+    input:focus, textarea:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 30%, transparent); border-color: var(--accent); }
+    input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--accent); }
+    textarea { min-height: 86px; resize: vertical; font-size: 13px; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 13px; }
+    label.check { display: flex; align-items: center; gap: 8px; min-height: 36px; }
+    label.check span { color: var(--text); }
+    h1, h2, h3 { margin: 0; font-weight: 600; }
+    h1 { font-size: 20px; }
+    h2 { font-size: 16px; margin-bottom: 14px; }
+    h3 { font-size: 14px; margin: 18px 0 8px; }
+    .hidden { display: none !important; }
+     .login { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+     .login-box { width: min(390px, 100%); background: var(--surface); border: 1px solid var(--border); padding: 26px; border-radius: 8px; box-shadow: var(--shadow); }
+     .login-head { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+     .login-head button { flex: 0 0 auto; }
+    .login-box form { display: grid; gap: 14px; margin-top: 22px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .error { color: var(--danger); min-height: 20px; font-size: 13px; }
+    .app { min-height: 100vh; }
+    header { position: sticky; top: 0; z-index: 2; display: flex; gap: 18px; align-items: center; justify-content: space-between; padding: 13px 22px; background: var(--surface); border-bottom: 1px solid var(--border); box-shadow: 0 2px 12px #1730420b; }
+    header .actions { display: flex; gap: 8px; align-items: center; }
+    main { max-width: 1240px; margin: 0 auto; padding: 22px; }
+    nav { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+    nav button { border: 0; border-radius: 4px 4px 0 0; background: transparent; color: var(--muted); }
+    nav button.active { color: var(--text); background: var(--surface); box-shadow: 0 -2px var(--accent) inset; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+    .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 14px; box-shadow: var(--shadow); }
+    .metric { min-height: 86px; }
+    .metric strong { display: block; margin-top: 9px; font-size: 22px; color: var(--accent); overflow-wrap: anywhere; }
+    .row { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
+    .row > * { flex: 1; }
+    .row > button, .row > input[type=file] { flex: 0 0 auto; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+    .form-grid.compact { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .hint { margin: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .notice { padding: 10px 12px; background: #fff8df; border: 1px solid #e2c975; color: #765c12; border-radius: 5px; margin-bottom: 14px; }
+    .account-card, .view-card, .pack-row { background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 5px; padding: 13px; margin-top: 10px; }
+    .card-head { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 11px; }
+    .card-head strong { overflow-wrap: anywhere; }
+    .card-actions { display: flex; gap: 5px; flex-wrap: wrap; }
+    .subsection { border-top: 1px solid var(--border); margin-top: 13px; padding-top: 12px; }
+    .check-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 4px 12px; }
+    .number-short { max-width: 130px; }
+    .color-input { padding: 3px; height: 38px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--border); padding: 9px 7px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 500; }
+    pre { background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 5px; padding: 12px; min-height: 180px; max-height: 560px; overflow: auto; white-space: pre-wrap; word-break: break-word; color: var(--text); font: 12px/1.55 ui-monospace, Consolas, monospace; }
+    details { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 12px; }
+    summary { color: var(--muted); cursor: pointer; font-size: 13px; }
+    .toast { position: fixed; right: 18px; bottom: 18px; max-width: min(420px, calc(100vw - 36px)); padding: 11px 14px; background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 5px; display: none; box-shadow: var(--shadow); }
+    @media (max-width: 620px) { header { align-items: flex-start; flex-direction: column; } main { padding: 14px; } .card-head { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <section id="login" class="login">
+    <div class="login-box">
+      <div class="login-head"><h1>Litematic GPU Agent</h1><button id="loginThemeToggle" type="button">深色模式</button></div>
+      <p class="muted">独立渲染与机器人管理后台</p>
+      <form id="loginForm">
+        <label>用户名<input id="username" autocomplete="username" value="admin" required></label>
+        <label>密码<input id="password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">登录</button>
+        <div id="loginError" class="error"></div>
+      </form>
+    </div>
+  </section>
+
+  <section id="app" class="app hidden">
+    <header>
+      <div><h1>Litematic GPU Agent</h1><span id="version" class="muted">连接中...</span></div>
+      <div class="actions"><span id="connection" class="muted"></span><button id="saveConfigTop" class="primary">保存并重载配置</button><button id="themeToggle">深色模式</button><button id="logout">退出登录</button></div>
+    </header>
+    <main>
+      <nav>
+        <button data-view="status" class="active">状态</button>
+        <button data-view="config">配置</button>
+        <button data-view="logs">日志</button>
+      </nav>
+
+      <div id="notice" class="notice hidden">当前 Web 后台密码仍为首次生成密码，建议在“配置”页修改。</div>
+
+      <section id="status" class="view active">
+        <div class="grid">
+          <div class="panel metric"><span class="muted">运行时</span><strong id="runtimeReady">-</strong></div>
+          <div class="panel metric"><span class="muted">GPU</span><strong id="gpu">-</strong></div>
+          <div class="panel metric"><span class="muted">队列</span><strong id="queue">-</strong></div>
+          <div class="panel metric"><span class="muted">当前任务</span><strong id="currentFile">-</strong></div>
+        </div>
+        <div class="panel"><h2>机器人账号</h2><div id="accounts">暂无账号</div></div>
+        <div class="panel"><h2>运行详情</h2><pre id="runtimeDetails">等待状态...</pre></div>
+      </section>
+
+      <section id="config" class="view">
+        <div class="panel">
+          <h2>服务与渲染</h2>
+          <div class="form-grid">
+            <label><span>启用 Web 管理后台</span><input id="webEnabled" type="checkbox"></label>
+            <label>监听地址<input id="webBindHost"></label>
+            <label>监听端口<input id="webPort" type="number" min="1" max="65535"></label>
+            <label>缓存目录<input id="cacheDirectory"></label>
+             <label>缓存上限 GB<input id="cacheMaxGb" type="number" min="1" step="0.1"></label>
+            <label>宽度<input id="renderWidth" type="number" min="64"></label>
+            <label>高度<input id="renderHeight" type="number" min="64"></label>
+            <label>群文件上限 KB<input id="maxFileSizeKb" type="number" min="1"></label>
+            <label>私聊文件上限 KB<input id="privateMaxFileSizeKb" type="number" min="1"></label>
+            <label>渲染超时毫秒<input id="renderTimeoutMillis" type="number" min="1000"></label>
+             <label>空闲关闭毫秒<input id="renderIdleStopMillis" type="number" min="0"></label>
+             <label>并行客户端数<input id="maxConcurrentRenders" type="number" min="1" max="4"></label>
+             <label>内存重启阈值 GB<input id="memoryRestartGb" type="number" min="0" step="0.1"><span class="hint">0 表示关闭自动重启</span></label>
+          </div>
+          <div class="subsection check-grid">
+            <label class="check"><input id="localMergeEnabled" type="checkbox"><span>本地生成拼接图</span></label>
+            <label class="check"><input id="cacheKeepProjections" type="checkbox"><span>缓存保留原始投影</span></label>
+            <label class="check"><input id="startWithWindows" type="checkbox"><span>随 Windows 启动</span></label>
+            <label class="check"><input id="minimizeToTray" type="checkbox"><span>关闭窗口时缩到托盘</span></label>
+          </div>
+          <div class="form-grid" style="margin-top:12px">
+            <label>拼接方向<select id="cloudMergeLayout"><option value="horizontal">横向</option><option value="vertical">竖向</option></select></label>
+            <label>Java 路径<input id="javaPath" placeholder="留空自动检测"></label>
+             <label>最大请求 MB<input id="maxRequestMb" type="number" min="1"></label>
+             <label>时间偏差秒<input id="maxClockSkewSeconds" type="number" min="0"></label>
+             <label>网页登录用户名<input id="webUsername" autocomplete="username"></label>
+             <label>会话时长小时<input id="webSessionHours" type="number" min="0.083" step="0.5"></label>
+          </div>
+          <h3>云端 Agent</h3>
+          <div class="form-grid">
+            <label class="check"><input id="cloudEnabled" type="checkbox"><span>启用云端</span></label>
+            <label>云端 WebSocket 地址<input id="cloudWebSocketUrl"></label>
+            <label>节点 ID<input id="agentId"></label>
+            <label>共享密钥（留空保持不变）<input id="sharedSecret" type="password" autocomplete="new-password"></label>
+          </div>
+          <p class="hint">监听地址、端口和 Java 路径保存后需要重启 Agent 才会生效。默认监听 0.0.0.0，公网使用建议通过 HTTPS 反向代理或 VPN。</p>
+        </div>
+
+        <div class="panel">
+          <h2>投影信息</h2>
+          <div class="form-grid compact">
+            <label>介绍格式<select id="metadataFormat"><option value="full">完整标签版</option><option value="compact">精简版（模式2）</option></select></label>
+          </div>
+          <div class="check-grid">
+            <label class="check"><input id="showMetadataProjectionName" type="checkbox"><span>投影名称</span></label>
+            <label class="check"><input id="showMetadataAuthor" type="checkbox"><span>保存者游戏 ID</span></label>
+            <label class="check"><input id="showMetadataCreatedAt" type="checkbox"><span>创建时间</span></label>
+            <label class="check"><input id="showMetadataBlockStats" type="checkbox"><span>方块数/体积</span></label>
+            <label class="check"><input id="showMetadataSize" type="checkbox"><span>尺寸</span></label>
+            <label class="check"><input id="showMetadataLitematicVersion" type="checkbox"><span>Litematic 版本</span></label>
+            <label class="check"><input id="showMetadataGameVersion" type="checkbox"><span>游戏版本</span></label>
+          </div>
+          <p class="hint">这些开关只影响机器人发送的投影信息文字，不影响图片渲染和缓存识别。</p>
+        </div>
+
+        <div class="panel">
+          <h2>机器人账号</h2>
+          <div class="row"><button id="addOfficial">添加官方 QQ</button><button id="addOneBot">添加 OneBot/NekoBot</button><button id="reloadBots">重新加载全部账号</button></div>
+          <p class="hint">账号保存后会自动重载对应连接。密钥字段为空时保持服务端已保存的密钥。</p>
+          <div id="accountEditor"></div>
+        </div>
+
+        <div class="panel">
+          <div class="row"><h2 style="margin:0; flex:1">视角</h2><button id="addView">添加视角</button></div>
+          <p class="hint">视角顺序、角度、缩放、智能填充、分辨率、背景、透明背景、超采样和亮度均可单独设置。</p>
+          <div id="viewEditor"></div>
+        </div>
+
+        <div class="panel">
+          <h2>资源包</h2>
+          <div class="row"><input id="packFile" type="file" accept=".zip"><button id="uploadPack">上传资源包</button></div>
+          <div id="packEditor"></div>
+        </div>
+
+        <div class="panel">
+          <div class="row"><button id="saveConfig" class="primary">保存配置</button><span id="saveMessage" class="muted"></span></div>
+        </div>
+
+        <div class="panel">
+          <h2>修改 Web 账户名称</h2>
+          <div class="form-grid"><label>新账户名称<input id="newUsername" autocomplete="username"></label></div>
+          <p class="hint">当前登录会话不会失效，修改后使用新账户名称登录。</p>
+          <div class="row" style="margin-top:12px"><button id="changeUsername">修改账户名称</button></div>
+        </div>
+
+        <div class="panel">
+          <h2>修改 Web 密码</h2>
+          <div class="form-grid"><label>新密码<input id="newPassword" type="password" autocomplete="new-password"></label><label>再次输入<input id="newPasswordAgain" type="password" autocomplete="new-password"></label></div>
+          <div class="row" style="margin-top:12px"><button id="changePassword">修改密码</button></div>
+        </div>
+      </section>
+
+      <section id="logs" class="view">
+        <div class="panel"><div class="row"><h2 style="margin:0; flex:1">日志尾部</h2><button id="refreshLogs">刷新</button></div><pre id="logOutput">暂无日志</pre></div>
+      </section>
+    </main>
+  </section>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const state = { config: null, status: null };
+    const $ = id => document.getElementById(id);
+    const show = (id, visible) => $(id).classList.toggle('hidden', !visible);
+    function toast(message, error = false) { const el = $('toast'); el.textContent = message; el.style.display = 'block'; el.style.background = error ? '#633639' : '#23614e'; setTimeout(() => el.style.display = 'none', 3200); }
+    async function api(path, options = {}) {
+      const response = await fetch(path, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
+      let body = null; try { body = await response.json(); } catch (_) { }
+      if (!response.ok) throw new Error(body && (body.error || body.message) || ('HTTP ' + response.status));
+      return body;
+    }
+    function checked(value) { return value ? ' checked' : ''; }
+    function numberValue(value, fallback) { return Number.isFinite(Number(value)) ? Number(value) : fallback; }
+    function listValue(value) { return Array.isArray(value) ? value.join('\n') : ''; }
+    function randomId(prefix) { return prefix + '-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(16).slice(2)); }
+
+    function renderAccountEditor() {
+      const profiles = state.config.botProfiles || [];
+      if (!profiles.length) {
+        $('accountEditor').innerHTML = '<p class="hint">暂无账号，请点击上方按钮添加。</p>';
+        return;
+      }
+      $('accountEditor').innerHTML = profiles.map((profile, index) => {
+        const onebot = String(profile.type || 'official').toLowerCase() === 'onebot';
+        return '<article class="account-card" data-account-index="' + index + '">'
+          + '<div class="card-head"><strong>' + esc(profile.name || ('账号 ' + (index + 1))) + '</strong><div class="card-actions">'
+          + '<button type="button" class="small" data-account-action="up">上移</button><button type="button" class="small" data-account-action="down">下移</button><button type="button" class="small danger" data-account-action="delete">删除</button></div></div>'
+          + '<div class="form-grid compact">'
+          + '<label>账号名称<input data-field="name" value="' + esc(profile.name || '') + '"></label>'
+          + '<label class="check"><input data-field="enabled" type="checkbox"' + checked(profile.enabled) + '><span>启用账号</span></label>'
+          + '<label>账号类型<select data-field="type" data-account-type><option value="official"' + (onebot ? '' : ' selected') + '>官方 QQ</option><option value="onebot"' + (onebot ? ' selected' : '') + '>OneBot / NekoBot</option></select></label>'
+          + '<label>群消息模式<select data-field="groupMessageMode"><option value="received"' + (profile.groupMessageMode === 'received' ? ' selected' : '') + '>接收群文件自动识别（不要求 @）</option><option value="mentionOnly"' + (profile.groupMessageMode === 'mentionOnly' ? ' selected' : '') + '>仅被 @ 时识别</option><option value="any"' + (profile.groupMessageMode === 'any' ? ' selected' : '') + '>都可以（文件或 @）</option></select></label>'
+          + '</div>'
+          + '<div class="subsection ' + (onebot ? 'hidden' : '') + '" data-type-fields="official"><h3>官方 QQ</h3><div class="form-grid compact">'
+          + '<label>AppID<input data-field="appId" value="' + esc(profile.appId || '') + '"></label>'
+          + '<label>AppSecret（留空保持不变）<input data-field="appSecret" type="password" autocomplete="new-password" placeholder="已保存的密钥不会回显"></label>'
+          + '<label class="check"><input data-field="sandbox" type="checkbox"' + checked(profile.sandbox) + '><span>沙箱环境</span></label>'
+           + '<label>事件意图<input data-field="intents" data-number type="number" min="0" value="' + numberValue(profile.intents, 1174405120) + '"></label>'
+          + '</div></div>'
+          + '<div class="subsection ' + (onebot ? '' : 'hidden') + '" data-type-fields="onebot"><h3>OneBot / NekoBot</h3><div class="form-grid compact">'
+          + '<label>连接方式<select data-field="transport"><option value="forward"' + (profile.transport === 'forward' ? ' selected' : '') + '>正向连接</option><option value="reverse"' + (profile.transport === 'reverse' ? ' selected' : '') + '>反向监听</option></select></label>'
+          + '<label>WebSocket 地址<input data-field="webSocketUrl" placeholder="ws://127.0.0.1:3001" value="' + esc(profile.webSocketUrl || '') + '"></label>'
+          + '<label>Token（留空保持不变）<input data-field="accessToken" type="password" autocomplete="new-password" placeholder="已保存的 Token 不会回显"></label>'
+          + '<label>监听地址<input data-field="listenHost" value="' + esc(profile.listenHost || '0.0.0.0') + '"></label>'
+          + '<label>监听端口<input data-field="listenPort" data-number type="number" min="1" max="65535" value="' + numberValue(profile.listenPort, 39200) + '"></label>'
+          + '<label>反向路径<input data-field="path" value="' + esc(profile.path || '/onebot/v11/ws') + '"></label>'
+          + '</div></div>'
+           + '<div class="subsection"><h3>发送与权限</h3><div class="form-grid compact">'
+           + '<label>群文件上限 KB（0 跟随全局）<input data-field="maxFileSizeKb" data-number type="number" min="0" step="1" value="' + numberValue(profile.maxFileSizeKb, 0) + '"></label>'
+           + '<label>私聊文件上限 KB（0 跟随全局）<input data-field="privateMaxFileSizeKb" data-number type="number" min="0" step="1" value="' + numberValue(profile.privateMaxFileSizeKb, 0) + '"></label>'
+           + '<label class="check"><input data-field="allowPrivateRender" type="checkbox"' + checked(profile.allowPrivateRender) + '><span>允许单人对话渲染</span></label>'
+          + '<label class="check"><input data-field="replyAndMention" type="checkbox"' + checked(profile.replyAndMention) + '><span>引用原消息并 @ 发送者</span></label>'
+          + '<label class="check"><input data-field="showViewTitles" type="checkbox"' + checked(profile.showViewTitles) + '><span>显示视角标题</span></label>'
+          + '<label class="check"><input data-field="successNotice" type="checkbox"' + checked(profile.successNotice) + '><span>发送渲染成功提示</span></label>'
+          + '<label>发送模式<select data-field="sendMode"><option value="combined"' + (profile.sendMode === 'combined' ? ' selected' : '') + '>联合发送</option><option value="forward"' + (profile.sendMode === 'forward' ? ' selected' : '') + '>合并转发</option></select></label>'
+          + '</div><div class="form-grid compact">'
+          + '<label>群白名单（每行一个）<textarea data-field="groupWhitelist" data-list>' + esc(listValue(profile.groupWhitelist)) + '</textarea></label>'
+          + '<label>群黑名单（每行一个）<textarea data-field="groupBlacklist" data-list>' + esc(listValue(profile.groupBlacklist)) + '</textarea></label>'
+          + '</div><div class="check-grid">'
+          + '<label class="check"><input data-field="groupWhitelistEnabled" type="checkbox"' + checked(profile.groupWhitelistEnabled) + '><span>启用群白名单</span></label>'
+          + '<label class="check"><input data-field="groupBlacklistEnabled" type="checkbox"' + checked(profile.groupBlacklistEnabled) + '><span>启用群黑名单</span></label>'
+          + '</div></div></article>';
+      }).join('');
+      $('accountEditor').querySelectorAll('[data-account-type]').forEach(select => select.addEventListener('change', () => {
+        const card = select.closest('.account-card');
+        card.querySelector('[data-type-fields="official"]').classList.toggle('hidden', select.value !== 'official');
+        card.querySelector('[data-type-fields="onebot"]').classList.toggle('hidden', select.value !== 'onebot');
+      }));
+      $('accountEditor').querySelectorAll('[data-account-action]').forEach(button => button.addEventListener('click', () => {
+        const card = button.closest('.account-card');
+        const index = Number(card.dataset.accountIndex);
+        const items = readAccounts();
+        const action = button.dataset.accountAction;
+        if (action === 'delete') items.splice(index, 1);
+        if (action === 'up' && index > 0) [items[index - 1], items[index]] = [items[index], items[index - 1]];
+        if (action === 'down' && index < items.length - 1) [items[index], items[index + 1]] = [items[index + 1], items[index]];
+        state.config.botProfiles = items;
+        renderAccountEditor();
+      }));
+    }
+
+    function readAccounts() {
+      return [...document.querySelectorAll('.account-card')].map(card => {
+        const index = Number(card.dataset.accountIndex);
+        const profile = { ...(state.config.botProfiles || [])[index] };
+        card.querySelectorAll('[data-field]').forEach(field => {
+          if (field.type === 'checkbox') profile[field.dataset.field] = field.checked;
+          else if (field.dataset.list !== undefined) profile[field.dataset.field] = field.value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+          else if (field.dataset.number !== undefined) profile[field.dataset.field] = Number(field.value);
+          else profile[field.dataset.field] = field.value;
+        });
+        return profile;
+      });
+    }
+
+    function defaultViews() {
+      return [
+        { id: 'isometric', name: '正二轴测', yaw: 135, pitch: 36, zoom: 0.82, autoFill: true, width: 2048, height: 2048, supersampling: 1, background: '#000000', transparentBackground: false, brightness: 1 },
+        { id: 'isometric-reverse', name: '反向正二轴测', yaw: 315, pitch: 36, zoom: 0.82, autoFill: true, width: 2048, height: 2048, supersampling: 1, background: '#000000', transparentBackground: false, brightness: 1 }
+      ];
+    }
+
+    function renderViewEditor() {
+      const views = (state.config.views && state.config.views.length) ? state.config.views : defaultViews();
+      $('viewEditor').innerHTML = views.map((view, index) => {
+        const value = { ...defaultViews()[0], ...view };
+        const background = /^#[0-9a-f]{6}$/i.test(value.background || '') ? value.background : '#000000';
+        return '<article class="view-card" data-view-index="' + index + '">'
+          + '<div class="card-head"><strong>视角 ' + (index + 1) + '：' + esc(value.name || value.id || '') + '</strong><div class="card-actions">'
+          + '<button type="button" class="small" data-view-action="up">上移</button><button type="button" class="small" data-view-action="down">下移</button><button type="button" class="small danger" data-view-action="delete">删除</button></div></div>'
+          + '<div class="form-grid compact">'
+          + '<label>标识<input data-field="id" value="' + esc(value.id || '') + '"></label><label>名称<input data-field="name" value="' + esc(value.name || '') + '"></label>'
+          + '<label>水平角 yaw<input data-field="yaw" data-number type="number" step="0.1" value="' + numberValue(value.yaw, 0) + '"></label><label>俯仰角 pitch<input data-field="pitch" data-number type="number" step="0.1" value="' + numberValue(value.pitch, 0) + '"></label>'
+          + '<label>缩放<input data-field="zoom" data-number type="number" min="0.01" step="0.01" value="' + numberValue(value.zoom, 0.82) + '"></label>'
+          + '<label>宽度<input data-field="width" data-number type="number" min="64" value="' + numberValue(value.width, 2048) + '"></label><label>高度<input data-field="height" data-number type="number" min="64" value="' + numberValue(value.height, 2048) + '"></label>'
+          + '<label>超采样<input data-field="supersampling" data-number type="number" min="1" max="4" value="' + numberValue(value.supersampling, 1) + '"></label>'
+          + '<label>亮度<input data-field="brightness" data-number type="number" min="0.25" max="3" step="0.05" value="' + numberValue(value.brightness, 1) + '"></label>'
+          + '<label>背景色<input class="color-input" data-field="background" type="color" value="' + background + '"></label>'
+          + '</div><div class="subsection check-grid">'
+          + '<label class="check"><input data-field="autoFill" type="checkbox"' + checked(value.autoFill !== false) + '><span>智能缩放填满画面</span></label>'
+          + '<label class="check"><input data-field="transparentBackground" type="checkbox"' + checked(value.transparentBackground) + '><span>透明背景</span></label>'
+          + '</div></article>';
+      }).join('');
+      $('viewEditor').querySelectorAll('[data-view-action]').forEach(button => button.addEventListener('click', () => {
+        const card = button.closest('.view-card');
+        const index = Number(card.dataset.viewIndex);
+        const items = readViews();
+        const action = button.dataset.viewAction;
+        if (action === 'delete') items.splice(index, 1);
+        if (action === 'up' && index > 0) [items[index - 1], items[index]] = [items[index], items[index - 1]];
+        if (action === 'down' && index < items.length - 1) [items[index], items[index + 1]] = [items[index + 1], items[index]];
+        state.config.views = items;
+        renderViewEditor();
+      }));
+    }
+
+    function readViews() {
+      return [...document.querySelectorAll('.view-card')].map(card => {
+        const index = Number(card.dataset.viewIndex);
+        const view = { ...((state.config.views && state.config.views.length) ? state.config.views[index] : defaultViews()[index]) };
+        card.querySelectorAll('[data-field]').forEach(field => view[field.dataset.field] = field.type === 'checkbox' ? field.checked : (field.dataset.number !== undefined ? Number(field.value) : field.value));
+        return view;
+      });
+    }
+
+    function renderPackEditor() {
+      const packs = state.config.resourcePacks || [];
+      $('packEditor').innerHTML = packs.length ? packs.map((pack, index) => '<div class="pack-row" data-pack-index="' + index + '" data-pack-path="' + esc(pack.path || '') + '"><div class="row"><label class="check"><input data-pack-enabled type="checkbox"' + checked(pack.enabled) + '><span>' + esc(pack.path || '') + '</span></label><div class="card-actions"><button type="button" class="small" data-pack-action="up">上移</button><button type="button" class="small" data-pack-action="down">下移</button><button type="button" class="small danger" data-pack-action="delete">删除</button></div></div></div>').join('') : '<p class="hint">暂无资源包。</p>';
+      $('packEditor').querySelectorAll('[data-pack-action]').forEach(button => button.addEventListener('click', () => {
+        const index = Number(button.closest('.pack-row').dataset.packIndex);
+        const items = readPacks();
+        const action = button.dataset.packAction;
+        if (action === 'delete') items.splice(index, 1);
+        if (action === 'up' && index > 0) [items[index - 1], items[index]] = [items[index], items[index - 1]];
+        if (action === 'down' && index < items.length - 1) [items[index], items[index + 1]] = [items[index + 1], items[index]];
+        state.config.resourcePacks = items;
+        renderPackEditor();
+      }));
+    }
+
+    function readPacks() {
+      return [...document.querySelectorAll('.pack-row')].map(row => ({ path: row.dataset.packPath, enabled: row.querySelector('[data-pack-enabled]').checked }));
+    }
+    async function loadConfig() {
+      state.config = await api('/api/config');
+      const c = state.config;
+      ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','cloudWebSocketUrl','agentId','javaPath','maxClockSkewSeconds','webUsername'].forEach(id => { if ($(id)) $(id).value = c[id] ?? ''; });
+      $('newUsername').value = c.webUsername ?? '';
+      $('cacheMaxGb').value = Math.max(1, Math.round((Number(c.cacheMaxBytes || 10737418240) / 1073741824) * 10) / 10);
+      $('maxRequestMb').value = Math.max(1, Math.round((Number(c.maxRequestBytes || 134217728) / 1048576) * 10) / 10);
+      $('memoryRestartGb').value = Math.max(0, Math.round((Number(c.memoryRestartThresholdBytes || 0) / 1073741824) * 10) / 10);
+      $('webSessionHours').value = Math.max(0.083, Math.round((Number(c.webSessionTimeoutMillis || 43200000) / 3600000) * 10) / 10);
+      $('webEnabled').checked = !!c.webEnabled;
+      $('metadataFormat').value = c.metadataFormat === 'compact' ? 'compact' : 'full';
+      ['showMetadataProjectionName','showMetadataAuthor','showMetadataCreatedAt','showMetadataBlockStats','showMetadataSize','showMetadataLitematicVersion','showMetadataGameVersion'].forEach(id => { $(id).checked = c[id] !== false; });
+      ['localMergeEnabled','cacheKeepProjections','startWithWindows','minimizeToTray','cloudEnabled'].forEach(id => { $(id).checked = !!c[id]; });
+      $('cloudMergeLayout').value = c.cloudMergeLayout === 'vertical' ? 'vertical' : 'horizontal';
+      renderAccountEditor(); renderViewEditor(); renderPackEditor();
+      show('notice', !!c.webPasswordChangeNotice);
+    }
+    async function loadStatus() {
+      try {
+        state.status = await api('/api/status');
+        const s = state.status;
+        $('version').textContent = '版本 ' + (s.version || '-');
+        $('connection').textContent = '后台在线';
+        $('runtimeReady').textContent = s.runtimeReady ? (s.stage || '已就绪') : '未启动';
+        $('gpu').textContent = s.gpu || '-';
+        $('queue').textContent = (s.queueLength ?? 0) + (s.busy ? '（渲染中）' : '');
+        $('currentFile').textContent = s.currentFile || '无';
+        $('runtimeDetails').textContent = JSON.stringify(s, null, 2);
+        renderAccounts(s.accounts || []);
+      } catch (error) { $('connection').textContent = '状态读取失败'; }
+    }
+    function renderAccounts(accounts) {
+      if (!accounts.length) { $('accounts').textContent = '暂无启用账号'; return; }
+      const rows = accounts.map(item => '<tr><td>' + esc(item.name) + '</td><td>' + esc(item.type) + '</td><td>' + (item.enabled ? '启用' : '停用') + '</td><td>' + (item.connected ? '已连接' : esc(item.state || '未连接')) + '</td><td>' + esc(item.lastError || '') + '</td><td><button data-reload="' + esc(item.id) + '">重载</button></td></tr>').join('');
+      $('accounts').innerHTML = '<table><thead><tr><th>名称</th><th>类型</th><th>开关</th><th>连接</th><th>错误</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      $('accounts').querySelectorAll('[data-reload]').forEach(button => button.onclick = async () => { try { await api('/api/accounts/' + encodeURIComponent(button.dataset.reload) + '/reload', { method: 'POST', body: '{}' }); toast('账号已重新加载'); loadStatus(); } catch (error) { toast(error.message, true); } });
+    }
+    async function saveConfig() {
+      try {
+        const next = { ...state.config };
+        ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','cloudWebSocketUrl','agentId','javaPath','maxClockSkewSeconds','webUsername'].forEach(id => next[id] = $(id).type === 'number' ? Number($(id).value) : $(id).value.trim());
+        next.cacheMaxBytes = Math.max(1, Number($('cacheMaxGb').value)) * 1073741824;
+        next.maxRequestBytes = Math.max(1, Number($('maxRequestMb').value)) * 1048576;
+        next.memoryRestartThresholdBytes = Math.max(0, Number($('memoryRestartGb').value)) * 1073741824;
+        next.webSessionTimeoutMillis = Math.max(0.083, Number($('webSessionHours').value)) * 3600000;
+        next.webEnabled = $('webEnabled').checked;
+        next.cloudEnabled = $('cloudEnabled').checked;
+        next.localMergeEnabled = $('localMergeEnabled').checked;
+        next.cacheKeepProjections = $('cacheKeepProjections').checked;
+        next.startWithWindows = $('startWithWindows').checked;
+        next.minimizeToTray = $('minimizeToTray').checked;
+        next.cloudMergeLayout = $('cloudMergeLayout').value === 'vertical' ? 'vertical' : 'horizontal';
+      next.metadataFormat = $('metadataFormat').value === 'compact' ? 'compact' : 'full';
+      ['showMetadataProjectionName','showMetadataAuthor','showMetadataCreatedAt','showMetadataBlockStats','showMetadataSize','showMetadataLitematicVersion','showMetadataGameVersion'].forEach(id => next[id] = $(id).checked);
+        next.sharedSecret = $('sharedSecret').value;
+        next.botProfiles = readAccounts();
+        next.views = readViews();
+        next.resourcePacks = readPacks();
+        const result = await api('/api/config', { method: 'PUT', body: JSON.stringify(next) });
+        $('saveMessage').textContent = result.restartRequired ? '已保存，缓存目录、并行数、Java 路径或 Web 监听设置需重启' : '已保存，相关服务已即时应用';
+        toast(result.restartRequired ? '配置已保存，部分设置请重启 Agent' : '配置已保存并即时应用');
+        await loadConfig(); loadStatus();
+      } catch (error) { $('saveMessage').textContent = error.message; toast(error.message, true); }
+    }
+    function newProfile(type) {
+      const profile = { id: randomId('bot'), name: type === 'onebot' ? 'OneBot 账号' : '官方 QQ 账号', type, enabled: false, appId: '', appSecret: '', sandbox: false, intents: 1174405120, groupMessageMode: 'received', transport: 'forward', webSocketUrl: '', accessToken: '', listenHost: '0.0.0.0', listenPort: 39200, path: '/onebot/v11/ws', maxFileSizeKb: 0, privateMaxFileSizeKb: 0, allowPrivateRender: false, groupWhitelistEnabled: false, groupWhitelist: [], groupBlacklistEnabled: false, groupBlacklist: [], sendMode: 'combined', replyAndMention: true, showViewTitles: false, successNotice: true };
+      state.config.botProfiles = [...(state.config.botProfiles || []), profile]; renderAccountEditor();
+    }
+    function newView() {
+      state.config.views = [...((state.config.views && state.config.views.length) ? state.config.views : defaultViews()), { id: randomId('view'), name: '新视角', yaw: 135, pitch: 36, zoom: 0.82, autoFill: true, width: 2048, height: 2048, supersampling: 1, background: '#000000', transparentBackground: false, brightness: 1 }];
+      renderViewEditor();
+    }
+    async function uploadPack() {
+      const file = $('packFile').files[0]; if (!file) { toast('请选择 ZIP 资源包', true); return; }
+      if (file.size > 256 * 1024 * 1024) { toast('资源包超过 256 MB', true); return; }
+      const reader = new FileReader(); reader.onload = async () => { try { const base64 = String(reader.result).split(',', 2)[1] || ''; await api('/api/resource-packs', { method: 'POST', body: JSON.stringify({ filename: file.name, base64 }) }); toast('资源包已上传'); $('packFile').value = ''; await loadConfig(); } catch (error) { toast(error.message, true); } }; reader.readAsDataURL(file);
+    }
+    async function changePassword() { try { await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ newPassword: $('newPassword').value, newPasswordAgain: $('newPasswordAgain').value }) }); $('newPassword').value = ''; $('newPasswordAgain').value = ''; toast('密码已修改'); await loadConfig(); } catch (error) { toast(error.message, true); } }
+    async function changeUsername() { try { const name = $('newUsername').value.trim(); if (!name) throw new Error('账户名称不能为空'); await api('/api/auth/change-username', { method: 'POST', body: JSON.stringify({ newUsername: name }) }); toast('账户名称已修改'); await loadConfig(); } catch (error) { toast(error.message, true); } }
+    async function loadLogs() { try { const data = await api('/api/logs?limit=500'); $('logOutput').textContent = (data.lines || []).join('\n') || '暂无日志'; } catch (error) { $('logOutput').textContent = error.message; } }
+    function esc(value) { return String(value ?? '').replace(/[&<>"']/g, character => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[character])); }
+     function applyTheme(theme) {
+       const value = theme === 'dark' ? 'dark' : 'light';
+       document.documentElement.dataset.theme = value;
+       const label = value === 'dark' ? '浅色模式' : '深色模式';
+       $('themeToggle').textContent = label;
+       $('loginThemeToggle').textContent = label;
+      try { localStorage.setItem('litematic-agent-theme', value); } catch (_) { }
+    }
+    applyTheme((() => { try { return localStorage.getItem('litematic-agent-theme') || 'light'; } catch (_) { return 'light'; } })());
+    $('loginForm').onsubmit = async event => { event.preventDefault(); $('loginError').textContent = ''; try { const result = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ username: $('username').value, password: $('password').value }) }); show('login', false); show('app', true); show('notice', !!result.passwordChangeNotice); await loadConfig(); await loadStatus(); await loadLogs(); } catch (error) { $('loginError').textContent = error.message; } };
+     $('logout').onclick = () => { location.reload(); };
+     $('themeToggle').onclick = () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+     $('loginThemeToggle').onclick = () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+    document.querySelectorAll('nav button').forEach(button => button.onclick = () => { document.querySelectorAll('nav button').forEach(item => item.classList.remove('active')); document.querySelectorAll('.view').forEach(item => item.classList.remove('active')); button.classList.add('active'); $(button.dataset.view).classList.add('active'); if (button.dataset.view === 'logs') loadLogs(); });
+    $('saveConfig').onclick = saveConfig; $('saveConfigTop').onclick = saveConfig; $('addOfficial').onclick = () => newProfile('official'); $('addOneBot').onclick = () => newProfile('onebot'); $('addView').onclick = newView; $('reloadBots').onclick = async () => { try { const result = await api('/api/config', { method: 'PUT', body: JSON.stringify({ ...state.config, botProfiles: readAccounts() }) }); toast(result.restartRequired ? '账号已保存，请重启 Agent' : '账号已重新加载'); await loadConfig(); loadStatus(); } catch (error) { toast(error.message, true); } }; $('uploadPack').onclick = uploadPack; $('changePassword').onclick = changePassword; $('changeUsername').onclick = changeUsername; $('refreshLogs').onclick = loadLogs;
+    setInterval(() => { if (!$('app').classList.contains('hidden')) loadStatus(); }, 4000);
+  </script>
+</body>
+</html>

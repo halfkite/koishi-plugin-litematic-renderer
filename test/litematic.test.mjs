@@ -188,6 +188,32 @@ test('reads the Litematic metadata used by the forwarded text footer', () => {
   ].join('\n'))
 })
 
+test('toggles each projection metadata field independently', () => {
+  const metadata = parseLitematicMetadata(sampleLitematic())
+  assert.equal(formatLitematicMetadata(metadata, '测试投影.litematic', {
+    showProjectionName: true,
+    showAuthor: false,
+    showCreatedAt: false,
+    showBlockStats: true,
+    showSize: false,
+    showLitematicVersion: false,
+    showGameVersion: true,
+  }), [
+    '投影名称：测试投影',
+    '方块数/体积：421/720',
+    '游戏版本：1.20.1（数据版本：3465）',
+  ].join('\n'))
+  assert.equal(formatLitematicMetadata(metadata, '测试投影.litematic', {
+    showProjectionName: false,
+    showAuthor: false,
+    showCreatedAt: false,
+    showBlockStats: false,
+    showSize: false,
+    showLitematicVersion: false,
+    showGameVersion: false,
+  }), '')
+})
+
 test('shows every effective config field and omits obsolete fields', () => {
   assert.equal(RendererConfig.type, 'intersect')
   assert.equal(RendererConfig.list[0].meta.description, '机器人接入')
@@ -365,7 +391,7 @@ test('always sends one plain success notification after forward content without 
   assert.equal(sent[1], '测试投影 已渲染成功，结果如上')
 })
 
-test('sends QQ official forward-mode results as one overview image and summary message', async () => {
+test('sends QQ official forward-mode results as one overview image with metadata', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'litematic-qq-overview-'))
   const sent = []
   const session = {
@@ -385,9 +411,9 @@ test('sends QQ official forward-mode results as one overview image and summary m
 
     assert.equal(sent.length, 1)
     assert.deepEqual(sent[0].map(element => element.type), ['img', 'text'])
+    assert.equal(sent[0][1].attrs.content, '\n投影信息')
     assert.equal(new URL(sent[0][0].attrs.src).protocol, 'file:')
     assert.equal(sent[0][0].attrs.src.includes('\\'), false)
-    assert.equal(sent[0][1].attrs.content, '投影信息')
     const overview = await readFile(join(directory, 'qq-overview.png'))
     assert.deepEqual([overview.readUInt32BE(16), overview.readUInt32BE(20)], [128, 132])
   } finally {
@@ -395,7 +421,7 @@ test('sends QQ official forward-mode results as one overview image and summary m
   }
 })
 
-test('keeps the quote but omits unsupported mentions from the QQ official overview message', async () => {
+test('keeps the quote and metadata while omitting unsupported mentions from the QQ official overview message', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'litematic-qq-reply-'))
   const sent = []
   const session = {
@@ -416,7 +442,7 @@ test('keeps the quote but omits unsupported mentions from the QQ official overvi
     assert.equal(sent.length, 1)
     assert.deepEqual(sent[0].map(element => element.type), ['quote', 'img', 'text'])
     assert.equal(sent[0][0].attrs.id, 'message')
-    assert.equal(sent[0][2].attrs.content, '投影信息')
+    assert.equal(sent[0][2].attrs.content, '\n投影信息')
     assert.equal(JSON.stringify(sent[0]).includes('<@user>'), false)
   } finally {
     await rm(directory, { recursive: true, force: true })

@@ -19,6 +19,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 final class AgentFrame extends JFrame {
     private final Path root;
@@ -27,6 +28,8 @@ final class AgentFrame extends JFrame {
     private final RenderService renderer;
     private final HttpV1Server httpServer;
     private final CloudConnection cloud;
+    private final BotManager bots;
+    private final WebAdminServer web;
     private final MemoryWatchdog watchdog;
     private final JTextArea logs = new JTextArea();
     private final JLabel runtimeStatus = new JLabel("运行时：未启动");
@@ -37,6 +40,9 @@ final class AgentFrame extends JFrame {
     private final JTable viewTable = new JTable(views);
     private final JTextField inputFile = new JTextField();
     private final JTextField outputDirectory = new JTextField();
+    private final DefaultListModel<Path> projectionModel = new DefaultListModel<>();
+    private final JList<Path> projectionList = new JList<>(projectionModel);
+    private final List<Component> projectionDropTargets = new ArrayList<>();
     private final PreviewPanel preview;
     private final DefaultTableModel history = new DefaultTableModel(new String[] {"时间", "文件", "视角", "耗时", "状态"}, 0) {
         @Override public boolean isCellEditable(int row, int column) { return false; }
@@ -44,6 +50,8 @@ final class AgentFrame extends JFrame {
     private final DefaultListModel<AgentConfig.ResourcePackEntry> packModel = new DefaultListModel<>();
     private final java.util.ArrayList<String> historyLocations = new java.util.ArrayList<>();
     private TrayIcon trayIcon;
+    private final AtomicBoolean shuttingDown = new AtomicBoolean();
+    private final AtomicBoolean servicesClosed = new AtomicBoolean();
 
     AgentFrame(Path root, Path configPath, AgentConfig config) {
         super("Litematic GPU Agent");
@@ -52,8 +60,9 @@ final class AgentFrame extends JFrame {
         this.renderer.setLog(this::log);
         this.httpServer = new HttpV1Server(config, renderer, this::log);
         this.cloud = new CloudConnection(config, renderer, this::log);
+        this.bots = new BotManager(root, configPath, config, renderer, this::log);
+        this.web = new WebAdminServer(root, configPath, config, renderer, bots, cloud, this::log);
         this.watchdog = new MemoryWatchdog(config, renderer, renderer.runtime(), root, this::log);
-        this.watchdog.start();
         this.preview = new PreviewPanel(renderer, renderer.runtime(), config,
                 () -> outputDirectory.getText(), this::log, this::showError,
                 path -> {
@@ -61,6 +70,7 @@ final class AgentFrame extends JFrame {
                     if (outputDirectory.getText().isBlank())
                         outputDirectory.setText(path.getParent().resolve("渲染结果").toString());
                 });
+        this.watchdog.start();
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         setMinimumSize(new Dimension(900, 640));
         setSize(1080, 760);
@@ -69,7 +79,7 @@ final class AgentFrame extends JFrame {
         installDropTarget();
         installTray();
         addWindowListener(new WindowAdapter() {
-            @Override public void windowClosing(WindowEvent event) { if (config.minimizeToTray && trayIcon != null) setVisible(false); else shutdown(); }
+            @Override public void windowClosing(WindowEvent event) { confirmWindowClose(); }
         });
         for (var pack : config.resourcePacks) packModel.addElement(pack);
         if (config.outputDirectory != null && !config.outputDirectory.isBlank()) outputDirectory.setText(config.outputDirectory);
@@ -91,7 +101,7 @@ final class AgentFrame extends JFrame {
         if (config.views != null && !config.views.isEmpty()) {
             List<RenderModels.View> loaded = new ArrayList<>();
             for (AgentConfig.ViewEntry entry : config.views) {
-                loaded.add(new RenderModels.View(entry.id(), entry.name(), entry.yaw(), entry.pitch(), entry.zoom(), true, entry.width(), entry.height(), entry.background(), entry.transparentBackground(), entry.supersampling()));
+                loaded.add(new RenderModels.View(entry.id(), entry.name(), entry.yaw(), entry.pitch(), entry.zoom(), entry.autoFillEnabled(), entry.width(), entry.height(), entry.background(), entry.transparentBackground(), entry.supersampling(), entry.brightnessFactor()));
             }
             views.reset(loaded);
         } else if (config.renderWidth > 0 && config.renderHeight > 0) {
@@ -99,8 +109,20 @@ final class AgentFrame extends JFrame {
         }
         new Timer(1000, event -> refreshStatus()).start();
         Thread.startVirtualThread(() -> {
-            try { httpServer.start(); } catch (Exception error) { log("HTTP v1 启动失败：" + error.getMessage()); }
+            // 自动重启交接时旧实例可能还占着端口，最多重试 30 秒
+            for (int attempt = 1; attempt <= 30; attempt++) {
+                try { httpServer.start(); break; }
+                catch (Exception error) {
+                    if (attempt == 30) log("HTTP v1 启动失败（重试 30 秒后放弃）：" + error.getMessage());
+                    else { log("HTTP v1 端口被占用（第 " + attempt + " 次重试）：" + error.getMessage()); try { Thread.sleep(1000); } catch (InterruptedException ignored) { return; } }
+                }
+            }
             cloud.start();
+            bots.start();
+            if (config.webEnabled) {
+                try { web.start(); }
+                catch (Exception error) { log("Web 管理后台启动失败：" + error.getMessage()); }
+            }
         });
     }
 
@@ -108,12 +130,25 @@ final class AgentFrame extends JFrame {
         JPanel rootPanel = new JPanel(new BorderLayout());
         JPanel status = new JPanel(new FlowLayout(FlowLayout.LEFT, 18, 6));
         status.add(runtimeStatus); status.add(cloudStatus); status.add(currentTaskLabel); status.add(memoryStatus); status.add(new JLabel("Minecraft 26.2 / Java 25"));
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+        actions.add(new JLabel("工具版本 " + Main.VERSION));
+        JButton saveReload = new JButton("保存并重载配置");
+        saveReload.setToolTipText("保存当前配置并重载云端与机器人连接");
+        saveReload.addActionListener(e -> saveAndReloadConfiguration());
+        actions.add(saveReload);
         JButton restartApp = new JButton("重启程序");
         restartApp.addActionListener(e -> restartApplication(false));
-        status.add(restartApp);
-        rootPanel.add(status, BorderLayout.NORTH);
+        actions.add(restartApp);
+        JButton exitApp = new JButton("退出程序");
+        exitApp.addActionListener(e -> confirmExit());
+        actions.add(exitApp);
+        JPanel header = new JPanel(new BorderLayout());
+        header.add(status, BorderLayout.WEST);
+        header.add(actions, BorderLayout.EAST);
+        rootPanel.add(header, BorderLayout.NORTH);
         JTabbedPane tabs = new JTabbedPane();
         tabs.addTab("本地渲染", localPanel()); tabs.addTab("预览", preview);
+        tabs.addTab("机器人账号", botPanel());
         tabs.addTab("任务历史", historyPanel());
         tabs.addTab("资源包", resourcePackPanel()); tabs.addTab("连接设置", settingsPanel()); tabs.addTab("日志", logPanel());
         rootPanel.add(tabs, BorderLayout.CENTER);
@@ -125,9 +160,10 @@ final class AgentFrame extends JFrame {
         JPanel files = new JPanel(new GridBagLayout()); GridBagConstraints c = new GridBagConstraints(); c.insets = new Insets(3,3,3,3); c.fill = GridBagConstraints.HORIZONTAL;
         JButton inputOpen = new JButton("打开位置"); inputOpen.addActionListener(e -> openLocation(inputFile.getText()));
         JButton inputHistory = new JButton(); inputHistory.addActionListener(e -> showRecentMenu(inputFile, config.recentProjectionPaths, this::setInputPath));
-        JButton chooseInput = new JButton("选择..."); chooseInput.addActionListener(e -> chooseInput());
+        JButton chooseInput = new JButton("导入投影"); chooseInput.addActionListener(e -> chooseInputFiles());
         JPanel inputButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0)); inputButtons.add(inputOpen); inputButtons.add(chooseInput);
-        c.gridx=0; c.gridy=0; c.weightx=0; files.add(new JLabel("投影文件"), c); c.gridx=1; c.weightx=1; files.add(fieldWithArrow(inputFile, inputHistory),c);
+        projectionDropTargets.add(chooseInput);
+        c.gridx=0; c.gridy=0; c.weightx=0; files.add(new JLabel("当前投影"), c); c.gridx=1; c.weightx=1; files.add(fieldWithArrow(inputFile, inputHistory),c);
         c.gridx=2; c.weightx=0; files.add(inputButtons,c);
         JButton outputOpen = new JButton("打开位置"); outputOpen.addActionListener(e -> openLocation(outputDirectory.getText()));
         JButton outputHistory = new JButton(); outputHistory.addActionListener(e -> showRecentMenu(outputDirectory, config.recentOutputDirectories, this::setOutputPath));
@@ -162,7 +198,86 @@ final class AgentFrame extends JFrame {
         resolutionPanel.add(heightField);
         resolutionPanel.add(applyResolution);
         c.gridx=0; c.gridy=2; files.add(new JLabel("分辨率"),c); c.gridx=1; c.weightx=1; files.add(resolutionPanel,c);
-        panel.add(files, BorderLayout.NORTH);
+
+        JComboBox<String> mergeLayout = new JComboBox<>(new String[] {"横向拼接", "竖向拼接"});
+        mergeLayout.setSelectedIndex("vertical".equalsIgnoreCase(config.cloudMergeLayout) ? 1 : 0);
+        JTextField cacheDir = new JTextField(config.cacheDirectory == null ? "" : config.cacheDirectory, 24);
+        JCheckBox keepProjection = new JCheckBox("保留投影文件", config.cacheKeepProjections);
+        JTextField cacheMaxGb = new JTextField(String.valueOf(Math.max(1, config.cacheMaxBytes / (1024L * 1024 * 1024))), 5);
+        JTextField idleStop = new JTextField(String.valueOf(config.renderIdleStopMillis), 7);
+        JTextField concurrentField = new JTextField(String.valueOf(Math.max(1, config.maxConcurrentRenders)), 4);
+        JTextField memoryGbField = new JTextField(String.valueOf(config.memoryRestartThresholdBytes / (1024L * 1024 * 1024)), 4);
+        JPanel cachePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        cachePanel.add(cacheDir);
+        JButton openCache = new JButton("打开缓存");
+        openCache.addActionListener(e -> {
+            Path dir = cacheDir.getText().isBlank() ? renderer.cacheDirectory() : Path.of(cacheDir.getText().trim());
+            try { Files.createDirectories(dir); new ProcessBuilder("explorer", dir.toAbsolutePath().toString()).start(); }
+            catch (Exception ex) { showError(ex); }
+        });
+        cachePanel.add(openCache); cachePanel.add(keepProjection);
+        JPanel renderSettings = new JPanel(new GridBagLayout());
+        renderSettings.setBorder(BorderFactory.createTitledBorder("本地渲染设置"));
+        GridBagConstraints rc = new GridBagConstraints(); rc.insets = new Insets(3, 6, 3, 6); rc.fill = GridBagConstraints.HORIZONTAL; rc.anchor = GridBagConstraints.WEST;
+        JCheckBox localMerge = new JCheckBox("生成本地拼接图", config.localMergeEnabled);
+        JPanel mergePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        mergePanel.add(localMerge); mergePanel.add(mergeLayout); mergePanel.add(new JLabel("云端/本地方向"));
+        addSetting(renderSettings, rc, 0, "拼接方向", mergePanel);
+        addSetting(renderSettings, rc, 1, "缓存目录", cachePanel);
+        JPanel cacheLimitPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        cacheLimitPanel.add(cacheMaxGb); cacheLimitPanel.add(new JLabel("GB，上限后清理最旧缓存"));
+        addSetting(renderSettings, rc, 2, "缓存容量", cacheLimitPanel);
+        JPanel runtimePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        runtimePanel.add(new JLabel("空闲关闭")); runtimePanel.add(idleStop); runtimePanel.add(new JLabel("毫秒；并行客户端")); runtimePanel.add(concurrentField); runtimePanel.add(new JLabel("个"));
+        addSetting(renderSettings, rc, 3, "运行参数", runtimePanel);
+        JPanel memoryPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        memoryPanel.add(memoryGbField); memoryPanel.add(new JLabel("GB，0 = 关闭内存自动重启"));
+        addSetting(renderSettings, rc, 4, "内存阈值", memoryPanel);
+        JPanel metadataPanel = new JPanel(new GridLayout(0, 2, 8, 2));
+        JCheckBox showProjectionName = new JCheckBox("投影名称", config.showMetadataProjectionName);
+        JCheckBox showAuthor = new JCheckBox("保存者游戏 ID", config.showMetadataAuthor);
+        JCheckBox showCreatedAt = new JCheckBox("创建时间", config.showMetadataCreatedAt);
+        JCheckBox showBlockStats = new JCheckBox("方块数/体积", config.showMetadataBlockStats);
+        JCheckBox showSize = new JCheckBox("尺寸", config.showMetadataSize);
+        JCheckBox showLitematicVersion = new JCheckBox("Litematic 版本", config.showMetadataLitematicVersion);
+        JCheckBox showGameVersion = new JCheckBox("游戏版本", config.showMetadataGameVersion);
+        metadataPanel.add(showProjectionName); metadataPanel.add(showAuthor); metadataPanel.add(showCreatedAt);
+        metadataPanel.add(showBlockStats); metadataPanel.add(showSize); metadataPanel.add(showLitematicVersion);
+        metadataPanel.add(showGameVersion);
+        JComboBox<String> metadataFormat = new JComboBox<>(new String[] {"完整标签版", "精简版（模式2）"});
+        metadataFormat.setSelectedIndex("compact".equalsIgnoreCase(config.metadataFormat) ? 1 : 0);
+        addSetting(renderSettings, rc, 5, "介绍格式", metadataFormat);
+        addSetting(renderSettings, rc, 6, "显示项目", metadataPanel);
+        JButton saveRender = new JButton("保存渲染设置并重启");
+        saveRender.addActionListener(e -> saveRenderSettings(localMerge, mergeLayout, cacheDir, keepProjection,
+                cacheMaxGb, idleStop, concurrentField, memoryGbField, showProjectionName, showAuthor,
+                showCreatedAt, showBlockStats, showSize, showLitematicVersion, showGameVersion, metadataFormat));
+        rc.gridx = 1; rc.gridy = 7; rc.fill = GridBagConstraints.NONE; renderSettings.add(saveRender, rc);
+        JPanel localTop = new JPanel(new BorderLayout(0, 5)); localTop.add(files, BorderLayout.NORTH); localTop.add(renderSettings, BorderLayout.CENTER);
+        panel.add(localTop, BorderLayout.NORTH);
+
+        projectionList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        projectionList.setCellRenderer((list, value, index, selected, focus) -> {
+            JLabel label = new JLabel(value == null ? "" : value.getFileName().toString());
+            label.setToolTipText(value == null ? null : value.toAbsolutePath().toString());
+            label.setOpaque(true); label.setBackground(selected ? list.getSelectionBackground() : list.getBackground());
+            label.setForeground(selected ? list.getSelectionForeground() : list.getForeground());
+            label.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6)); return label;
+        });
+        projectionList.addListSelectionListener(e -> {
+            if (e.getValueIsAdjusting()) return;
+            Path selected = projectionList.getSelectedValue();
+            if (selected != null) selectProjection(selected);
+        });
+        JPanel projectionPanel = new JPanel(new BorderLayout(4, 4)); projectionPanel.setBorder(BorderFactory.createTitledBorder("已导入投影"));
+        projectionPanel.add(new JScrollPane(projectionList), BorderLayout.CENTER);
+        JPanel projectionTools = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
+        JButton importProjection = new JButton("导入投影"); importProjection.addActionListener(e -> chooseInputFiles());
+        projectionDropTargets.add(importProjection);
+        JButton removeProjection = new JButton("移除选中"); removeProjection.addActionListener(e -> removeSelectedProjections());
+        JButton clearProjections = new JButton("清空"); clearProjections.addActionListener(e -> clearImportedProjections());
+        projectionTools.add(importProjection); projectionTools.add(removeProjection); projectionTools.add(clearProjections);
+        projectionPanel.add(projectionTools, BorderLayout.SOUTH);
         viewTable.setFillsViewportHeight(true); viewTable.putClientProperty("terminateEditOnFocusLost", true);
         viewTable.getColumnModel().getColumn(1).setCellRenderer(new javax.swing.table.DefaultTableCellRenderer() {
             private boolean arrow;
@@ -189,7 +304,9 @@ final class AgentFrame extends JFrame {
                 }
             }
         });
-        panel.add(new JScrollPane(viewTable), BorderLayout.CENTER);
+        JSplitPane center = new JSplitPane(JSplitPane.VERTICAL_SPLIT, projectionPanel, new JScrollPane(viewTable));
+        center.setResizeWeight(0.25); center.setDividerLocation(130); center.setBorder(null);
+        panel.add(center, BorderLayout.CENTER);
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
         JButton add = new JButton("添加视角"); add.addActionListener(e -> views.addView());
         JButton remove = new JButton("删除视角"); remove.addActionListener(e -> views.remove(viewTable.getSelectedRow()));
@@ -251,10 +368,8 @@ final class AgentFrame extends JFrame {
     }
 
     private void setInputPath(String path) {
-        inputFile.setText(path);
-        try { preview.fileChanged(Path.of(path)); } catch (Exception ignored) {}
-        addRecent(config.recentProjectionPaths, path);
-        try { config.save(configPath); } catch (Exception ex) { log("保存设置失败：" + ex.getMessage()); }
+        try { importProjectionFiles(List.of(Path.of(path))); }
+        catch (Exception error) { showError(error); }
     }
 
     private void setOutputPath(String path) {
@@ -309,83 +424,505 @@ final class AgentFrame extends JFrame {
 
     private JComponent settingsPanel() {
         JPanel panel = new JPanel(new GridBagLayout()); panel.setBorder(BorderFactory.createEmptyBorder(16,16,16,16));
-        JTextField id = new JTextField(config.agentId,30); JPasswordField secret = new JPasswordField(config.sharedSecret,30);
-        JTextField url = new JTextField(config.cloudWebSocketUrl,30); JCheckBox enabled = new JCheckBox("主动连接云端 Koishi",config.cloudEnabled);
-        JTextField idleStop = new JTextField(String.valueOf(config.renderIdleStopMillis),30);
-        JTextField cacheDir = new JTextField(config.cacheDirectory == null ? "" : config.cacheDirectory, 30);
-        JCheckBox keepProjection = new JCheckBox("保存投影文件到缓存", config.cacheKeepProjections);
-        JTextField cacheMaxGb = new JTextField(String.valueOf(Math.max(1, config.cacheMaxBytes / (1024L * 1024 * 1024))), 6);
-        JTextField concurrentField = new JTextField(String.valueOf(Math.max(1, config.maxConcurrentRenders)), 6);
-        JTextField memoryGbField = new JTextField(String.valueOf(config.memoryRestartThresholdBytes / (1024L * 1024 * 1024)), 6);
-        JCheckBox startup = new JCheckBox("随 Windows 登录启动",config.startWithWindows); JCheckBox tray = new JCheckBox("关闭窗口时最小化到托盘",config.minimizeToTray);
-        GridBagConstraints c=new GridBagConstraints();c.insets=new Insets(6,6,6,6);c.fill=GridBagConstraints.HORIZONTAL;c.anchor=GridBagConstraints.WEST;
-        addSetting(panel,c,0,"Agent ID",id);addSetting(panel,c,1,"共享密钥",secret);addSetting(panel,c,2,"WebSocket 地址",url);addSetting(panel,c,3,"空闲自动关闭(毫秒,0=不关闭)",idleStop);
-        addSetting(panel,c,4,"缓存目录(空=默认)",cacheDir);
-        JButton openCache = new JButton("打开缓存");
-        openCache.addActionListener(e -> {
-            Path dir = renderer.cacheDirectory();
-            try { Files.createDirectories(dir); } catch (Exception ignored) {}
-            try { new ProcessBuilder("explorer", dir.toAbsolutePath().toString()).start(); }
-            catch (Exception ex) { showError(ex); }
-        });
-        JPanel cacheDirPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
-        cacheDirPanel.add(cacheDir); cacheDirPanel.add(openCache);
-        c.gridx=1;c.gridy=4;c.weightx=1;panel.add(cacheDirPanel,c);
-        c.gridx=1;c.gridy=5;panel.add(enabled,c);
-        c.gridx=1;c.gridy=6;panel.add(keepProjection,c);
-        JPanel cacheMaxPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        cacheMaxPanel.add(cacheMaxGb); cacheMaxPanel.add(new JLabel("GB（超出自动清理最旧文件）"));
-        addSetting(panel,c,7,"缓存容量上限",cacheMaxPanel);
-        JPanel concurrentPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        concurrentPanel.add(concurrentField); concurrentPanel.add(new JLabel("个（1-4，同时渲染的 Minecraft 客户端数量，重启后生效）"));
-        addSetting(panel,c,8,"并行渲染数",concurrentPanel);
-        JPanel memoryPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        memoryPanel.add(memoryGbField); memoryPanel.add(new JLabel("GB（工具+渲染端总内存超限后，手头任务完成即自动重启；0=关闭）"));
-        addSetting(panel,c,9,"内存重启阈值",memoryPanel);
-        c.gridx=1;c.gridy=10;panel.add(startup,c);c.gridy=11;panel.add(tray,c);
-        JLabel warning=new JLabel("公网 ws:// 不加密投影内容，建议使用 wss://");warning.setForeground(new Color(170,70,0));c.gridy=12;panel.add(warning,c);
-        JButton save=new JButton("保存设置");save.addActionListener(e->{try{config.agentId=id.getText().trim();config.sharedSecret=new String(secret.getPassword());config.cloudWebSocketUrl=url.getText().trim();config.cloudEnabled=enabled.isSelected();config.renderIdleStopMillis=Math.max(0,Integer.parseInt(idleStop.getText().trim()));config.cacheDirectory=cacheDir.getText().trim();config.cacheKeepProjections=keepProjection.isSelected();config.cacheMaxBytes=Math.max(1,Long.parseLong(cacheMaxGb.getText().trim()))*1024L*1024*1024;config.maxConcurrentRenders=Math.max(1,Math.min(4,Integer.parseInt(concurrentField.getText().trim())));config.memoryRestartThresholdBytes=Math.max(0,Long.parseLong(memoryGbField.getText().trim()))*1024L*1024*1024;config.startWithWindows=startup.isSelected();config.minimizeToTray=tray.isSelected();config.save(configPath);StartupManager.setEnabled(config.startWithWindows);JOptionPane.showMessageDialog(this,"设置已保存。并行渲染数与网络设置重启 Agent 后生效，内存阈值立即生效。", "保存成功",JOptionPane.INFORMATION_MESSAGE);}catch(Exception ex){showError(ex);}});c.gridy=13;c.fill=GridBagConstraints.NONE;panel.add(save,c);
-        JButton saveRestart=new JButton("保存并重启");saveRestart.addActionListener(e->{save.doClick();restartApplication(false);});c.gridx=2;c.gridy=13;panel.add(saveRestart,c);
+         JTextField id = new JTextField(config.agentId,30); JPasswordField secret = new JPasswordField(config.sharedSecret,30);
+          JTextField url = new JTextField(config.cloudWebSocketUrl,30); JCheckBox enabled = new JCheckBox("主动连接云端 Koishi",config.cloudEnabled);
+          JCheckBox startup = new JCheckBox("随 Windows 登录启动",config.startWithWindows); JCheckBox tray = new JCheckBox("关闭窗口时最小化到托盘",config.minimizeToTray);
+          JTextField webUsername = new JTextField(config.webUsername,30);
+          JTextField maxFileSizeKb = new JTextField(String.valueOf(config.maxFileSizeKb),10);
+          JTextField privateMaxFileSizeKb = new JTextField(String.valueOf(config.privateMaxFileSizeKb),10);
+          JPasswordField newWebPassword = new JPasswordField(30); JPasswordField newWebPasswordAgain = new JPasswordField(30);
+         GridBagConstraints c=new GridBagConstraints();c.insets=new Insets(6,6,6,6);c.fill=GridBagConstraints.HORIZONTAL;c.anchor=GridBagConstraints.WEST;
+         addSetting(panel,c,0,"Agent ID",id);addSetting(panel,c,1,"共享密钥",secret);addSetting(panel,c,2,"WebSocket 地址",url);
+         JCheckBox webEnabled = new JCheckBox("启用 Web 管理后台", config.webEnabled);
+         JTextField webBindHost = new JTextField(config.webBindHost, 30);
+         JTextField webPort = new JTextField(String.valueOf(config.webPort), 8);
+          addSetting(panel,c,3,"Web 监听地址",webBindHost);addSetting(panel,c,4,"Web 监听端口",webPort);
+          addSetting(panel,c,5,"Web 登录用户名",webUsername);
+          addSetting(panel,c,6,"全局群文件上限 KB",maxFileSizeKb);
+          addSetting(panel,c,7,"全局私聊文件上限 KB",privateMaxFileSizeKb);
+          addSetting(panel,c,8,"新 Web 密码",newWebPassword);addSetting(panel,c,9,"确认新密码",newWebPasswordAgain);
+          c.gridx=1;c.gridy=10;panel.add(webEnabled,c);
+          c.gridx=1;c.gridy=11;panel.add(enabled,c);
+          c.gridx=1;c.gridy=12;panel.add(startup,c);c.gridy=13;panel.add(tray,c);
+          JLabel warning=new JLabel("密码可使用字母、数字和符号；留空保持不变。启用 Web 后可访问 http://监听地址:端口/");warning.setForeground(new Color(170,70,0));c.gridy=14;panel.add(warning,c);
+         JButton save=new JButton("保存连接设置");save.addActionListener(e->{try{
+              boolean oldWebEnabled = config.webEnabled;
+              String oldWebBindHost = config.webBindHost;
+              int oldWebPort = config.webPort;
+              String oldWebUsername = config.webUsername;
+             int newWebPort = Integer.parseInt(webPort.getText().trim());
+             if (newWebPort < 1 || newWebPort > 65535) throw new IllegalArgumentException("Web 端口必须为 1-65535");
+             String newUsername = webUsername.getText().trim();
+             if (newUsername.isBlank()) throw new IllegalArgumentException("Web 登录用户名不能为空");
+             long newMaxFileSizeKb = Long.parseLong(maxFileSizeKb.getText().trim());
+             long newPrivateMaxFileSizeKb = Long.parseLong(privateMaxFileSizeKb.getText().trim());
+             if (newMaxFileSizeKb < 1 || newPrivateMaxFileSizeKb < 1) throw new IllegalArgumentException("文件大小上限必须为正整数 KB");
+             String password = new String(newWebPassword.getPassword());
+             String passwordAgain = new String(newWebPasswordAgain.getPassword());
+             if (!password.isBlank() || !passwordAgain.isBlank()) {
+                 if (password.isBlank() || !password.equals(passwordAgain)) throw new IllegalArgumentException("两次新 Web 密码必须一致且不能为空");
+                 config.webPassword = password;
+                 config.webPasswordChangeNotice = false;
+             }
+             boolean cloudChanged = config.cloudEnabled != enabled.isSelected()
+                     || !java.util.Objects.equals(config.cloudWebSocketUrl, url.getText().trim())
+                     || !java.util.Objects.equals(config.agentId, id.getText().trim())
+                     || !java.util.Objects.equals(config.sharedSecret, new String(secret.getPassword()));
+             config.agentId=id.getText().trim();config.sharedSecret=new String(secret.getPassword());config.cloudWebSocketUrl=url.getText().trim();config.cloudEnabled=enabled.isSelected();
+             config.webEnabled=webEnabled.isSelected();config.webBindHost=webBindHost.getText().trim().isBlank()?"0.0.0.0":webBindHost.getText().trim();config.webPort=newWebPort;
+             config.webUsername = newUsername;
+             config.maxFileSizeKb = newMaxFileSizeKb;
+             config.privateMaxFileSizeKb = newPrivateMaxFileSizeKb;
+             config.startWithWindows=startup.isSelected();config.minimizeToTray=tray.isSelected();config.save(configPath);StartupManager.setEnabled(config.startWithWindows);
+              if (!password.isBlank() || !java.util.Objects.equals(oldWebUsername, config.webUsername)) {
+                  try { Files.writeString(configPath.resolveSibling("web-credentials.txt"), "用户名：" + config.webUsername + "\n密码：" + config.webPassword + "\n"); }
+                  catch (Exception error) { log("保存 Web 凭据提示文件失败：" + error.getMessage()); }
+              }
+              newWebPassword.setText(""); newWebPasswordAgain.setText("");
+             boolean endpointChanged = !java.util.Objects.equals(oldWebBindHost, config.webBindHost) || oldWebPort != config.webPort;
+              if (cloudChanged) cloud.reload();
+              if (!oldWebEnabled && config.webEnabled) web.start();
+             else if (oldWebEnabled && !config.webEnabled) web.close();
+             String message = endpointChanged && oldWebEnabled && config.webEnabled ? "连接设置已保存，Web 监听地址或端口需要重启后生效。" : "连接设置已保存。";
+             JOptionPane.showMessageDialog(this,message, "保存成功",JOptionPane.INFORMATION_MESSAGE);
+          }catch(Exception ex){showError(ex);}});c.gridy=15;c.fill=GridBagConstraints.NONE;panel.add(save,c);
+          JButton saveRestart=new JButton("保存并重启");saveRestart.addActionListener(e->{save.doClick();restartApplication(false);});c.gridx=2;c.gridy=15;panel.add(saveRestart,c);
         return new JScrollPane(panel);
     }
 
-    private static void addSetting(JPanel panel, GridBagConstraints c, int row, String name, JComponent field) { c.gridy=row;c.gridx=0;c.weightx=0;panel.add(new JLabel(name),c);c.gridx=1;c.weightx=1;panel.add(field,c); }
-    private JComponent logPanel() { logs.setEditable(false); logs.setFont(new Font(Font.MONOSPACED,Font.PLAIN,12)); return new JScrollPane(logs); }
+    private JComponent botPanel() {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        DefaultListModel<AgentConfig.BotProfile> model = new DefaultListModel<>();
+        if (config.botProfiles != null) for (AgentConfig.BotProfile profile : config.botProfiles) if (profile != null) model.addElement(profile);
+        JList<AgentConfig.BotProfile> list = new JList<>(model);
+        list.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        list.setCellRenderer((component, value, index, selected, focus) -> {
+            String name = value == null || value.name == null ? "机器人账号" : value.name;
+            String type = value != null && "onebot".equalsIgnoreCase(value.type) ? "OneBot" : "官方 QQ";
+            JLabel label = new JLabel((value != null && value.enabled ? "[启用] " : "[停用] ") + name + "（" + type + "）");
+            label.setOpaque(true);
+            label.setBackground(selected ? component.getSelectionBackground() : component.getBackground());
+            label.setForeground(selected ? component.getSelectionForeground() : component.getForeground());
+            label.setBorder(BorderFactory.createEmptyBorder(5, 6, 5, 6));
+            return label;
+        });
+        JPanel listPanel = new JPanel(new BorderLayout(5, 5));
+        listPanel.add(new JScrollPane(list), BorderLayout.CENTER);
+        JPanel listButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        JButton addOfficial = new JButton("添加官方 QQ");
+        JButton addOneBot = new JButton("添加 OneBot");
+        JButton remove = new JButton("删除");
+        listButtons.add(addOfficial); listButtons.add(addOneBot); listButtons.add(remove);
+        listPanel.add(listButtons, BorderLayout.SOUTH);
+        listPanel.setPreferredSize(new Dimension(270, 0));
 
-    private void chooseInput(){Path chosen=NativeFilePicker.chooseFile("选择投影文件","Litematica 投影","*.litematic");if(chosen!=null){inputFile.setText(chosen.toString());preview.fileChanged(chosen);addRecent(config.recentProjectionPaths,chosen.toString());try{config.save(configPath);}catch(Exception ignored){}}}
+        JTextField name = new JTextField(); JCheckBox enabled = new JCheckBox("启用账号");
+        JComboBox<String> type = new JComboBox<>(new String[] {"官方 QQ", "OneBot / NekoBot"});
+        JTextField appId = new JTextField(); JPasswordField appSecret = new JPasswordField();
+        JCheckBox sandbox = new JCheckBox("沙箱环境"); JTextField intents = new JTextField();
+        JComboBox<String> groupMode = new JComboBox<>(new String[] {"接收群文件自动识别", "仅被 @ 时识别", "都可以（文件或 @）"});
+        JTextField groupLimit = new JTextField(); JTextField privateLimit = new JTextField();
+        JCheckBox allowPrivate = new JCheckBox("允许单人对话渲染");
+        JComboBox<String> transport = new JComboBox<>(new String[] {"正向 WebSocket", "反向 WebSocket"});
+        JTextField webSocketUrl = new JTextField(); JPasswordField accessToken = new JPasswordField();
+        JTextField listenHost = new JTextField(); JTextField listenPort = new JTextField(); JTextField path = new JTextField();
+        JComboBox<String> sendMode = new JComboBox<>(new String[] {"联合发送", "合并转发"});
+        JCheckBox replyAndMention = new JCheckBox("引用原消息并 @ 发送者");
+        JCheckBox showViewTitles = new JCheckBox("显示视角标题"); JCheckBox successNotice = new JCheckBox("发送渲染成功提示");
+        JCheckBox whitelistEnabled = new JCheckBox("启用群白名单"); JCheckBox blacklistEnabled = new JCheckBox("启用群黑名单");
+        JTextArea whitelist = new JTextArea(3, 20); JTextArea blacklist = new JTextArea(3, 20);
+
+        JPanel form = new JPanel(new GridBagLayout());
+        GridBagConstraints c = new GridBagConstraints(); c.insets = new Insets(4, 6, 4, 6); c.fill = GridBagConstraints.HORIZONTAL; c.anchor = GridBagConstraints.WEST;
+        addSetting(form, c, 0, "账号名称", name); c.gridx = 1; c.gridy = 1; form.add(enabled, c);
+        addSetting(form, c, 2, "账号类型", type); addSetting(form, c, 3, "群消息模式", groupMode);
+
+        JPanel official = new JPanel(new GridBagLayout()); GridBagConstraints oc = new GridBagConstraints(); oc.insets = new Insets(2, 2, 2, 2); oc.fill = GridBagConstraints.HORIZONTAL;
+        addSetting(official, oc, 0, "AppID", appId); addSetting(official, oc, 1, "AppSecret", appSecret);
+        oc.gridx = 1; oc.gridy = 2; official.add(sandbox, oc); addSetting(official, oc, 3, "事件意图", intents);
+        addSetting(form, c, 4, "官方 QQ", official);
+
+        JPanel onebot = new JPanel(new GridBagLayout()); GridBagConstraints nc = new GridBagConstraints(); nc.insets = new Insets(2, 2, 2, 2); nc.fill = GridBagConstraints.HORIZONTAL;
+        addSetting(onebot, nc, 0, "连接方式", transport); addSetting(onebot, nc, 1, "WebSocket 地址", webSocketUrl);
+        addSetting(onebot, nc, 2, "Token", accessToken); addSetting(onebot, nc, 3, "监听地址", listenHost);
+        addSetting(onebot, nc, 4, "监听端口", listenPort); addSetting(onebot, nc, 5, "反向路径", path);
+        addSetting(form, c, 5, "OneBot / NekoBot", onebot);
+
+        JPanel limits = new JPanel(new GridLayout(1, 2, 8, 0));
+        limits.add(labeledField("群文件上限 KB（0 跟随全局）", groupLimit));
+        limits.add(labeledField("私聊文件上限 KB（0 跟随全局）", privateLimit));
+        addSetting(form, c, 6, "文件大小", limits);
+        JPanel send = new JPanel(new GridLayout(0, 2, 8, 2));
+        send.add(allowPrivate); send.add(replyAndMention); send.add(showViewTitles); send.add(successNotice);
+        send.add(new JLabel("发送模式")); send.add(sendMode); send.add(whitelistEnabled); send.add(blacklistEnabled);
+        addSetting(form, c, 7, "发送与权限", send);
+        JPanel lists = new JPanel(new GridLayout(1, 2, 8, 0));
+        lists.add(labeledArea("群白名单（每行一个）", whitelist)); lists.add(labeledArea("群黑名单（每行一个）", blacklist));
+        addSetting(form, c, 8, "群名单", lists);
+        JButton save = new JButton("保存账号并重连"); JLabel message = new JLabel(" ");
+        JPanel savePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0)); savePanel.add(save); savePanel.add(message);
+        addSetting(form, c, 9, "", savePanel);
+
+        Runnable load = () -> {
+            AgentConfig.BotProfile profile = list.getSelectedValue();
+            boolean has = profile != null;
+            name.setEnabled(has); enabled.setEnabled(has); type.setEnabled(has); groupMode.setEnabled(has);
+            appId.setEnabled(has); appSecret.setEnabled(has); sandbox.setEnabled(has); intents.setEnabled(has);
+            transport.setEnabled(has); webSocketUrl.setEnabled(has); accessToken.setEnabled(has); listenHost.setEnabled(has); listenPort.setEnabled(has); path.setEnabled(has);
+            groupLimit.setEnabled(has); privateLimit.setEnabled(has); allowPrivate.setEnabled(has); sendMode.setEnabled(has); replyAndMention.setEnabled(has); showViewTitles.setEnabled(has); successNotice.setEnabled(has); whitelistEnabled.setEnabled(has); blacklistEnabled.setEnabled(has); whitelist.setEnabled(has); blacklist.setEnabled(has);
+            if (!has) return;
+            name.setText(profile.name); enabled.setSelected(profile.enabled); type.setSelectedIndex("onebot".equalsIgnoreCase(profile.type) ? 1 : 0);
+            groupMode.setSelectedIndex("mentiononly".equalsIgnoreCase(profile.groupMessageMode) ? 1 : "any".equalsIgnoreCase(profile.groupMessageMode) ? 2 : 0); appId.setText(profile.appId); appSecret.setText(profile.appSecret); sandbox.setSelected(profile.sandbox); intents.setText(String.valueOf(profile.intents));
+            transport.setSelectedIndex("reverse".equalsIgnoreCase(profile.transport) ? 1 : 0); webSocketUrl.setText(profile.webSocketUrl); accessToken.setText(profile.accessToken); listenHost.setText(profile.listenHost); listenPort.setText(String.valueOf(profile.listenPort)); path.setText(profile.path);
+            groupLimit.setText(String.valueOf(profile.maxFileSizeKb)); privateLimit.setText(String.valueOf(profile.privateMaxFileSizeKb)); allowPrivate.setSelected(profile.allowPrivateRender); sendMode.setSelectedIndex("forward".equalsIgnoreCase(profile.sendMode) ? 1 : 0); replyAndMention.setSelected(profile.replyAndMention); showViewTitles.setSelected(profile.showViewTitles); successNotice.setSelected(profile.successNotice);
+            whitelistEnabled.setSelected(profile.groupWhitelistEnabled); blacklistEnabled.setSelected(profile.groupBlacklistEnabled); whitelist.setText(String.join(System.lineSeparator(), profile.groupWhitelist)); blacklist.setText(String.join(System.lineSeparator(), profile.groupBlacklist));
+            message.setText(" ");
+        };
+        list.addListSelectionListener(event -> { if (!event.getValueIsAdjusting()) load.run(); });
+        Runnable add = () -> { AgentConfig.BotProfile profile = new AgentConfig.BotProfile(); profile.id = "bot-" + UUID.randomUUID(); profile.type = "official"; profile.name = "官方 QQ 账号"; profile.normalize(); model.addElement(profile); list.setSelectedIndex(model.size() - 1); };
+        addOfficial.addActionListener(event -> add.run());
+        addOneBot.addActionListener(event -> { AgentConfig.BotProfile profile = new AgentConfig.BotProfile(); profile.id = "bot-" + UUID.randomUUID(); profile.type = "onebot"; profile.name = "OneBot 账号"; profile.normalize(); model.addElement(profile); list.setSelectedIndex(model.size() - 1); });
+        remove.addActionListener(event -> { int index = list.getSelectedIndex(); if (index >= 0) { model.remove(index); if (!model.isEmpty()) list.setSelectedIndex(Math.min(index, model.size() - 1)); else load.run(); } });
+        save.addActionListener(event -> {
+            AgentConfig.BotProfile profile = list.getSelectedValue();
+            if (profile == null) { message.setText("请先选择账号"); return; }
+            try {
+                profile.name = name.getText().trim(); profile.enabled = enabled.isSelected(); profile.type = type.getSelectedIndex() == 1 ? "onebot" : "official"; profile.groupMessageMode = switch (groupMode.getSelectedIndex()) { case 1 -> "mentionOnly"; case 2 -> "any"; default -> "received"; };
+                profile.appId = appId.getText().trim(); profile.appSecret = new String(appSecret.getPassword()); profile.sandbox = sandbox.isSelected(); profile.intents = Long.parseLong(intents.getText().trim());
+                profile.transport = transport.getSelectedIndex() == 1 ? "reverse" : "forward"; profile.webSocketUrl = webSocketUrl.getText().trim(); profile.accessToken = new String(accessToken.getPassword()); profile.listenHost = listenHost.getText().trim(); profile.listenPort = Integer.parseInt(listenPort.getText().trim()); profile.path = path.getText().trim();
+                profile.maxFileSizeKb = Long.parseLong(groupLimit.getText().trim()); profile.privateMaxFileSizeKb = Long.parseLong(privateLimit.getText().trim());
+                profile.allowPrivateRender = allowPrivate.isSelected(); profile.sendMode = sendMode.getSelectedIndex() == 1 ? "forward" : "combined"; profile.replyAndMention = replyAndMention.isSelected(); profile.showViewTitles = showViewTitles.isSelected(); profile.successNotice = successNotice.isSelected(); profile.groupWhitelistEnabled = whitelistEnabled.isSelected(); profile.groupBlacklistEnabled = blacklistEnabled.isSelected(); profile.groupWhitelist = textLines(whitelist.getText()); profile.groupBlacklist = textLines(blacklist.getText()); profile.normalize();
+                config.botProfiles = java.util.Collections.list(model.elements()); config.save(configPath); bots.reload(); list.repaint(); message.setText("已保存并重连");
+            } catch (Exception error) { message.setText("保存失败：" + error.getMessage()); }
+        });
+        type.addActionListener(event -> { boolean officialSelected = type.getSelectedIndex() == 0; official.setVisible(officialSelected); onebot.setVisible(!officialSelected); form.revalidate(); form.repaint(); });
+        boolean initialOfficial = type.getSelectedIndex() == 0;
+        official.setVisible(initialOfficial);
+        onebot.setVisible(!initialOfficial);
+        if (!model.isEmpty()) list.setSelectedIndex(0); else load.run();
+        panel.add(listPanel, BorderLayout.WEST); panel.add(new JScrollPane(form), BorderLayout.CENTER);
+        return panel;
+    }
+
+    private static JPanel labeledField(String title, JComponent field) { JPanel panel = new JPanel(new BorderLayout(3, 2)); panel.add(new JLabel(title), BorderLayout.NORTH); panel.add(field, BorderLayout.CENTER); return panel; }
+    private static JPanel labeledArea(String title, JTextArea area) { JPanel panel = new JPanel(new BorderLayout(3, 2)); panel.add(new JLabel(title), BorderLayout.NORTH); panel.add(new JScrollPane(area), BorderLayout.CENTER); return panel; }
+    private static List<String> textLines(String value) { return java.util.Arrays.stream((value == null ? "" : value).split("\\r?\\n")).map(String::trim).filter(item -> !item.isBlank()).toList(); }
+
+    private static void addSetting(JPanel panel, GridBagConstraints c, int row, String name, JComponent field) { c.gridy=row;c.gridx=0;c.weightx=0;panel.add(new JLabel(name),c);c.gridx=1;c.weightx=1;panel.add(field,c); }
+    private JComponent logPanel() {
+        logs.setEditable(false); logs.setFont(new Font(Font.MONOSPACED,Font.PLAIN,12));
+        JPanel panel = new JPanel(new BorderLayout(6,6));
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+        JButton export = new JButton("导出日志（诊断包）");
+        export.addActionListener(e -> exportLogs());
+        JButton openFolder = new JButton("打开日志文件夹");
+        openFolder.addActionListener(e -> {
+            try { Files.createDirectories(logFile().getParent()); new ProcessBuilder("explorer", logFile().getParent().toAbsolutePath().toString()).start(); }
+            catch (Exception ex) { showError(ex); }
+        });
+        buttons.add(export); buttons.add(openFolder);
+        buttons.add(new JLabel("日志同时自动写入 agent-gui.log，可跨设备排查"));
+        panel.add(buttons, BorderLayout.NORTH);
+        panel.add(new JScrollPane(logs), BorderLayout.CENTER);
+        return panel;
+    }
+
+    private Path logFile() { return root.resolve("agent-gui.log"); }
+
+    /** GUI 日志同步落盘（agent-gui.log，超过 2MB 轮转为 .old），保证重启/崩溃前的记录可查。 */
+    private void persistLog(String line) {
+        try {
+            Path file = logFile();
+            Files.createDirectories(file.getParent());
+            if (Files.exists(file) && Files.size(file) > 2L * 1024 * 1024) {
+                Path old = file.resolveSibling("agent-gui.log.old");
+                Files.move(file, old, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            Files.writeString(file, LocalDateTime.now() + "  " + line + System.lineSeparator(),
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (Exception ignored) {}
+    }
+
+    /** 打包跨设备诊断材料：GUI 日志、调试日志、运行时日志、配置（密钥脱敏）。 */
+    private void exportLogs() {
+        javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
+        chooser.setDialogTitle("导出诊断日志包");
+        chooser.setSelectedFile(new java.io.File("litematic-agent-logs-"
+                + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")) + ".zip"));
+        if (chooser.showSaveDialog(this) != javax.swing.JFileChooser.APPROVE_OPTION) return;
+        Path target = chooser.getSelectedFile().toPath().toAbsolutePath();
+        Thread.startVirtualThread(() -> {
+            try (java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(Files.newOutputStream(target))) {
+                List<Path> files = new ArrayList<>();
+                files.add(logFile());
+                files.add(logFile().resolveSibling("agent-gui.log.old"));
+                files.add(root.resolve("send-debug.log"));
+                files.add(root.resolve("cache-debug.log"));
+                files.add(root.resolve("restart-guard.json"));
+                files.add(configPath);
+                files.add(root.resolve("runtime/launch-diagnostics.txt"));
+                files.add(root.resolve("runtime/minecraft-runtime.log"));
+                files.add(root.resolve("runtime/minecraft-runtime-2.log"));
+                files.add(root.resolve("runtime/minecraft-runtime-3.log"));
+                for (Path file : files) {
+                    if (file == null || !Files.isRegularFile(file)) continue;
+                    byte[] bytes = Files.readAllBytes(file);
+                    if (file.equals(configPath)) bytes = redactSecrets(bytes);
+                    zip.putNextEntry(new java.util.zip.ZipEntry(file.getFileName().toString()));
+                    zip.write(bytes);
+                    zip.closeEntry();
+                }
+                zip.finish();
+                SwingUtilities.invokeLater(() -> log("诊断日志包已导出：" + target));
+            } catch (Throwable error) {
+                SwingUtilities.invokeLater(() -> showError(error));
+            }
+        });
+    }
+
+    /** 配置文件进诊断包前脱敏：共享密钥与连接地址保留结构但遮住值。 */
+    private static byte[] redactSecrets(byte[] configBytes) {
+        try {
+            String text = new String(configBytes, java.nio.charset.StandardCharsets.UTF_8);
+            String redacted = text
+                    .replaceAll("(\"sharedSecret\"\\s*:\\s*\")[^\"]*(\")", "$1<已脱敏>$2")
+                    .replaceAll("(\"cloudWebSocketUrl\"\\s*:\\s*\")[^\"]*(\")", "$1<已脱敏>$2");
+            return redacted.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception ignored) {
+            return "<脱敏失败，已省略>".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
+    private void chooseInputFiles() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("导入投影");
+        chooser.setMultiSelectionEnabled(true);
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Litematica 投影 (*.litematic)", "litematic"));
+        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            java.io.File[] selected = chooser.getSelectedFiles();
+            if (selected.length == 0 && chooser.getSelectedFile() != null) selected = new java.io.File[] {chooser.getSelectedFile()};
+            importProjectionFiles(java.util.Arrays.stream(selected).map(java.io.File::toPath).toList());
+        }
+    }
+
+    private void importProjectionFiles(List<Path> files) {
+        Path first = null;
+        for (Path value : files) {
+            if (value == null) continue;
+            Path path = value.toAbsolutePath().normalize();
+            if (!Files.isRegularFile(path) || !path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".litematic")) continue;
+            boolean exists = false;
+            for (int i = 0; i < projectionModel.size(); i++) if (projectionModel.get(i).equals(path)) { exists = true; break; }
+            if (!exists) projectionModel.addElement(path);
+            if (first == null) first = path;
+            addRecent(config.recentProjectionPaths, path.toString());
+        }
+        if (first != null) selectProjection(first);
+        try { config.save(configPath); } catch (Exception error) { log("保存投影列表失败：" + error.getMessage()); }
+    }
+
+    private void selectProjection(Path path) {
+        inputFile.setText(path.toString());
+        if (outputDirectory.getText().isBlank() && path.getParent() != null) outputDirectory.setText(path.getParent().resolve("渲染结果").toString());
+        try { preview.fileChanged(path); } catch (Exception ignored) {}
+        for (int i = 0; i < projectionModel.size(); i++) {
+            if (projectionModel.get(i).equals(path)) { projectionList.setSelectedIndex(i); break; }
+        }
+    }
+
+    private void removeSelectedProjections() {
+        int[] selected = projectionList.getSelectedIndices();
+        for (int i = selected.length - 1; i >= 0; i--) projectionModel.remove(selected[i]);
+        if (projectionModel.isEmpty()) inputFile.setText("");
+        else selectProjection(projectionModel.get(Math.min(selected.length == 0 ? 0 : selected[0], projectionModel.size() - 1)));
+        try { config.save(configPath); } catch (Exception error) { log("保存投影列表失败：" + error.getMessage()); }
+    }
+
+    private void clearImportedProjections() {
+        projectionModel.clear(); inputFile.setText("");
+        try { config.save(configPath); } catch (Exception error) { log("保存投影列表失败：" + error.getMessage()); }
+    }
+
+    private void saveRenderSettings(JCheckBox localMerge,
+                                    JComboBox<String> mergeLayout,
+                                    JTextField cacheDir, JCheckBox keepProjection, JTextField cacheMaxGb,
+                                    JTextField idleStop, JTextField concurrentField, JTextField memoryGbField,
+                                    JCheckBox showProjectionName, JCheckBox showAuthor, JCheckBox showCreatedAt,
+                                    JCheckBox showBlockStats, JCheckBox showSize, JCheckBox showLitematicVersion,
+                                    JCheckBox showGameVersion, JComboBox<String> metadataFormat) {
+        try {
+            config.localMergeEnabled = localMerge.isSelected();
+            config.cloudMergeLayout = mergeLayout.getSelectedIndex() == 1 ? "vertical" : "horizontal";
+            config.cacheDirectory = cacheDir.getText().trim();
+            config.cacheKeepProjections = keepProjection.isSelected();
+            config.cacheMaxBytes = Math.max(1, Long.parseLong(cacheMaxGb.getText().trim())) * 1024L * 1024 * 1024;
+            config.renderIdleStopMillis = Math.max(0, Integer.parseInt(idleStop.getText().trim()));
+            config.maxConcurrentRenders = Math.max(1, Math.min(4, Integer.parseInt(concurrentField.getText().trim())));
+            config.memoryRestartThresholdBytes = Math.max(0, Long.parseLong(memoryGbField.getText().trim())) * 1024L * 1024 * 1024;
+            config.showMetadataProjectionName = showProjectionName.isSelected();
+            config.showMetadataAuthor = showAuthor.isSelected();
+            config.showMetadataCreatedAt = showCreatedAt.isSelected();
+            config.showMetadataBlockStats = showBlockStats.isSelected();
+            config.showMetadataSize = showSize.isSelected();
+            config.showMetadataLitematicVersion = showLitematicVersion.isSelected();
+            config.showMetadataGameVersion = showGameVersion.isSelected();
+            config.metadataFormat = metadataFormat.getSelectedIndex() == 1 ? "compact" : "full";
+            config.save(configPath);
+            log("本地渲染设置已保存，正在重启 Agent 使缓存目录、并行客户端和拼接设置生效");
+            restartApplication(false);
+        } catch (Exception error) { showError(error); }
+    }
+
     private void chooseOutput(){JFileChooser f=new JFileChooser();f.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);if(f.showOpenDialog(this)==JFileChooser.APPROVE_OPTION){String chosen=f.getSelectedFile().getAbsolutePath();outputDirectory.setText(chosen);persistOutputDirectory(chosen);}}
-    private void renderLocal(JButton button){Path input=Path.of(inputFile.getText());Path base=outputDirectory.getText().isBlank()?input.getParent().resolve("渲染结果"):Path.of(outputDirectory.getText());Path output=base.resolve(renderFolderName(input.getFileName().toString()));button.setEnabled(false);Thread.startVirtualThread(()->{try{byte[] bytes=Files.readAllBytes(input);var request=new RenderModels.Request(2,UUID.randomUUID().toString(),input.getFileName().toString(),views.values(),null);var result=renderer.submit(request,bytes,Duration.ofMillis(config.renderTimeoutMillis),"本地",output.toString()).join();Files.createDirectories(output);for(var image:result.images())Files.copy(image.path(),output.resolve(image.name()),StandardCopyOption.REPLACE_EXISTING);config.outputDirectory=base.toString();addRecent(config.recentOutputDirectories,base.toString());try{config.save(configPath);}catch(Exception ignored){}log("本地渲染完成："+output);}catch(Throwable error){Throwable cause=error.getCause()==null?error:error.getCause();SwingUtilities.invokeLater(()->showError(cause));}finally{SwingUtilities.invokeLater(()->button.setEnabled(true));}});}
+    private void renderLocal(JButton button) {
+        if (viewTable.isEditing()) viewTable.getCellEditor().stopCellEditing();
+        List<Path> inputs = new ArrayList<>();
+        for (int i = 0; i < projectionModel.size(); i++) inputs.add(projectionModel.get(i));
+        if (inputs.isEmpty() && !inputFile.getText().isBlank()) inputs.add(Path.of(inputFile.getText().trim()));
+        if (inputs.isEmpty()) { showError(new RuntimeException("请先点击“导入投影”或拖入 .litematic 文件")); return; }
+        List<RenderModels.View> renderViews = views.values();
+        if (renderViews.isEmpty()) { showError(new RuntimeException("至少需要一个视角")); return; }
+        String configuredOutput = outputDirectory.getText().trim();
+        button.setEnabled(false);
+        Thread.startVirtualThread(() -> {
+            List<String> failures = new ArrayList<>(); int completed = 0;
+            for (Path input : inputs) {
+                try {
+                    if (!Files.isRegularFile(input)) throw new java.io.IOException("文件不存在");
+                    Path base = configuredOutput.isBlank()
+                            ? (input.getParent() == null ? root.resolve("渲染结果") : input.getParent().resolve("渲染结果"))
+                            : Path.of(configuredOutput);
+                    Path output = base.resolve(renderFolderName(input.getFileName().toString()));
+                    byte[] bytes = Files.readAllBytes(input);
+                    var request = new RenderModels.Request(2, UUID.randomUUID().toString(), input.getFileName().toString(), renderViews, null);
+                    var result = renderer.submit(request, bytes, Duration.ofMillis(config.renderTimeoutMillis), "本地", output.toString()).join();
+                    Files.createDirectories(output);
+                    for (var image : result.images()) Files.copy(image.path(), output.resolve(image.name()), StandardCopyOption.REPLACE_EXISTING);
+                    if (config.localMergeEnabled && result.images().size() > 1) {
+                        CloudConnection.MergedPng merged = CloudConnection.mergeImages(result.images(), renderViews.getFirst(), config.cloudMergeLayout);
+                        if (merged != null) Files.write(output.resolve("merged.png"), merged.bytes());
+                    }
+                    config.outputDirectory = base.toString(); addRecent(config.recentOutputDirectories, base.toString());
+                    completed++; log("本地渲染完成：" + input.getFileName() + " -> " + output);
+                } catch (Throwable error) {
+                    Throwable cause = error.getCause() == null ? error : error.getCause();
+                    failures.add(input.getFileName() + "：" + cause.getMessage()); log("本地渲染失败：" + input.getFileName() + "，" + cause.getMessage());
+                }
+            }
+            try { config.save(configPath); } catch (Exception error) { log("保存输出目录失败：" + error.getMessage()); }
+            int completedCount = completed;
+            SwingUtilities.invokeLater(() -> {
+                button.setEnabled(true);
+                if (!failures.isEmpty()) showError(new RuntimeException("完成 " + completedCount + " 个，失败 " + failures.size() + " 个：\n" + String.join("\n", failures)));
+            });
+        });
+    }
     static String renderFolderName(String fileName){String stem=fileName.endsWith(".litematic")?fileName.substring(0,fileName.length()-".litematic".length()):fileName;return stem+"-"+java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"));}
     /** 材质包列表任何改动立即持久化到配置。 */
     private void syncResourcePacks(){List<AgentConfig.ResourcePackEntry> entries=new ArrayList<>();for(int i=0;i<packModel.size();i++)entries.add(packModel.get(i));config.resourcePacks=entries;try{config.save(configPath);}catch(Exception ex){log("保存设置失败："+ex.getMessage());}}
 
     /** 视角列表任何改动立即持久化到配置。 */
-    private void syncViews(){List<AgentConfig.ViewEntry> entries=new ArrayList<>();for(var v:views.values())entries.add(new AgentConfig.ViewEntry(v.id(),v.name(),v.yaw(),v.pitch(),v.zoom(),v.width(),v.height(),v.supersampling(),v.background(),v.transparentBackground()));config.views=entries;try{config.save(configPath);}catch(Exception ex){log("保存视角失败："+ex.getMessage());}}
+    private void syncViews(){List<AgentConfig.ViewEntry> entries=new ArrayList<>();for(var v:views.values())entries.add(new AgentConfig.ViewEntry(v.id(),v.name(),v.yaw(),v.pitch(),v.zoom(),v.width(),v.height(),v.supersampling(),v.background(),v.transparentBackground(),Boolean.TRUE.equals(v.autoFill()),v.brightnessFactor()));config.views=entries;try{config.save(configPath);}catch(Exception ex){log("保存视角失败："+ex.getMessage());}}
     private void addPack(){Path chosen=NativeFilePicker.chooseFile("选择资源包","Minecraft 资源包","*.zip");if(chosen!=null){packModel.addElement(new AgentConfig.ResourcePackEntry(chosen.toString(),true));syncResourcePacks();}}
     private void movePack(JList<?> list,int delta){int from=list.getSelectedIndex(),to=from+delta;if(from<0||to<0||to>=packModel.size())return;var value=packModel.remove(from);packModel.add(to,value);list.setSelectedIndex(to);syncResourcePacks();}
     private void applyPacks(JButton button){List<AgentConfig.ResourcePackEntry> entries=new ArrayList<>();for(int i=0;i<packModel.size();i++)entries.add(packModel.get(i));button.setEnabled(false);Thread.startVirtualThread(()->{try{new ResourcePackManager(config,renderer.runtime(),this::log).applyTransactional(entries);config.save(configPath);}catch(Throwable e){SwingUtilities.invokeLater(()->showError(e));}finally{SwingUtilities.invokeLater(()->button.setEnabled(true));}});}
-    @SuppressWarnings("unchecked") private void installDropTarget(){new DropTarget(this,DnDConstants.ACTION_COPY,null){@Override public synchronized void drop(DropTargetDropEvent event){try{event.acceptDrop(DnDConstants.ACTION_COPY);List<java.io.File> files=(List<java.io.File>)event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);if(!files.isEmpty()&&files.getFirst().getName().toLowerCase().endsWith(".litematic")){Path chosen=files.getFirst().toPath();inputFile.setText(chosen.toString());preview.fileChanged(chosen);addRecent(config.recentProjectionPaths,chosen.toString());try{config.save(configPath);}catch(Exception ignored){}}event.dropComplete(true);}catch(Exception e){event.dropComplete(false);}}};}
+    @SuppressWarnings("unchecked") private void installDropTarget(){
+        installProjectionDropTarget(projectionList);
+        installProjectionDropTarget(inputFile);
+        for (Component target : projectionDropTargets) installProjectionDropTarget(target);
+    }
+    @SuppressWarnings("unchecked") private void installProjectionDropTarget(Component target){new DropTarget(target,DnDConstants.ACTION_COPY,null){@Override public synchronized void drop(DropTargetDropEvent event){try{event.acceptDrop(DnDConstants.ACTION_COPY);List<java.io.File> files=(List<java.io.File>)event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);importProjectionFiles(files.stream().map(java.io.File::toPath).toList());event.dropComplete(true);}catch(Exception e){event.dropComplete(false);}}};}
     private void installTray(){if(!SystemTray.isSupported())return;try{BufferedImage image=new BufferedImage(16,16,BufferedImage.TYPE_INT_ARGB);Graphics2D g=image.createGraphics();g.setColor(new Color(55,145,90));g.fillRect(2,2,12,12);g.dispose();PopupMenu menu=new PopupMenu();MenuItem show=new MenuItem("打开");show.addActionListener(e->SwingUtilities.invokeLater(()->{setVisible(true);setState(NORMAL);}));MenuItem exit=new MenuItem("退出");exit.addActionListener(e->shutdown());menu.add(show);menu.add(exit);trayIcon=new TrayIcon(image,"Litematic GPU Agent",menu);trayIcon.setImageAutoSize(true);trayIcon.addActionListener(e->setVisible(true));SystemTray.getSystemTray().add(trayIcon);}catch(Exception e){log("托盘初始化失败："+e.getMessage());}}
-    private void refreshStatus(){runtimeStatus.setText("运行时："+(renderer.runtime().isAlive()?(renderer.isBusy()?"渲染中":"已启动"):"未启动")+(config.maxConcurrentRenders>1?"（并行 "+config.maxConcurrentRenders+"）":"")+(renderer.isDraining()?"【等待重启】":""));cloudStatus.setText("队列："+renderer.queueLength());long memoryBytes=watchdog.lastReportedTotalBytes();memoryStatus.setText("内存："+(memoryBytes>0?String.format(java.util.Locale.ROOT,"%.1f",memoryBytes/1024.0/1024/1024)+"GB"+(config.memoryRestartThresholdBytes>0?"/"+config.memoryRestartThresholdBytes/(1024L*1024*1024)+"GB":""):"-"));String current=renderer.currentFile();if(current==null){currentTaskLabel.setText("当前渲染：无");}else{var status=renderer.runtime().currentStatus();String stage=status!=null&&status.stage()!=null?status.stage():"";int percent=status!=null?(int)Math.round(status.progress()*100):0;currentTaskLabel.setText("当前渲染["+(renderer.currentSource() == null ? "本地" : renderer.currentSource())+"]："+current+(stage.isEmpty()?"":"（"+stage+(percent>0?" "+percent+"%":"")+"）"));}}
+    private void refreshStatus(){runtimeStatus.setText("运行时："+(renderer.runtime().isAlive()?(renderer.isBusy()?"渲染中":"已启动"):"未启动")+(config.maxConcurrentRenders>1?"（并行 "+config.maxConcurrentRenders+"）":"")+(renderer.isDraining()?"【等待重启】":""));cloudStatus.setText("队列："+renderer.queueLength()+"（"+String.format(java.util.Locale.ROOT,"%.0f",renderer.retainedRequestBytes()/1024.0/1024.0)+"MB）");long memoryBytes=watchdog.lastReportedTotalBytes();memoryStatus.setText("内存："+(memoryBytes>0?String.format(java.util.Locale.ROOT,"%.1f",memoryBytes/1024.0/1024/1024)+"GB"+(config.memoryRestartThresholdBytes>0?"/"+config.memoryRestartThresholdBytes/(1024L*1024*1024)+"GB":""):"-"));String current=renderer.currentFile();if(current==null){currentTaskLabel.setText("当前渲染：无");}else{var status=renderer.runtime().currentStatus();String stage=status!=null&&status.stage()!=null?status.stage():"";int percent=status!=null?(int)Math.round(status.progress()*100):0;currentTaskLabel.setText("当前渲染["+(renderer.currentSource() == null ? "本地" : renderer.currentSource())+"]："+current+(stage.isEmpty()?"":"（"+stage+(percent>0?" "+percent+"%":"")+"）"));}}
     private void addHistory(String fileName,int count,long elapsed,String status,String location){SwingUtilities.invokeLater(()->{String time=LocalDateTime.now().format(DateTimeFormatter.ofPattern("MM-dd HH:mm:ss"));historyLocations.add(0,location);history.insertRow(0,new Object[]{time,fileName,count,elapsed+" ms",status});while(historyLocations.size()>200)historyLocations.remove(historyLocations.size()-1);while(history.getRowCount()>200)history.removeRow(history.getRowCount()-1);});}
-    private void log(String message){SwingUtilities.invokeLater(()->{logs.append(LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))+"  "+message+System.lineSeparator());logs.setCaretPosition(logs.getDocument().getLength());});}
+    private void log(String message){persistLog(message);SwingUtilities.invokeLater(()->{logs.append(LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))+"  "+message+System.lineSeparator());logs.setCaretPosition(logs.getDocument().getLength());});}
     private void showError(Throwable error){JOptionPane.showMessageDialog(this,error.getMessage(),"操作失败",JOptionPane.ERROR_MESSAGE);log("错误："+error.getMessage());}
-    /** 重启程序：以当前可执行文件重新拉起自身后退出（仅支持 jpackage/exe 启动方式）。 */
+    /** 重启程序：复用当前进程的启动命令，兼容 jpackage EXE、java -jar 和开发环境。 */
     private void restartApplication(boolean saveFirst) {
         if (saveFirst) {
             try { config.save(configPath); } catch (Exception ex) { showError(ex); return; }
         }
-        String command = ProcessHandle.current().info().command().orElse("");
-        var arguments = ProcessHandle.current().info().arguments().orElse(new String[0]);
-        if (!command.toLowerCase().endsWith(".exe") || arguments.length > 0) {
-            JOptionPane.showMessageDialog(this, "当前以非安装方式运行，无法自动重启，请手动重启程序。", "重启程序", JOptionPane.WARNING_MESSAGE);
+        List<String> launch;
+        try { launch = ProcessRelauncher.currentCommand(); }
+        catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "无法取得当前启动命令，请手动重启程序。", "重启程序", JOptionPane.WARNING_MESSAGE);
+            log("重启程序失败：" + ex.getMessage());
             return;
         }
-        try { new ProcessBuilder(command).start(); }
+        try { new ProcessBuilder(launch).directory(ProcessRelauncher.workingDirectory(launch).toFile()).start(); }
         catch (Exception ex) { showError(ex); return; }
         log("正在重启程序...");
         shutdown();
     }
 
-    private void shutdown(){preview.closeForShutdown();cloud.close();httpServer.close();renderer.close();if(trayIcon!=null)SystemTray.getSystemTray().remove(trayIcon);dispose();System.exit(0);}
+    private void saveAndReloadConfiguration() {
+        try {
+            config.save(configPath);
+            cloud.reload();
+            bots.reload();
+            log("配置已保存并重载云端与机器人连接");
+            JOptionPane.showMessageDialog(this, "配置已保存并重载。监听地址、端口和 Java 路径仍需重启程序。", "配置已应用", JOptionPane.INFORMATION_MESSAGE);
+        } catch (Exception error) {
+            showError(error);
+        }
+    }
+
+    static List<String> restartCommand(String command, String[] arguments) {
+        return ProcessRelauncher.command(command, arguments);
+    }
+
+    private void confirmWindowClose() {
+        if (trayIcon == null) {
+            confirmExit();
+            return;
+        }
+        Object[] options = closeOptions();
+        int selected = JOptionPane.showOptionDialog(this,
+                "关闭窗口时要最小化到托盘，还是退出程序？\n直接退出会同时关闭内置 Minecraft 渲染客户端。",
+                "关闭 Litematic GPU Agent", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE,
+                null, options, options[0]);
+        if (selected == 0) {
+            setVisible(false);
+            trayIcon.displayMessage("Litematic GPU Agent", "程序仍在托盘运行。", TrayIcon.MessageType.INFO);
+        } else if (selected == 1) {
+            shutdown();
+        }
+    }
+
+    static Object[] closeOptions() {
+        return new Object[] {"最小化到托盘", "直接退出", "取消"};
+    }
+
+    private void confirmExit() {
+        int selected = JOptionPane.showConfirmDialog(this,
+                "确定退出程序吗？内置 Minecraft 渲染客户端也会一并关闭。",
+                "退出 Litematic GPU Agent", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (selected == JOptionPane.YES_OPTION) shutdown();
+    }
+
+    private void closeServices() {
+        if (!servicesClosed.compareAndSet(false, true)) return;
+        try { watchdog.close(); } catch (Throwable error) { log("关闭内存看门狗失败：" + error.getMessage()); }
+        try { bots.close(); } catch (Throwable error) { log("关闭机器人连接失败：" + error.getMessage()); }
+        try { web.close(); } catch (Throwable error) { log("关闭 Web 管理后台失败：" + error.getMessage()); }
+        try { preview.closeForShutdown(); } catch (Throwable error) { log("关闭预览失败：" + error.getMessage()); }
+        try { cloud.close(); } catch (Throwable error) { log("关闭云端连接失败：" + error.getMessage()); }
+        try { httpServer.close(); } catch (Throwable error) { log("关闭 HTTP 服务失败：" + error.getMessage()); }
+        try { renderer.close(); } catch (Throwable error) { log("关闭渲染服务失败：" + error.getMessage()); }
+    }
+
+    private void shutdown(){
+        if (!shuttingDown.compareAndSet(false, true)) return;
+        setVisible(false);
+        dispose();
+        // 清理可能包含 Minecraft 进程回收的阻塞操作，不能卡在 Swing EDT 上。
+        Thread.startVirtualThread(() -> {
+            try { closeServices(); }
+            finally {
+                try { if (trayIcon != null) SystemTray.getSystemTray().remove(trayIcon); } catch (Throwable ignored) {}
+                System.exit(0);
+            }
+        });
+    }
 }

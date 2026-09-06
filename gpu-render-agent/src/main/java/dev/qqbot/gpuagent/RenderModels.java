@@ -6,10 +6,38 @@ import java.util.List;
 final class RenderModels {
     private RenderModels() {}
 
-    record View(String id, String name, double yaw, double pitch, Double zoom, Boolean autoFill,
-                int width, int height, String background, boolean transparentBackground, int supersampling) {}
+    static double brightnessBase(double pitch) {
+        return pitch <= -80.0 ? 1.5 : 1.0;
+    }
 
-    record Request(int version, String id, String filename, List<View> views, String resourcePackProfile) {}
+    record View(String id, String name, double yaw, double pitch, Double zoom, Boolean autoFill,
+                int width, int height, String background, boolean transparentBackground, int supersampling,
+                Double brightness) {
+        View(String id, String name, double yaw, double pitch, Double zoom, Boolean autoFill,
+             int width, int height, String background, boolean transparentBackground, int supersampling) {
+            this(id, name, yaw, pitch, zoom, autoFill, width, height, background, transparentBackground,
+                    supersampling, brightnessBase(pitch));
+        }
+
+        double brightnessFactor() {
+            double value = this.brightness == null ? brightnessBase(this.pitch) : this.brightness;
+            return Math.max(0.25, Math.min(3.0, Double.isFinite(value) ? value : 1.0));
+        }
+
+        double brightnessPercent() {
+            return brightnessFactor() / brightnessBase(this.pitch) * 100.0;
+        }
+    }
+
+    record Request(int version, String id, String filename, List<View> views, String resourcePackProfile,
+                   String pluginVersion, String renderConfigSha256) {
+        Request(int version, String id, String filename, List<View> views, String resourcePackProfile) {
+            this(version, id, filename, views, resourcePackProfile, "0", null);
+        }
+        Request(int version, String id, String filename, List<View> views, String resourcePackProfile, String pluginVersion) {
+            this(version, id, filename, views, resourcePackProfile, pluginVersion, null);
+        }
+    }
 
     record Image(String id, String name, int width, int height, Path path) {}
 

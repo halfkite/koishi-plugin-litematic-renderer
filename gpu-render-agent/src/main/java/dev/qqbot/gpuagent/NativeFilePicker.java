@@ -18,6 +18,13 @@ final class NativeFilePicker {
 
     /** 阻塞式选择单个文件；用户取消或出错返回 null。调用线程会被阻塞直到对话框关闭。 */
     static Path chooseFile(String title, String filterLabel, String pattern) {
+        if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win")) {
+            javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
+            chooser.setDialogTitle(title);
+            if (chooser.showOpenDialog(null) != javax.swing.JFileChooser.APPROVE_OPTION) return null;
+            Path selected = chooser.getSelectedFile().toPath();
+            return Files.isRegularFile(selected) ? selected : null;
+        }
         String script = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
             + "Add-Type -AssemblyName System.Windows.Forms | Out-Null;"
             + "$d = New-Object System.Windows.Forms.OpenFileDialog;"

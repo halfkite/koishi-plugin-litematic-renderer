@@ -126,7 +126,11 @@ final class RuntimeManager implements AutoCloseable {
     }
 
     private synchronized void start(Slot slot) throws Exception {
-        if (slot.process != null && slot.process.isAlive()) return;
+        if (slot.process != null) {
+            if (slot.process.isAlive()) return;
+            // 客户端崩溃后，Java 的主进程可能已退出但其派生进程仍在；启动新客户端前先清理整棵树。
+            stop(slot);
+        }
         RuntimeInstaller.LaunchSpec spec = installer.install();
         prepareSlotGameDirectory(slot);
         if (slot.index == 0 && config.resourcePacks != null && !config.resourcePacks.isEmpty()) {
@@ -144,6 +148,8 @@ final class RuntimeManager implements AutoCloseable {
         command.add("--enable-native-access=ALL-UNNAMED");
         command.add("-Djava.library.path=" + spec.natives());
         command.add("-Dgpu.render.agent=true");
+        command.add("-Dgpu.render.nightVision=" + config.nightVisionEnabled);
+        command.add("-Dgpu.render.nightVisionLevel=" + Math.max(1, Math.min(15, config.nightVisionLevel)));
         for (String argument : spec.jvmArguments()) {
             String normalized = normalizeJvmArgument(argument);
             if (!"-cp".equals(normalized) && !normalized.contains("${classpath}")) command.add(normalized);
@@ -178,8 +184,12 @@ final class RuntimeManager implements AutoCloseable {
         if (Files.exists(link)) return;
         try {
             Files.createDirectories(sharedCache);
-            new ProcessBuilder("cmd", "/c", "mklink", "/J", link.toString(), sharedCache.toString())
-                    .redirectErrorStream(true).start().waitFor();
+            if (isWindows()) {
+                new ProcessBuilder("cmd", "/c", "mklink", "/J", link.toString(), sharedCache.toString())
+                        .redirectErrorStream(true).start().waitFor();
+            } else {
+                Files.createSymbolicLink(link, sharedCache);
+            }
             log.accept("客户端 " + (slot.index + 1) + " 已共享网格缓存目录");
         } catch (Throwable error) {
             log.accept("网格缓存共享失败（客户端 " + (slot.index + 1) + " 将使用独立缓存）：" + error.getMessage());
@@ -243,23 +253,27 @@ final class RuntimeManager implements AutoCloseable {
     private Path javaExecutable() throws IOException {
         List<Path> candidates = new ArrayList<>();
         if (config.javaPath != null && !config.javaPath.isBlank()) candidates.add(Path.of(config.javaPath));
-        candidates.add(Path.of(System.getProperty("java.home"), "bin", "java.exe"));
+        String launcher = isWindows() ? "java.exe" : "java";
+        candidates.add(Path.of(System.getProperty("java.home"), "bin", launcher));
         String javaHome = System.getenv("JAVA_HOME");
-        if (javaHome != null && !javaHome.isBlank()) candidates.add(Path.of(javaHome, "bin", "java.exe"));
+        if (javaHome != null && !javaHome.isBlank()) candidates.add(Path.of(javaHome, "bin", launcher));
         for (Path candidate : candidates) {
             if (Files.isRegularFile(candidate)) return candidate;
         }
         String path = System.getenv("PATH");
         if (path != null) {
-            for (String entry : path.split(";")) {
+            for (String entry : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
                 if (entry.isBlank()) continue;
-                Path candidate = Path.of(entry.trim(), "java.exe");
+                Path candidate = Path.of(entry.trim(), launcher);
                 if (Files.isRegularFile(candidate)) return candidate;
             }
         }
         throw new IOException("""
-                未找到可用的 Java 启动器（java.exe）。jpackage 自带运行时可能不含启动器，\
-                请在 agent.json 的 javaPath 中填写一个完整 JDK/JRE 的 java.exe 路径后重试。""");
+                未找到可用的 Java 启动器。请在 agent.json 的 javaPath 中填写一个完整 JDK/JRE 的 Java 路径后重试。""");
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
     }
 
     private void readLogs(Slot slot, Process child) {
@@ -284,11 +298,60 @@ final class RuntimeManager implements AutoCloseable {
 
     private synchronized void stop(Slot slot) {
         Process child = slot.process;
-        slot.process = null;
         if (child == null) return;
-        child.destroy();
-        try { if (!child.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) child.destroyForcibly(); }
-        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); child.destroyForcibly(); }
+        terminateProcessTree(child);
+        // 只有确认 terminateProcessTree 返回后才清空句柄，避免状态先变成“未启动”而旧客户端仍在退出。
+        slot.process = null;
+    }
+
+    /** Windows 的 destroy 只保证主进程，使用 taskkill /T 兜底回收 Fabric/GLFW 派生进程。 */
+    private static void terminateProcessTree(Process process) {
+        List<ProcessHandle> descendants = process.toHandle().descendants().toList();
+        try {
+            if (isWindows() && process.isAlive()) {
+                Process killer = new ProcessBuilder("taskkill.exe", "/PID", String.valueOf(process.pid()), "/T", "/F")
+                        .redirectErrorStream(true).start();
+                killer.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+            } else if (isWindows()) {
+                // 主 Java 已崩溃时，Windows 可能仍留下 GLFW/子 Java；根句柄此时无法再覆盖它们。
+                for (ProcessHandle descendant : descendants) {
+                    if (!descendant.isAlive()) continue;
+                    Process killer = new ProcessBuilder("taskkill.exe", "/PID", String.valueOf(descendant.pid()), "/T", "/F")
+                            .redirectErrorStream(true).start();
+                    killer.waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+                }
+            } else {
+                descendants.forEach(ProcessHandle::destroy);
+                process.destroy();
+            }
+            if (!process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly();
+            descendants.forEach(handle -> {
+                if (handle.isAlive()) handle.destroyForcibly();
+            });
+            // taskkill/forcible destroy 都是异步语义；在启动下一个客户端前确认整棵进程树已经消失。
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+            while (System.nanoTime() < deadline && processTreeAlive(process, descendants)) {
+                Thread.sleep(50);
+            }
+            if (processTreeAlive(process, descendants)) {
+                descendants.forEach(handle -> {
+                    if (handle.isAlive()) handle.destroyForcibly();
+                });
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+            descendants.forEach(ProcessHandle::destroyForcibly);
+        } catch (Exception ignored) {
+            process.destroy();
+            if (process.isAlive()) process.destroyForcibly();
+            descendants.forEach(ProcessHandle::destroyForcibly);
+        }
+    }
+
+    private static boolean processTreeAlive(Process process, List<ProcessHandle> descendants) {
+        if (process.isAlive()) return true;
+        return descendants.stream().anyMatch(ProcessHandle::isAlive);
     }
 
     @Override public void close() { stop(); }
