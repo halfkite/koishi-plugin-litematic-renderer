@@ -24,6 +24,8 @@ dependencies {
     runtimeOnly "maven.modrinth:malilib:${project.malilib_version}"
     compileOnly "maven.modrinth:litematica:${project.litematica_version}"
     runtimeOnly "maven.modrinth:litematica:${project.litematica_version}"
+    testImplementation "maven.modrinth:malilib:${project.malilib_version}"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     testImplementation platform('org.junit:junit-bom:5.13.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
 }

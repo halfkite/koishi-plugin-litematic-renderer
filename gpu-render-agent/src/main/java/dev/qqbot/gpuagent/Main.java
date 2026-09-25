@@ -14,7 +14,7 @@ import java.util.function.Consumer;
 
 public final class Main {
     /** 工具版本号：与 build.gradle 和预发布包名保持一致。 */
-    public static final String VERSION = "0.5.1";
+    public static final String VERSION = "0.5.2";
 
     private Main() {}
 

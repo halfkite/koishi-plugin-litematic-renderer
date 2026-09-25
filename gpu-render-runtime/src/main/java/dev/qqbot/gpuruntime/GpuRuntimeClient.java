@@ -325,7 +325,7 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             String stage = mapArtBusy ? "map-art-colors" : active == null ? "idle" : active.exporting ? "rendering" : "building";
             writeAtomic(root.resolve("status.json"), GSON.toJson(new RenderStatus(System.currentTimeMillis(),
                     active == null && !mapArtBusy && initialResourcesReady, active != null || mapArtBusy, client.level != null,
-                    "0.1.1", "26.3", gpu, maxTextureSize, fingerprint, progress, stage,
+                    "0.1.3", "26.3", gpu, maxTextureSize, fingerprint, progress, stage,
                     clientDefaultsApplied, worldDefaultsApplied, worldDefaultsApplied, RENDER_WORLD,
                     QuickLitematicaPreview3D.nightVisionEnabled(), QuickLitematicaPreview3D.nightVisionLevel())));
         } catch (IOException error) { LOGGER.warn("Unable to write GPU runtime status", error); }

@@ -1,8 +1,8 @@
-# Litematic GPU Agent 0.5.1
+# Litematic GPU Agent 0.5.2
 
 跨平台可执行 JAR 与 Windows x64 便携 GPU Agent，用于 Minecraft 26.3 / Fabric 0.19.5 投影渲染。
 
-0.5.1 发布版本。0.4.63 新增机器人功能单项开关，关闭后即时拦截对应功能并同步移除官方 QQ `/` 指令；帮助与介绍图片按启用项生成。群文件自动渲染也可单独停用。0.4.62 增加单次定时公告，发送前导入自选位置的旧渲染索引并刷新 OneBot 群列表；桌面工具新增打开配置文件和客户端目录的入口。0.4.61 新增公告页，可编辑消息并逐群发送，显示每个群的结果。0.4.60 更新机器人 `/帮助` 图片与文字内容。
+0.5.2 在读取投影时忽略熔炉、箱子、漏斗等容器的库存和处理状态，降低大型容器投影的载入开销。0.5.1 发布版本。0.4.63 新增机器人功能单项开关，关闭后即时拦截对应功能并同步移除官方 QQ `/` 指令；帮助与介绍图片按启用项生成。群文件自动渲染也可单独停用。0.4.62 增加单次定时公告，发送前导入自选位置的旧渲染索引并刷新 OneBot 群列表；桌面工具新增打开配置文件和客户端目录的入口。0.4.61 新增公告页，可编辑消息并逐群发送，显示每个群的结果。0.4.60 更新机器人 `/帮助` 图片与文字内容。
 
 0.4.59 为机器人渲染结果附加固定投影编号；搜索图片仅列出编号和名称。移除“渲染搜索”，发送投影改为按编号或完整名称精确查找，同名时不发送。
 
@@ -13,23 +13,23 @@
 JAR 需要目标机器安装 Java 25：
 
 ```text
-java -jar litematic-gpu-agent-0.5.1-all.jar
-java -jar litematic-gpu-agent-0.5.1-all.jar --version
-java -jar litematic-gpu-agent-0.5.1-all.jar --help
-java -jar litematic-gpu-agent-0.5.1-all.jar --web
-java -jar litematic-gpu-agent-0.5.1-all.jar --bot
+java -jar litematic-gpu-agent-0.5.2-all.jar
+java -jar litematic-gpu-agent-0.5.2-all.jar --version
+java -jar litematic-gpu-agent-0.5.2-all.jar --help
+java -jar litematic-gpu-agent-0.5.2-all.jar --web
+java -jar litematic-gpu-agent-0.5.2-all.jar --bot
 ```
 
 也可以直接双击 `start-agent.bat` 启动桌面工具；把 `--web` 或 `--bot` 作为参数传给脚本即可启动对应模式。Linux/macOS 可执行 `./start-agent.sh --web`，脚本会自动查找 Java 和同目录 JAR。
 
-Windows 用户也可以解压 `litematic-gpu-agent-0.5.1-windows-x64.zip` 后直接启动 `Litematic GPU Agent/Litematic GPU Agent.exe`；该包已经内置 Java 25 Runtime，不需要安装 Java。首次渲染时，程序会从官方地址下载 Minecraft 26.3 客户端、资源和 Fabric Loader，并从 Modrinth 下载固定版本的 Fabric API、MaLiLib 与 Litematica，不需要登录账号，也不使用已有游戏目录。下载时桌面顶部和 Web 状态页会显示阶段、文件和进度；如果已有客户端，可在“渲染设置”选择 JAR，或在 Web 配置页上传本地 Minecraft 26.3 客户端。
+Windows 用户也可以解压 `litematic-gpu-agent-0.5.2-windows-x64.zip` 后直接启动 `Litematic GPU Agent/Litematic GPU Agent.exe`；该包已经内置 Java 25 Runtime，不需要安装 Java。首次渲染时，程序会从官方地址下载 Minecraft 26.3 客户端、资源和 Fabric Loader，并从 Modrinth 下载固定版本的 Fabric API、MaLiLib 与 Litematica，不需要登录账号，也不使用已有游戏目录。下载时桌面顶部和 Web 状态页会显示阶段、文件和进度；如果已有客户端，可在“渲染设置”选择 JAR，或在 Web 配置页上传本地 Minecraft 26.3 客户端。
 
 ### Linux Web 后台
 
 Linux 无桌面环境直接运行 `--web`，默认访问 `http://服务器IP:2618/`：
 
 ```text
-java -jar litematic-gpu-agent-0.5.1-all.jar --web
+java -jar litematic-gpu-agent-0.5.2-all.jar --web
 ```
 
 首次启动会在终端和 `web-credentials.txt` 输出随机 12 位数字密码，用户名默认是 `admin`。网页可配置多个官方 QQ 和 OneBot/NekoBot 账号、视角、亮度、拼接、缓存、资源包和云端连接。群消息模式有“接收群文件自动识别（不要求 @）”“仅被 @ 时识别”和“都可以（文件或 @）”三种选择。官方 QQ 与 OneBot 账号会在 Agent 内直接连接，不依赖 Koishi；OneBot 支持正向 WebSocket 与反向 WebSocket。`--bot` 只启动机器人和渲染服务，不启动网页。
@@ -45,7 +45,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=/opt/litematic-gpu-agent
-ExecStart=/usr/bin/java -jar /opt/litematic-gpu-agent/litematic-gpu-agent-0.5.1-all.jar --web
+ExecStart=/usr/bin/java -jar /opt/litematic-gpu-agent/litematic-gpu-agent-0.5.2-all.jar --web
 Restart=on-failure
 User=litematic
 

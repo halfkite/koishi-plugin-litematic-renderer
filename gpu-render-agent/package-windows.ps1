@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $PSScriptRoot) { $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $JavaHome) { $JavaHome = Split-Path -Parent (Split-Path -Parent (Get-Command java).Source) }
-$version = '0.5.1'
+$version = '0.5.2'
 $jar = Get-Item "$PSScriptRoot\build\libs\litematic-gpu-agent-$version-all.jar" -ErrorAction SilentlyContinue
 if (-not $jar) { throw 'Run gradlew.bat fatJar first.' }
 
