@@ -30,6 +30,7 @@ export interface GpuRenderRequest {
   sourceUser?: string
   pluginVersion?: string
   renderConfigSha256?: string
+  imageSendLayout?: 'horizontal' | 'vertical' | 'separate'
 }
 
 export interface GpuAgentNodeConfig {
@@ -62,6 +63,8 @@ export interface GpuRenderImage {
 export interface GpuRenderResult {
   agentId: string
   images: GpuRenderImage[]
+  /** Agent 因合成图超过平台上限而要求调用方逐张发送。 */
+  forceSeparateImages?: boolean
   elapsedMillis?: number
   cacheHit?: boolean
   gpu?: string
@@ -276,7 +279,8 @@ export class GpuAgentHub extends EventEmitter {
       if (message.type === 'error') pending.reject(new Error(`${message.code ?? 'GPU_RENDER_FAILED'}: ${message.message ?? 'GPU render failed'}`))
       else {
         this.options.logger.info(`GPU Agent ${state.agentId} 回传结果：任务 ${message.taskId}，${pending.images.length} 张图`)
-        pending.resolve({ agentId: state.agentId, images: pending.images, elapsedMillis: message.elapsedMillis,
+        pending.resolve({ agentId: state.agentId, images: pending.images, forceSeparateImages: message.forceSeparateImages === true,
+          elapsedMillis: message.elapsedMillis,
           cacheHit: message.cacheHit, gpu: state.capabilities.gpu,
           rendererVersion: state.capabilities.rendererVersion })
       }

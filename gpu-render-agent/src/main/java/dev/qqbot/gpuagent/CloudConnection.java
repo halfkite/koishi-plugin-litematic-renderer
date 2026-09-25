@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 final class CloudConnection implements WebSocket.Listener, AutoCloseable {
+    static final int MAX_MERGED_IMAGE_BYTES = 10 * 1024 * 1024;
     private final AgentConfig config;
     private final RenderService renderer;
     private final Consumer<String> log;
@@ -146,7 +147,7 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
                 }
             }
             request = new RenderModels.Request(request.version(), request.id(), request.filename(), views,
-                    request.resourcePackProfile(), request.pluginVersion(), localViewsOverride ? null : request.renderConfigSha256());
+                    request.resourcePackProfile(), request.pluginVersion(), localViewsOverride ? null : request.renderConfigSha256(), request.imageSendLayout());
             requests.put(request.id(), request);
             // 捕获来源信息（群号/发送人），渲染完成后写入缓存记录
             String sourceGroup = task.has("sourceGroup") && !task.get("sourceGroup").isJsonNull() ? task.get("sourceGroup").getAsString() : null;
@@ -173,17 +174,25 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
         debug("sendResult 开始,图片数=" + result.images().size());
         try {
             List<RenderModels.Image> images = result.images();
+            boolean forceSeparateImages = false;
             // 云端来源：本地视角表中的全部视角都参与拼接，避免新增视角只渲染不回传。
-            if (images.size() >= 2 && request != null && !request.views().isEmpty()) {
-                MergedPng merged = mergeImages(images, request.views().get(0), config.cloudMergeLayout);
-                if (merged != null) {
+            String imageSendLayout = AgentConfig.effectiveImageSendLayout(
+                    config.cloudMergeLayout, request == null ? null : request.imageSendLayout());
+            boolean mergeImages = !AgentConfig.separateImageSend(imageSendLayout);
+            debug("云端结果发送模式：" + imageSendLayout + "，拼接=" + mergeImages);
+            if (mergeImages && images.size() >= 2 && request != null && !request.views().isEmpty()) {
+                MergedPng merged = mergeImages(images, request.views().get(0), imageSendLayout);
+                if (merged != null && merged.bytes().length <= MAX_MERGED_IMAGE_BYTES) {
                     sendBinary(Protocol.binary("image", taskId, "merged", "merged.png", merged.width(), merged.height(), merged.bytes()));
-                    debug("已发送合并图 merged.png (" + images.size() + " 张源图，" + mergeLayout(config.cloudMergeLayout) + ")");
+                    debug("已发送合并图 merged.png (" + images.size() + " 张源图，" + mergeLayout(imageSendLayout) + ")");
                     JsonObject control = new JsonObject(); control.addProperty("type", "result"); control.addProperty("taskId", taskId);
                     control.addProperty("elapsedMillis", result.elapsedMillis()); control.addProperty("cacheHit", result.cacheHit()); send(control);
                     debug("已发送 result 控制消息");
                     log.accept("已回传渲染结果：" + images.size() + " 张图合并为 1 张（任务 " + taskId + "）");
                     return;
+                } else if (merged != null) {
+                    forceSeparateImages = true;
+                    debug("合并图超过 10MB（" + merged.bytes().length + " 字节），改为逐张回传");
                 }
             }
             for (var image : images) {
@@ -191,7 +200,8 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
                 debug("已发送图片 " + image.name() + " " + image.width() + "x" + image.height());
             }
             JsonObject control = new JsonObject(); control.addProperty("type", "result"); control.addProperty("taskId", taskId);
-            control.addProperty("elapsedMillis", result.elapsedMillis()); control.addProperty("cacheHit", result.cacheHit()); send(control);
+            control.addProperty("elapsedMillis", result.elapsedMillis()); control.addProperty("cacheHit", result.cacheHit());
+            control.addProperty("forceSeparateImages", forceSeparateImages); send(control);
             debug("已发送 result 控制消息");
             log.accept("已回传渲染结果：" + images.size() + " 张图（任务 " + taskId + "）");
         } catch (Exception error) {
@@ -215,7 +225,6 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
         java.util.List<java.awt.image.BufferedImage> decoded = new java.util.ArrayList<>();
         boolean vertical = "vertical".equalsIgnoreCase(layout);
         int totalWidth = 0, totalHeight = 0, maxWidth = 0, maxHeight = 0;
-        final int gap = 32;
         for (var image : images) {
             java.awt.image.BufferedImage decoded_image;
             try (var input = Files.newInputStream(image.path())) {
@@ -223,16 +232,16 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
             }
             if (decoded_image == null) return null;
             decoded.add(decoded_image);
-            if (vertical) totalHeight += decoded_image.getHeight() + gap;
-            else totalWidth += decoded_image.getWidth() + gap;
+            if (vertical) totalHeight += decoded_image.getHeight();
+            else totalWidth += decoded_image.getWidth();
             maxWidth = Math.max(maxWidth, decoded_image.getWidth());
             maxHeight = Math.max(maxHeight, decoded_image.getHeight());
         }
         if (vertical) {
             totalWidth = maxWidth;
-            totalHeight = Math.max(1, totalHeight - gap);
+            totalHeight = Math.max(1, totalHeight);
         } else {
-            totalWidth = Math.max(1, totalWidth - gap);
+            totalWidth = Math.max(1, totalWidth);
             totalHeight = maxHeight;
         }
         java.awt.image.BufferedImage canvas = new java.awt.image.BufferedImage(totalWidth, totalHeight, java.awt.image.BufferedImage.TYPE_INT_ARGB);
@@ -246,10 +255,10 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
             for (java.awt.image.BufferedImage image : decoded) {
                 if (vertical) {
                     g.drawImage(image, (totalWidth - image.getWidth()) / 2, y, null);
-                    y += image.getHeight() + gap;
+                    y += image.getHeight();
                 } else {
                     g.drawImage(image, x, (totalHeight - image.getHeight()) / 2, null);
-                    x += image.getWidth() + gap;
+                    x += image.getWidth();
                 }
             }
         } finally { g.dispose(); }
@@ -259,6 +268,7 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
     }
 
     private static String mergeLayout(String layout) {
+        if (AgentConfig.separateImageSend(layout)) return "不拼接";
         return "vertical".equalsIgnoreCase(layout) ? "竖向" : "横向";
     }
 
@@ -278,7 +288,7 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
         value.addProperty("minecraftVersion", RuntimeInstaller.MINECRAFT_VERSION);
         value.addProperty("nightVisionEnabled", config.nightVisionEnabled);
         value.addProperty("nightVisionLevel", Math.max(1, Math.min(15, config.nightVisionLevel)));
-        value.addProperty("lightingProfile", "top-light-v3-per-view-brightness-v1-dynamic-fullbright-sim-y64-smart-fill-v4");
+        value.addProperty("lightingProfile", "top-light-v3-per-view-brightness-v2-bottom-base-150-v1-dynamic-fullbright-sim-y64-smart-fill-v5-no-beacon-beams-v1");
         value.addProperty("localViewsFingerprint", localViewsFingerprint());
         value.addProperty("cloudMergeLayout", mergeLayout(config.cloudMergeLayout));
         RenderModels.RuntimeStatus status = renderer.runtime().currentStatus();

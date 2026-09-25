@@ -127,12 +127,12 @@ public final class QuickLitematicaPreview3DScreen extends Screen {
         this.addRenderableWidget(this.button(
                 Component.translatable("quickcraft.litematica.preview_3d.preset.top"),
                 panelX, y, halfWidth,
-                () -> this.manager.setPreset(0.0, 85.0)
+                () -> this.manager.setPreset(0.0, 90.0)
         ));
         this.addRenderableWidget(this.button(
                 Component.translatable("quickcraft.litematica.preview_3d.preset.bottom"),
                 panelX + halfWidth + 4, y, halfWidth,
-                () -> this.manager.setPreset(0.0, -85.0)
+                () -> this.manager.setPreset(0.0, -90.0)
         ));
 
         y += sectionStep;
@@ -338,7 +338,9 @@ public final class QuickLitematicaPreview3DScreen extends Screen {
     private void openOutputFolder() {
         try {
             Files.createDirectories(this.manager.outputDirectory());
-            Util.getPlatform().openFile(this.manager.outputDirectory().toFile());
+            if (java.awt.Desktop.isDesktopSupported()) {
+                java.awt.Desktop.getDesktop().open(this.manager.outputDirectory().toFile());
+            }
         } catch (IOException e) {
             this.status = Component.translatable("quickcraft.litematica.preview_3d.open_folder_failed");
         }

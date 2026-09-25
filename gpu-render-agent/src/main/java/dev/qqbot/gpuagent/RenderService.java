@@ -1,7 +1,10 @@
 package dev.qqbot.gpuagent;
 
+import dev.qqbot.standalone.PreviewEngine;
 import com.google.gson.JsonObject;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -56,15 +59,17 @@ final class RenderService implements AutoCloseable {
         final String source;
         final String historyLocation;
         final RenderModels.TaskMeta meta;
+        final boolean auxiliary;
         final CompletableFuture<RenderModels.Result> future = new CompletableFuture<>();
 
-        QueuedTask(RenderModels.Request request, byte[] schematic, Duration timeout, String source, String historyLocation, RenderModels.TaskMeta meta) {
+        QueuedTask(RenderModels.Request request, byte[] schematic, Duration timeout, String source, String historyLocation, RenderModels.TaskMeta meta, boolean auxiliary) {
             this.request = request;
             this.schematic = schematic;
             this.timeout = timeout;
             this.source = source;
             this.historyLocation = historyLocation;
             this.meta = meta;
+            this.auxiliary = auxiliary;
         }
     }
 
@@ -87,6 +92,7 @@ final class RenderService implements AutoCloseable {
         this.config = config;
         this.cacheStore = new CacheStore(applicationRoot, config, message -> log.accept(message));
         this.runtime = new RuntimeManager(applicationRoot, config);
+        cleanupAbandonedTaskDirectories();
         int workerCount = Math.max(1, Math.min(4, config.maxConcurrentRenders));
         for (int index = 0; index < workerCount; index++) {
             Thread worker = new Thread(this::runLoop, "gpu-render-queue-" + (index + 1));
@@ -112,6 +118,17 @@ final class RenderService implements AutoCloseable {
 
     CompletableFuture<RenderModels.Result> submit(RenderModels.Request request, byte[] schematic, Duration timeout,
                                                   String source, String historyLocation, RenderModels.TaskMeta meta) {
+        return submit(request, schematic, timeout, source, historyLocation, meta, false);
+    }
+
+    CompletableFuture<RenderModels.Result> submitAuxiliary(RenderModels.Request request, byte[] schematic, Duration timeout,
+                                                           String source, RenderModels.TaskMeta meta) {
+        return submit(request, schematic, timeout, source, null, meta, true);
+    }
+
+    private CompletableFuture<RenderModels.Result> submit(RenderModels.Request request, byte[] schematic, Duration timeout,
+                                                          String source, String historyLocation, RenderModels.TaskMeta meta,
+                                                          boolean auxiliary) {
         CompletableFuture<RenderModels.Result> rejected = new CompletableFuture<>();
         if (closed.get()) {
             rejected.completeExceptionally(new RenderFailure("CLOSED", "渲染服务已关闭"));
@@ -133,7 +150,7 @@ final class RenderService implements AutoCloseable {
             if (retainedRequestBytes.compareAndSet(current, current + requestBytes)) break;
         }
         idleGeneration.incrementAndGet();
-        QueuedTask task = new QueuedTask(request, schematic, timeout, source, historyLocation, meta);
+        QueuedTask task = new QueuedTask(request, schematic, timeout, source, historyLocation, meta, auxiliary);
         queueLength.incrementAndGet();
         tasks.add(task);
         return task.future;
@@ -272,6 +289,33 @@ final class RenderService implements AutoCloseable {
         return cacheStore.directory();
     }
 
+    int rebuildProjectionIndex() throws IOException {
+        ProjectionCacheIndex.rebuild(cacheStore.directory());
+        int count = ProjectionCacheIndex.read(cacheStore.directory()).size();
+        log.accept("已重建投影搜索索引：" + count + " 个有效投影");
+        return count;
+    }
+
+    ProjectionArchiveImporter.ImportResult importCacheArchive(Path archive) throws IOException {
+        ProjectionArchiveImporter.ImportResult result = ProjectionArchiveImporter.importArchive(archive, cacheStore);
+        log.accept("已导入缓存投影：新增 " + result.importedCount() + " 个，已存在 "
+                + result.existingFiles() + " 个，跳过无效条目 " + result.invalidEntries() + " 个");
+        return result;
+    }
+
+    void recordCacheUsage(Path entry) {
+        cacheStore.recordUsage(entry);
+    }
+
+    boolean cacheIsCurrent(RenderModels.Request request, byte[] schematic) {
+        return cacheStore.isCurrent(request, schematic, Main.VERSION, cacheStore.resourcePackFingerprint());
+    }
+
+    void invalidateCacheImages(byte[] schematic) {
+        String fileHash = cacheStore.hash(schematic);
+        if (cacheStore.invalidateImages(fileHash)) log.accept("已删除配置失效的投影图片缓存 " + fileHash + "，将重新渲染");
+    }
+
     private RenderModels.Result render(QueuedTask queued, RunningTask running, int slot, long epochAtStart) throws Exception {
         RenderModels.Request request = queued.request;
         byte[] schematic = queued.schematic;
@@ -280,18 +324,28 @@ final class RenderService implements AutoCloseable {
         String fileHash = cacheStore.hash(schematic);
         String packFingerprint = cacheStore.resourcePackFingerprint();
         Object cacheLock = cacheLocks.computeIfAbsent(fileHash, ignored -> new Object());
+        Path taskDirectory = null;
         try {
             synchronized (cacheLock) {
-                CacheStore.CacheHit cached = cacheStore.lookup(request, schematic, Main.VERSION, packFingerprint);
+                CacheStore.CacheHit cached = queued.auxiliary ? null
+                        : cacheStore.lookup(request, schematic, Main.VERSION, packFingerprint);
                 if (cached != null) {
                     running.outputDir = cached.directory().toAbsolutePath().normalize();
                     log.accept("命中统一投影缓存 " + fileHash + "，无需启动 Minecraft");
                     return new RenderModels.Result(request.id(), cached.images(), 0, true, cached.gpu());
                 }
 
+                if (queued.auxiliary) {
+                    List<RenderModels.Image> extra = auxiliaryHit(request, fileHash, packFingerprint);
+                    if (!extra.isEmpty()) return new RenderModels.Result(request.id(), extra, 0, true, "cache");
+                } else {
+                    cacheStore.invalidateImages(fileHash);
+                }
+
                 runtime.ensureRunning(slot, timeout);
                 String id = UUID.randomUUID().toString();
                 Path task = root.resolve(id);
+                taskDirectory = task;
                 Path folder = cacheStore.directory().resolve(fileHash);
                 Path input = folder.resolve(CacheStore.safeProjectionFilename(request.filename()));
                 if (Files.isRegularFile(folder.resolve("about.json5"))) {
@@ -305,7 +359,8 @@ final class RenderService implements AutoCloseable {
                 Files.createDirectories(folder);
                 if (!Files.exists(input)) Files.write(input, schematic);
                 Path output = task.resolve("output");
-                running.outputDir = output.toAbsolutePath().normalize();
+                // 任务输出只是运行时中转目录，最终文件统一落到配置的缓存目录。
+                running.outputDir = folder.toAbsolutePath().normalize();
                 Files.createDirectories(output);
 
                 Path bridge = runtime.slotBridgeDirectory(slot);
@@ -333,7 +388,6 @@ final class RenderService implements AutoCloseable {
                     }
                     RenderModels.RuntimeStatus statusSnapshot = runtime.currentStatus(slot);
                     running.stage = statusSnapshot != null && statusSnapshot.stage() != null ? statusSnapshot.stage() : "";
-                    if (!runtime.isAlive(slot)) throw new RenderFailure("RUNTIME_CRASH", "Minecraft GPU 运行时已退出");
                     if (Files.exists(resultPath)) {
                         RenderModels.RuntimeResult result = Protocol.GSON.fromJson(Files.readString(resultPath), RenderModels.RuntimeResult.class);
                         Files.deleteIfExists(resultPath);
@@ -349,18 +403,141 @@ final class RenderService implements AutoCloseable {
                             }
                             images.add(new RenderModels.Image(image.id(), image.name(), image.width(), image.height(), path));
                         }
-                        List<RenderModels.Image> cachedImages = cacheStore.save(request, images, schematic, running.meta,
-                                running.source, Main.VERSION, packFingerprint, result.elapsedMillis(), result.gpu());
+                        List<RenderModels.Image> cachedImages = queued.auxiliary
+                                ? saveAuxiliary(request, images, fileHash, packFingerprint)
+                                : cacheStore.save(request, images, schematic, running.meta,
+                                        running.source, Main.VERSION, packFingerprint, result.elapsedMillis(), result.gpu());
+                        running.outputDir = folder.toAbsolutePath().normalize();
                         return new RenderModels.Result(request.id(), cachedImages, result.elapsedMillis(), result.cacheHit(), result.gpu());
                     }
+                    if (!runtime.isAlive(slot)) throw new RenderFailure("RUNTIME_CRASH", "Minecraft GPU 运行时已退出");
                     Thread.sleep(100);
                 }
                 Files.deleteIfExists(target);
                 throw new RenderFailure("TIMEOUT", "GPU 渲染超过 " + timeout.toSeconds() + " 秒");
             }
+        } catch (RenderFailure failure) {
+            if (("RUNTIME_CRASH".equals(failure.code) || "SCHEMATIC_INVALID".equals(failure.code))
+                    && !isMapArtRequest(request)) {
+                log.accept("Minecraft GPU 运行时异常退出，自动回退独立渲染器：" + failure.getMessage());
+                return renderWithStandaloneFallback(queued, running, fileHash, schematic, packFingerprint);
+            }
+            throw failure;
         } finally {
+            if (taskDirectory != null) deleteTreeQuietly(taskDirectory);
             cacheLocks.remove(fileHash, cacheLock);
         }
+    }
+
+    private RenderModels.Result renderWithStandaloneFallback(QueuedTask queued, RunningTask running,
+                                                               String fileHash, byte[] schematic,
+                                                               String packFingerprint) throws Exception {
+        Path temporary = Files.createTempDirectory(root, "software-fallback-");
+        long started = System.nanoTime();
+        try {
+            Path input = temporary.resolve(CacheStore.safeProjectionFilename(queued.request.filename()));
+            Path output = temporary.resolve("output");
+            Files.createDirectories(output);
+            Files.write(input, schematic);
+            List<Path> packs = new ArrayList<>();
+            if (config.resourcePacks != null) {
+                for (AgentConfig.ResourcePackEntry pack : config.resourcePacks) {
+                    if (pack.enabled() && Files.isRegularFile(Path.of(pack.path()))) packs.add(Path.of(pack.path()));
+                }
+            }
+            try (PreviewEngine engine = PreviewEngine.load(input, runtime.minecraftClientJar(), packs)) {
+                List<RenderModels.Image> images = new ArrayList<>();
+                for (RenderModels.View view : queued.request.views()) {
+                    int renderWidth = Math.multiplyExact(view.width(), view.supersampling());
+                    int renderHeight = Math.multiplyExact(view.height(), view.supersampling());
+                    int renderSize = Math.max(renderWidth, renderHeight);
+                    BufferedImage source = engine.renderFrame(view.yaw(), view.pitch(),
+                            view.autoFill() == null || view.autoFill()
+                                    ? 1.0 : (view.zoom() == null ? 1.0 : view.zoom()), renderSize);
+                    BufferedImage target = FallbackImageProcessor.process(source, view);
+                    Path imagePath = output.resolve(view.id() + ".png");
+                    if (!ImageIO.write(target, "png", imagePath.toFile())) {
+                        throw new RenderFailure("INVALID_IMAGE", "独立渲染器无法写出 PNG");
+                    }
+                    images.add(new RenderModels.Image(view.id(), view.id() + ".png", view.width(), view.height(), imagePath));
+                }
+                long elapsed = (System.nanoTime() - started) / 1_000_000L;
+                List<RenderModels.Image> cached = queued.auxiliary
+                        ? saveAuxiliary(queued.request, images, fileHash, packFingerprint)
+                        : cacheStore.save(queued.request, images, schematic, running.meta,
+                                "独立渲染器回退", Main.VERSION, packFingerprint, elapsed, "software-fallback");
+                running.outputDir = cacheStore.directory().resolve(fileHash).toAbsolutePath().normalize();
+                return new RenderModels.Result(queued.request.id(), cached, elapsed, false, "software-fallback");
+            }
+        } finally {
+            deleteTreeQuietly(temporary);
+        }
+    }
+
+    private List<RenderModels.Image> auxiliaryHit(RenderModels.Request request, String hash, String packFingerprint)
+            throws IOException {
+        List<RenderModels.Image> images = new ArrayList<>();
+        for (RenderModels.View view : request.views()) {
+            Path path = auxiliaryPath(hash, view, request, packFingerprint);
+            if (!isPng(path)) return List.of();
+            BufferedImage decoded = ImageIO.read(path.toFile());
+            if (decoded == null) return List.of();
+            images.add(new RenderModels.Image(view.id(), path.getFileName().toString(),
+                    decoded.getWidth(), decoded.getHeight(), path));
+            decoded.flush();
+        }
+        return images;
+    }
+
+    private List<RenderModels.Image> saveAuxiliary(RenderModels.Request request, List<RenderModels.Image> images,
+                                                   String hash, String packFingerprint) throws IOException {
+        List<RenderModels.Image> saved = new ArrayList<>();
+        for (RenderModels.Image image : images) {
+            RenderModels.View view = request.views().stream().filter(candidate -> candidate.id().equals(image.id()))
+                    .findFirst().orElseThrow(() -> new IOException("额外视图 ID 不匹配"));
+            Path target = auxiliaryPath(hash, view, request, packFingerprint);
+            Files.createDirectories(target.getParent());
+            Path temporary = target.resolveSibling(target.getFileName() + ".tmp");
+            Files.copy(image.path(), temporary, StandardCopyOption.REPLACE_EXISTING);
+            try { Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
+            catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            saved.add(new RenderModels.Image(image.id(), target.getFileName().toString(), image.width(), image.height(), target));
+        }
+        return saved;
+    }
+
+    private Path auxiliaryPath(String hash, RenderModels.View view, RenderModels.Request request, String packFingerprint) {
+        String fingerprint = cacheStore.configurationFingerprint(request, Main.VERSION, packFingerprint);
+        return cacheStore.directory().resolve(hash).resolve("extra-" + view.id() + "-" + fingerprint + ".png");
+    }
+
+    private static boolean isMapArtRequest(RenderModels.Request request) {
+        return request.views().size() == 1 && "extra-map-art".equals(request.views().getFirst().id());
+    }
+
+    /** 清理上次异常退出遗留的运行时中转图片，避免 C 盘任务目录长期累积。 */
+    private void cleanupAbandonedTaskDirectories() {
+        try {
+            Files.createDirectories(root);
+            try (var stream = Files.list(root)) {
+                for (Path child : stream.toList()) deleteTreeQuietly(child);
+            }
+        } catch (IOException error) {
+            log.accept("清理旧渲染中转目录失败：" + error.getMessage());
+        }
+    }
+
+    private static void deleteTreeQuietly(Path path) {
+        try {
+            if (!Files.exists(path)) return;
+            try (var stream = Files.walk(path)) {
+                for (Path item : stream.sorted(java.util.Comparator.reverseOrder()).toList()) {
+                    Files.deleteIfExists(item);
+                }
+            }
+        } catch (IOException ignored) { }
     }
 
     private static void validate(RenderModels.Request request, byte[] schematic) throws RenderFailure {

@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -127,6 +128,7 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
         String groupId = text(value, "group_id", "");
         String selfId = text(value, "self_id", "");
         boolean mentioned = false;
+        String quotedMessageId = "";
         List<BotAttachment> attachments = new ArrayList<>();
         JsonElement message = value.get("message");
         if (message != null && message.isJsonArray()) {
@@ -136,6 +138,7 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
                 String segmentType = text(item, "type", "");
                 JsonObject data = item.has("data") && item.get("data").isJsonObject() ? item.getAsJsonObject("data") : item;
                 if ("at".equals(segmentType)) mentioned = true;
+                if ("reply".equals(segmentType)) quotedMessageId = text(data, "id", text(data, "message_id", ""));
                 if ("file".equals(segmentType)) attachments.add(file(data));
             }
         } else if (message != null && message.isJsonPrimitive()) {
@@ -146,8 +149,17 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
             }
         }
         if (value.has("file") && value.get("file").isJsonObject()) attachments.add(file(value.getAsJsonObject("file")));
+        String rawText = text(value, "raw_message", text(value, "message", ""));
+        if (quotedMessageId.isBlank()) quotedMessageId = replyIdFromRaw(rawText);
         receiver.accept(this, new BotMessage(profile.id, messageId, userId, groupId, selfId, direct, mentioned, attachments,
-                text(value, "raw_message", text(value, "message", ""))));
+                rawText, quotedMessageId));
+    }
+
+    static String replyIdFromRaw(String text) {
+        if (text == null) return "";
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("\\[CQ:reply,id=([^,\\]]+)")
+                .matcher(text);
+        return matcher.find() ? matcher.group(1) : "";
     }
 
     private static BotAttachment file(JsonObject value) {
@@ -182,34 +194,141 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
         sendMessage(message, segments);
     }
 
-    @Override public void sendResult(BotMessage message, RenderModels.Result result, String metadata) {
-        if ("forward".equalsIgnoreCase(profile.sendMode)) {
-            try { sendForward(message, result, metadata); }
-            catch (Throwable error) { log.accept("OneBot 合并转发失败，改用联合消息：" + error.getMessage()); sendCombined(message, result, metadata); }
-        } else sendCombined(message, result, metadata);
+    @Override public void sendAnnouncement(String profileId, String groupId, String text) {
+        JsonObject params = new JsonObject();
+        params.addProperty("group_id", numberOrString(groupId));
+        JsonArray segments = new JsonArray();
+        textSegment(segments, text);
+        params.add("message", segments);
+        action("send_group_msg", params).join();
     }
 
-    private void sendForward(BotMessage message, RenderModels.Result result, String metadata) {
-        JsonArray nodes = new JsonArray();
-        for (RenderModels.Image image : result.images()) {
-            JsonObject node = new JsonObject(); node.addProperty("type", "node"); JsonObject data = new JsonObject();
-            data.addProperty("name", "Litematic GPU Agent"); data.addProperty("uin", message.selfId() == null || message.selfId().isBlank() ? "0" : message.selfId());
-            JsonArray content = new JsonArray(); content.add(imageSegment(image.path())); data.add("content", content); node.add("data", data); nodes.add(node);
+    @Override public List<BotGroup> listGroups() {
+        JsonObject response = action("get_group_list", new JsonObject()).join();
+        return parseGroupList(response);
+    }
+
+    static List<BotGroup> parseGroupList(JsonObject response) {
+        if (!response.has("data") || !response.get("data").isJsonArray())
+            throw new IllegalStateException("OneBot 未返回群列表");
+        List<BotGroup> groups = new ArrayList<>();
+        for (JsonElement item : response.getAsJsonArray("data")) {
+            if (!item.isJsonObject()) continue;
+            JsonObject group = item.getAsJsonObject();
+            String id = text(group, "group_id", "");
+            if (!id.isBlank()) groups.add(new BotGroup(id, text(group, "group_name", "")));
         }
-        JsonObject info = new JsonObject(); info.addProperty("type", "node"); JsonObject infoData = new JsonObject(); infoData.addProperty("name", "Litematic GPU Agent"); infoData.addProperty("uin", message.selfId() == null || message.selfId().isBlank() ? "0" : message.selfId());
-        JsonArray content = new JsonArray(); textSegment(content, metadata); infoData.add("content", content); info.add("data", infoData); nodes.add(info);
-        JsonObject params = targetParams(message); params.add("messages", nodes);
-        action(message.direct() ? "send_private_forward_msg" : "send_group_forward_msg", params).join();
-        if (profile.successNotice) sendText(message, projectionName(metadata) + " 已渲染成功，结果如上");
+        return groups;
     }
 
-    private void sendCombined(BotMessage message, RenderModels.Result result, String metadata) {
+    @Override public void sendResult(BotMessage message, RenderModels.Result result, String metadata) {
+        sendResult(message, result, metadata, null);
+    }
+
+    @Override public void sendResult(BotMessage message, RenderModels.Result result, String metadata, Path metadataImage) {
+        sendResultTracked(message, result, metadata, metadataImage);
+    }
+
+    @Override public List<String> sendResultTracked(BotMessage message, RenderModels.Result result, String metadata,
+                                                     Path metadataImage) {
+        String id;
+        if ("forward".equalsIgnoreCase(profile.sendMode)) {
+            try { id = sendForward(message, result, metadata, metadataImage); }
+            catch (Throwable error) {
+                log.accept("OneBot 合并转发失败，改用联合消息：" + error.getMessage());
+                id = sendCombined(message, result, metadata, metadataImage);
+            }
+        } else id = sendCombined(message, result, metadata, metadataImage);
+        return id == null || id.isBlank() ? List.of() : List.of(id);
+    }
+
+    @Override public void sendProjection(BotMessage message, RenderModels.Result result, String metadata, Path projection) {
+        sendProjection(message, result, metadata, projection, null);
+    }
+
+    @Override public void sendProjection(BotMessage message, RenderModels.Result result, String metadata,
+                                         Path projection, Path metadataImage) {
+        sendResult(message, result, metadata, metadataImage);
+        sendFile(message, projection);
+    }
+
+    @Override public void sendSearch(BotMessage message, ProjectionSearch.SearchPage page, Path contactSheet) {
+        sendSearchTracked(message, page, contactSheet);
+    }
+
+    @Override public List<String> sendSearchTracked(BotMessage message, ProjectionSearch.SearchPage page, Path contactSheet) {
+        JsonArray segments = new JsonArray();
+        addPrefix(segments, message);
+        segments.add(imageSegment(contactSheet));
+        String id = sendMessage(message, segments);
+        return id == null || id.isBlank() ? List.of() : List.of(id);
+    }
+
+    @Override public void sendImage(BotMessage message, Path image) {
+        JsonArray segments = new JsonArray();
+        addPrefix(segments, message);
+        segments.add(imageSegment(image));
+        sendMessage(message, segments);
+    }
+
+    @Override public void sendImages(BotMessage message, List<Path> images) {
+        JsonArray segments = new JsonArray();
+        addPrefix(segments, message);
+        for (Path image : images) segments.add(imageSegment(image));
+        sendMessage(message, segments);
+    }
+
+    @Override public void sendFile(BotMessage message, Path projection) {
+        if (projection == null || !Files.isRegularFile(projection)) throw new IllegalArgumentException("缓存中没有投影文件");
+        JsonObject params = targetParams(message);
+        params.addProperty("file", projection.toAbsolutePath().toString());
+        params.addProperty("name", projection.getFileName().toString());
+        try {
+            action(message.direct() ? "upload_private_file" : "upload_group_file", params).join();
+        } catch (Throwable error) {
+            log.accept("OneBot 文件上传接口失败，改用文件消息：" + error.getMessage());
+            JsonArray segments = new JsonArray();
+            addPrefix(segments, message);
+            segments.add(fileSegment(projection));
+            sendMessage(message, segments);
+        }
+    }
+
+    private String sendForward(BotMessage message, RenderModels.Result result, String metadata, Path metadataImage) {
+        JsonArray nodes = new JsonArray();
+        if (metadataImage != null) {
+            nodes.add(forwardImageNode(message, metadataImage));
+        } else {
+            for (RenderModels.Image image : result.images()) nodes.add(forwardImageNode(message, image.path()));
+            if (metadata != null && !metadata.isBlank()) {
+                JsonObject info = new JsonObject(); info.addProperty("type", "node"); JsonObject infoData = new JsonObject(); infoData.addProperty("name", "Litematic GPU Agent"); infoData.addProperty("uin", message.selfId() == null || message.selfId().isBlank() ? "0" : message.selfId());
+                JsonArray content = new JsonArray(); textSegment(content, metadata); infoData.add("content", content); info.add("data", infoData); nodes.add(info);
+            }
+        }
+        JsonObject params = targetParams(message); params.add("messages", nodes);
+        String messageId = responseMessageId(action(message.direct() ? "send_private_forward_msg" : "send_group_forward_msg", params).join());
+        if (profile.successNotice) sendText(message, projectionName(metadata) + " 已渲染成功，结果如上");
+        return messageId;
+    }
+
+    private String sendCombined(BotMessage message, RenderModels.Result result, String metadata, Path metadataImage) {
         JsonArray segments = new JsonArray(); addPrefix(segments, message);
-        for (RenderModels.Image image : result.images()) segments.add(imageSegment(image.path()));
-        String text = metadata == null ? "" : metadata;
+        if (metadataImage != null) segments.add(imageSegment(metadataImage));
+        else for (RenderModels.Image image : result.images()) segments.add(imageSegment(image.path()));
+        String text = metadataImage == null && metadata != null ? metadata : "";
         if (profile.successNotice) text += "\n" + projectionName(metadata) + " 已渲染成功";
         textSegment(segments, text);
-        sendMessage(message, segments);
+        return sendMessage(message, segments);
+    }
+
+    private JsonObject forwardImageNode(BotMessage message, Path image) {
+        JsonObject node = new JsonObject(); node.addProperty("type", "node");
+        JsonObject data = new JsonObject();
+        data.addProperty("name", "Litematic GPU Agent");
+        data.addProperty("uin", message.selfId() == null || message.selfId().isBlank() ? "0" : message.selfId());
+        JsonArray content = new JsonArray(); content.add(imageSegment(image)); data.add("content", content);
+        node.add("data", data);
+        return node;
     }
 
     private void addPrefix(JsonArray segments, BotMessage message) {
@@ -223,10 +342,16 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
         textSegment(segments, "\n");
     }
 
-    private void sendMessage(BotMessage message, JsonArray segments) {
+    private String sendMessage(BotMessage message, JsonArray segments) {
         JsonObject params = targetParams(message); params.add("message", segments);
         String actionName = message.direct() ? "send_private_msg" : "send_group_msg";
-        action(actionName, params).join();
+        return responseMessageId(action(actionName, params).join());
+    }
+
+    private static String responseMessageId(JsonObject response) {
+        if (response == null || !response.has("data") || !response.get("data").isJsonObject()) return "";
+        JsonObject data = response.getAsJsonObject("data");
+        return text(data, "message_id", text(data, "id", ""));
     }
 
     private JsonObject targetParams(BotMessage message) {
@@ -279,6 +404,7 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
     }
 
     private static JsonObject imageSegment(Path path) { JsonObject value = new JsonObject(); value.addProperty("type", "image"); JsonObject data = new JsonObject(); data.addProperty("file", path.toUri().toString()); value.add("data", data); return value; }
+    private static JsonObject fileSegment(Path path) { JsonObject value = new JsonObject(); value.addProperty("type", "file"); JsonObject data = new JsonObject(); data.addProperty("file", path.toAbsolutePath().toString()); data.addProperty("name", path.getFileName().toString()); value.add("data", data); return value; }
     private static void textSegment(JsonArray array, String text) { JsonObject value = new JsonObject(); value.addProperty("type", "text"); JsonObject data = new JsonObject(); data.addProperty("text", text == null ? "" : text); value.add("data", data); array.add(value); }
     private static String projectionName(String metadata) { if (metadata == null) return "schematic"; String line = metadata.lines().findFirst().orElse(""); int colon = line.indexOf('：'); return colon >= 0 ? line.substring(colon + 1).replaceFirst("\\.litematic$", "") : "schematic"; }
     private static String text(JsonObject value, String key, String fallback) { try { return value != null && value.has(key) ? value.get(key).getAsString() : fallback; } catch (RuntimeException ignored) { return fallback; } }

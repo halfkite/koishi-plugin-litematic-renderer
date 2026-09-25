@@ -25,8 +25,8 @@ import java.util.function.Consumer;
  * JSON5 文件写成严格 JSON 子集，Node、Gson 以及常见编辑器都可以直接读取。
  */
 final class CacheStore {
-    static final int FORMAT_VERSION = 18;
-    private static final String LIGHTING_PROFILE = "top-light-v3-per-view-brightness-v2-bottom-base-150-v1-dynamic-fullbright-sim-y64-smart-fill-v4";
+    static final int FORMAT_VERSION = 21;
+    private static final String LIGHTING_PROFILE = "top-light-v3-per-view-brightness-v2-bottom-base-150-v1-dynamic-fullbright-sim-y64-smart-fill-v5-no-beacon-beams-v1";
     private static final String INDEX_NAME = "index.json5";
     private static final String ABOUT_NAME = "about.json5";
     private static final String[] IMAGE_IDS = {"isometric", "isometric-reverse", "six-face"};
@@ -41,6 +41,11 @@ final class CacheStore {
         this.directory = config.cacheDirectory != null && !config.cacheDirectory.isBlank()
                 ? Path.of(config.cacheDirectory).toAbsolutePath().normalize()
                 : applicationRoot.resolve("litematic-renderer-cache").toAbsolutePath().normalize();
+        try {
+            ProjectionCacheIndex.rebuild(directory);
+        } catch (IOException error) {
+            this.log.accept("生成投影缓存索引失败，将在后续操作重试：" + error.getMessage());
+        }
     }
 
     Path directory() { return directory; }
@@ -62,11 +67,72 @@ final class CacheStore {
 
     String hash(byte[] schematic) { return sha256(schematic); }
 
+    /**
+     * Imports a source schematic into the shared cache. Imported archives intentionally do not
+     * restore PNGs: the current render signature still has to validate every image before use.
+     */
+    ImportedProjection importProjection(byte[] schematic, String requestedFilename) throws IOException {
+        if (schematic == null || schematic.length == 0) throw new IOException("投影文件为空");
+        LitematicMetadata.validateNbtRoot(schematic);
+        String fileHash = hash(schematic);
+        Path entry = directory.resolve(fileHash);
+        Files.createDirectories(entry);
+        String storedFilename = storedFilename(entry, requestedFilename);
+        Path projection = entry.resolve(storedFilename).normalize();
+        if (!projection.startsWith(entry)) throw new IOException("投影文件名无效");
+        boolean created = !Files.isRegularFile(projection);
+        if (created) atomicWrite(projection, schematic);
+        Path aboutPath = entry.resolve(ABOUT_NAME);
+        if (!Files.isRegularFile(aboutPath)) {
+            JsonObject about = new JsonObject();
+            about.addProperty("缓存格式版本", FORMAT_VERSION);
+            about.addProperty("文件哈希", fileHash);
+            about.addProperty("投影文件名", nullToDefault(requestedFilename, storedFilename));
+            about.addProperty("存储投影文件名", storedFilename);
+            about.addProperty("投影大小", schematic.length);
+            addProjectionSaveTime(about, schematic);
+            about.addProperty("云端插件版本", "0");
+            about.addProperty("本地工具版本", Main.VERSION);
+            about.addProperty("有效工具版本", Main.VERSION);
+            about.addProperty("有效工具", "待渲染");
+            about.addProperty("Minecraft版本", RuntimeInstaller.MINECRAFT_VERSION);
+            about.addProperty("Java版本", System.getProperty("java.version", "unknown"));
+            about.addProperty("GPU", "imported");
+            about.addProperty("材质包指纹", "");
+            about.addProperty("夜视", config.nightVisionEnabled);
+            about.addProperty("夜视亮度等级", Math.max(1, Math.min(15, config.nightVisionLevel)));
+            about.addProperty("光照配置", LIGHTING_PROFILE);
+            about.addProperty("出图配置识别数", "");
+            about.addProperty("配置指纹", "");
+            about.add("视角", new JsonArray());
+            about.add("视角亮度", new JsonArray());
+            about.add("图片", new JsonArray());
+            about.addProperty("缓存调用次数", 0);
+            about.addProperty("渲染次数", 0);
+            about.addProperty("来源", "导入缓存");
+            about.addProperty("缓存状态", "待重新渲染");
+            about.addProperty("更新时间", Instant.now().toString());
+            atomicWrite(aboutPath, PRETTY_GSON.toJson(about).getBytes(StandardCharsets.UTF_8));
+        }
+        updateIndex(fileHash, storedFilename);
+        touch(entry);
+        return new ImportedProjection(projection, created, fileHash);
+    }
+
     String configurationFingerprint(RenderModels.Request request, String toolVersion, String packFingerprint) {
         return sha256(configurationPayload(request, toolVersion, packFingerprint).getBytes(StandardCharsets.UTF_8));
     }
 
     CacheHit lookup(RenderModels.Request request, byte[] schematic, String toolVersion, String packFingerprint) {
+        return lookup(request, schematic, toolVersion, packFingerprint, true);
+    }
+
+    boolean isCurrent(RenderModels.Request request, byte[] schematic, String toolVersion, String packFingerprint) {
+        return lookup(request, schematic, toolVersion, packFingerprint, false) != null;
+    }
+
+    private CacheHit lookup(RenderModels.Request request, byte[] schematic, String toolVersion,
+                            String packFingerprint, boolean recordUsage) {
         String fileHash = hash(schematic);
         Path entry = directory.resolve(fileHash);
         Path aboutPath = entry.resolve(ABOUT_NAME);
@@ -89,11 +155,65 @@ final class CacheStore {
                 images.add(new RenderModels.Image(view.id(), imagePath.getFileName().toString(),
                         image.getWidth(), image.getHeight(), imagePath));
             }
-            touch(entry);
+            if (recordUsage) {
+                about.addProperty("缓存调用次数", longValue(about, "缓存调用次数") + 1);
+                about.addProperty("最近缓存调用时间", Instant.now().toString());
+                atomicWrite(aboutPath, PRETTY_GSON.toJson(about).getBytes(StandardCharsets.UTF_8));
+                touch(entry);
+                evict(entry);
+            }
             return new CacheHit(fileHash, entry, images, string(about, "GPU"));
         } catch (Exception error) {
             log.accept("缓存读取失败，将重新渲染：" + error.getMessage());
             return null;
+        }
+    }
+
+    /** Removes stale rendered PNGs but deliberately keeps the source schematic and about.json5. */
+    boolean invalidateImages(String fileHash) {
+        if (fileHash == null || !fileHash.matches("[0-9a-fA-F]{64}")) return false;
+        Path entry = directory.resolve(fileHash.toLowerCase(java.util.Locale.ROOT)).normalize();
+        if (!entry.startsWith(directory) || !Files.isDirectory(entry)) return false;
+        boolean removed = false;
+        try (var files = Files.list(entry)) {
+            for (Path path : files.filter(path -> path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".png")).toList()) {
+                removed |= Files.deleteIfExists(path);
+            }
+        } catch (IOException error) {
+            log.accept("清理失效投影图片缓存失败：" + error.getMessage());
+        }
+        if (!removed) return false;
+        Path aboutPath = entry.resolve(ABOUT_NAME);
+        try {
+            if (Files.isRegularFile(aboutPath)) {
+                JsonObject about = Protocol.GSON.fromJson(Files.readString(aboutPath), JsonObject.class);
+                if (about != null) {
+                    about.add("图片", new JsonArray());
+                    about.addProperty("缓存状态", "待重新渲染");
+                    about.addProperty("缓存失效时间", Instant.now().toString());
+                    atomicWrite(aboutPath, PRETTY_GSON.toJson(about).getBytes(StandardCharsets.UTF_8));
+                }
+            }
+        } catch (Exception error) {
+            log.accept("更新失效投影缓存记录失败：" + error.getMessage());
+        }
+        return true;
+    }
+
+    /** Marks a cached projection as used by the search/send workflow. */
+    void recordUsage(Path entry) {
+        if (entry == null) return;
+        try {
+            Path aboutPath = entry.resolve(ABOUT_NAME);
+            if (!Files.isRegularFile(aboutPath)) return;
+            JsonObject about = Protocol.GSON.fromJson(Files.readString(aboutPath), JsonObject.class);
+            if (about == null) return;
+            about.addProperty("缓存调用次数", longValue(about, "缓存调用次数") + 1);
+            about.addProperty("最近缓存调用时间", Instant.now().toString());
+            atomicWrite(aboutPath, PRETTY_GSON.toJson(about).getBytes(StandardCharsets.UTF_8));
+            touch(entry);
+        } catch (Exception error) {
+            log.accept("更新投影缓存调用次数失败：" + error.getMessage());
         }
     }
 
@@ -135,6 +255,7 @@ final class CacheStore {
         about.addProperty("投影文件名", request.filename());
         about.addProperty("存储投影文件名", storedFilename);
         about.addProperty("投影大小", schematic.length);
+        addProjectionSaveTime(about, schematic);
         about.addProperty("云端插件版本", nullToDefault(request.pluginVersion(), "0"));
         about.addProperty("本地工具版本", Main.VERSION);
         about.addProperty("有效工具版本", Main.VERSION);
@@ -152,6 +273,9 @@ final class CacheStore {
         about.add("视角", Protocol.GSON.toJsonTree(normalizedViews(request.views())));
         about.add("视角亮度", brightnessMetadata(request.views()));
         about.add("图片", imageMetadata);
+        about.addProperty("缓存调用次数", previousCallCount(entry) + 1);
+        about.addProperty("渲染次数", previousRenderCount(entry) + 1);
+        about.addProperty("最近缓存调用时间", Instant.now().toString());
         about.addProperty("来源", nullToDefault(source, "本地"));
         about.addProperty("群号", meta == null ? "-" : nullToDefault(meta.group(), "-"));
         about.addProperty("发送人", meta == null ? "-" : nullToDefault(meta.user(), "-"));
@@ -159,9 +283,40 @@ final class CacheStore {
         about.addProperty("更新时间", Instant.now().toString());
         atomicWrite(entry.resolve(ABOUT_NAME), PRETTY_GSON.toJson(about).getBytes(StandardCharsets.UTF_8));
         updateIndex(fileHash, storedFilename);
+        ProjectionCacheIndex.upsert(directory, fileHash, request.filename(), storedFilename);
         touch(entry);
-        evict();
+        evict(entry);
         return cachedImages;
+    }
+
+    private long previousCallCount(Path entry) {
+        try {
+            Path aboutPath = entry.resolve(ABOUT_NAME);
+            if (!Files.isRegularFile(aboutPath)) return 0;
+            JsonObject about = Protocol.GSON.fromJson(Files.readString(aboutPath), JsonObject.class);
+            return longValue(about, "缓存调用次数");
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private long previousRenderCount(Path entry) {
+        try {
+            Path aboutPath = entry.resolve(ABOUT_NAME);
+            if (!Files.isRegularFile(aboutPath)) return 0;
+            JsonObject about = Protocol.GSON.fromJson(Files.readString(aboutPath), JsonObject.class);
+            return about != null && about.has("渲染次数")
+                    ? longValue(about, "渲染次数") : longValue(about, "缓存调用次数");
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private static void addProjectionSaveTime(JsonObject about, byte[] schematic) {
+        try {
+            Long createdAt = LitematicMetadata.parse(schematic).createdAtMillis();
+            if (createdAt != null) about.addProperty("投影保存时间", createdAt);
+        } catch (IOException ignored) { }
     }
 
     private String storedFilename(Path entry, String requested) throws IOException {
@@ -210,9 +365,11 @@ final class CacheStore {
         return item;
     }
 
-    private void evict() {
-        long maximum = Math.max(0, config.cacheMaxBytes);
-        if (maximum <= 0) return;
+    /** Enforces independent recent/history image quotas; source projections are never evicted. */
+    private void evict(Path protectedEntry) {
+        long recentMaximum = Math.max(0, config.cacheRecentImageMaxBytes);
+        long historicalMaximum = Math.max(0, config.cacheHistoricalImageMaxBytes);
+        if (recentMaximum == Long.MAX_VALUE && historicalMaximum == Long.MAX_VALUE) return;
         try {
             if (!Files.isDirectory(directory)) return;
             List<Path> entries;
@@ -221,20 +378,118 @@ final class CacheStore {
                         .filter(path -> path.getFileName().toString().matches("[0-9a-fA-F]{64}"))
                         .toList();
             }
-            long total = entries.stream().mapToLong(CacheStore::size).sum();
-            if (total <= maximum) return;
-            List<Path> sorted = new ArrayList<>(entries);
-            sorted.sort(Comparator.comparingLong(CacheStore::modified));
-            for (Path entry : sorted) {
-                if (total <= maximum) break;
-                long size = size(entry);
-                deleteTree(entry);
-                total -= size;
+            Path protectedPath = protectedEntry == null ? null : protectedEntry.toAbsolutePath().normalize();
+            List<ImageCandidate> recentCandidates = new ArrayList<>();
+            List<ImageCandidate> historicalCandidates = new ArrayList<>();
+            long recentBytes = 0;
+            long historicalBytes = 0;
+            for (Path entry : entries) {
+                boolean protectedCurrent = protectedPath != null && entry.toAbsolutePath().normalize().equals(protectedPath);
+                long calls = 0;
+                long savedAt = 0;
+                try {
+                    Path aboutPath = entry.resolve(ABOUT_NAME);
+                    if (Files.isRegularFile(aboutPath)) {
+                        JsonObject about = Protocol.GSON.fromJson(Files.readString(aboutPath), JsonObject.class);
+                        calls = longValue(about, "缓存调用次数");
+                        savedAt = longValue(about, "投影保存时间");
+                    }
+                } catch (Exception ignored) { }
+                long lastUsed = modified(entry);
+                boolean recent = isRecentProjection(savedAt);
+                try (var stream = Files.list(entry)) {
+                    for (Path image : stream.filter(path -> Files.isRegularFile(path)
+                            && isCachedImage(path)).toList()) {
+                        long imageBytes = fileSize(image);
+                        if (recent) {
+                            recentBytes += imageBytes;
+                            if (!protectedCurrent) recentCandidates.add(new ImageCandidate(entry, image, calls, lastUsed, isSearchPreview(image)));
+                        } else {
+                            historicalBytes += imageBytes;
+                            if (!protectedCurrent) historicalCandidates.add(new ImageCandidate(entry, image, calls, lastUsed, isSearchPreview(image)));
+                        }
+                    }
+                }
             }
+            List<Path> changedEntries = new ArrayList<>();
+            recentBytes = evictPool(recentCandidates, recentBytes, recentMaximum, changedEntries);
+            historicalBytes = evictPool(historicalCandidates, historicalBytes, historicalMaximum, changedEntries);
+            for (Path entry : changedEntries) refreshImageMetadata(entry);
+            if (recentBytes > recentMaximum) log.accept("近期投影图片缓存仍超过上限，受保护的当前投影无法清理");
+            if (historicalBytes > historicalMaximum) log.accept("历史投影图片缓存仍超过上限，受保护的当前投影无法清理");
         } catch (Exception error) {
             log.accept("缓存清理失败：" + error.getMessage());
         }
     }
+
+    private static long evictPool(List<ImageCandidate> candidates, long bytes, long maximum, List<Path> changedEntries) throws IOException {
+        candidates.sort(Comparator.comparing(ImageCandidate::searchPreview)
+                .thenComparingLong(ImageCandidate::calls)
+                .thenComparingLong(ImageCandidate::lastUsed)
+                .thenComparingLong(candidate -> -fileSize(candidate.path())));
+        for (ImageCandidate candidate : candidates) {
+            if (bytes <= maximum) break;
+            long size = fileSize(candidate.path());
+            if (size <= 0 || !Files.deleteIfExists(candidate.path())) continue;
+            bytes -= size;
+            if (!changedEntries.contains(candidate.entry())) changedEntries.add(candidate.entry());
+        }
+        return bytes;
+    }
+
+    private static boolean isRecentProjection(long savedAt) {
+        long now = System.currentTimeMillis();
+        return savedAt > 0 && savedAt <= now && now - savedAt <= 365L * 24 * 60 * 60 * 1000;
+    }
+
+    private static boolean isCachedImage(Path path) {
+        String name = path.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
+        return name.endsWith(".png") || name.equals("search-preview.jpg");
+    }
+
+    private static boolean isSearchPreview(Path path) {
+        return path.getFileName().toString().equalsIgnoreCase("search-preview.jpg");
+    }
+
+    private void refreshImageMetadata(Path entry) throws IOException {
+        Path aboutPath = entry.resolve(ABOUT_NAME);
+        if (!Files.isRegularFile(aboutPath)) return;
+        JsonObject about = Protocol.GSON.fromJson(Files.readString(aboutPath), JsonObject.class);
+        if (about == null) return;
+        about.add("图片", imageMetadata(entry));
+        about.addProperty("最近缓存清理时间", Instant.now().toString());
+        atomicWrite(aboutPath, PRETTY_GSON.toJson(about).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static JsonArray imageMetadata(Path entry) throws IOException {
+        JsonArray result = new JsonArray();
+        try (var stream = Files.list(entry)) {
+            for (Path path : stream.filter(file -> Files.isRegularFile(file) && isCachedImage(file)).sorted().toList()) {
+                var image = ImageIO.read(path.toFile());
+                if (image == null) continue;
+                JsonObject item = new JsonObject();
+                item.addProperty("文件名", path.getFileName().toString());
+                item.addProperty("宽", image.getWidth());
+                item.addProperty("高", image.getHeight());
+                item.addProperty("大小", Files.size(path));
+                item.addProperty("SHA-256", sha256(Files.readAllBytes(path)));
+                result.add(item);
+            }
+        }
+        return result;
+    }
+
+    private static long fileSize(Path path) {
+        try { return Files.size(path); } catch (IOException ignored) { return 0; }
+    }
+
+    private static long longValue(JsonObject object, String name) {
+        if (object == null || !object.has(name) || object.get(name).isJsonNull()) return 0;
+        try { return Math.max(0, object.get(name).getAsLong()); }
+        catch (RuntimeException ignored) { return 0; }
+    }
+
+    private record ImageCandidate(Path entry, Path path, long calls, long lastUsed, boolean searchPreview) {}
 
     private static String imageName(String id) {
         if ("isometric".equals(id)) return "isometric.png";
@@ -376,6 +631,8 @@ final class CacheStore {
         try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)); }
         catch (Exception error) { throw new IllegalStateException(error); }
     }
+
+    record ImportedProjection(Path path, boolean created, String fileHash) {}
 
     record CacheHit(String fileHash, Path directory, List<RenderModels.Image> images, String gpu) {}
 }

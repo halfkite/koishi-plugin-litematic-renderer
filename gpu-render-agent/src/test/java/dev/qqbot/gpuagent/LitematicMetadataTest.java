@@ -28,7 +28,7 @@ class LitematicMetadataTest {
         AgentConfig config = new AgentConfig();
         String text = LitematicMetadata.format(data, "铁合块.litematic", config);
         assertEquals("投影名称：铁合块\n保存者游戏 ID：半筝\n创建时间：2024-11-06 22:19:46\n"
-                        + "方块数/体积：75/105\n尺寸：3 × 5 × 7\nLitematic 版本：7\n游戏版本：1.21（数据版本：3953）", text);
+                        + "方块数体积：75/105\n尺寸：3 × 5 × 7\nLitematic 版本：7\n游戏版本：1.21（数据版本：3953）", text);
     }
 
     @Test
@@ -40,7 +40,7 @@ class LitematicMetadataTest {
         assertTrue(text.contains("投影名称：demo"));
         assertFalse(text.contains("保存者游戏 ID"));
         assertFalse(text.contains("尺寸"));
-        assertTrue(text.contains("方块数/体积：1/2"));
+        assertTrue(text.contains("方块数体积：1/2"));
         assertTrue(text.contains("游戏版本：1.21（数据版本：3953）"));
     }
 

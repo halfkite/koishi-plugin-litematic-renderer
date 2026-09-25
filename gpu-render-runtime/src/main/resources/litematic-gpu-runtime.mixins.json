@@ -3,10 +3,11 @@
   "package": "com.yiyihehe.quickcraft.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
-    "LitematicaFeatureRenderDispatcherAccessor",
-    "LitematicaStagedVertexBufferAccessor",
+    "GpuClientTickMixin",
     "RenderSetupAccessor",
-    "RenderTypePreviewMixin"
+    "RenderTypePreviewMixin",
+    "HeadlessMalilibMessageMixin",
+    "LitematicaBlockEntityConversionMixin"
   ],
   "injectors": { "defaultRequire": 1 }
 }

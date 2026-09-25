@@ -22,38 +22,67 @@ import java.util.List;
 import java.util.Map;
 import java.util.HexFormat;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 
 final class RuntimeInstaller {
-    static final String MINECRAFT_VERSION = "26.2";
-    static final String FABRIC_LOADER_VERSION = "0.19.3";
+    static final String MINECRAFT_VERSION = "26.3";
+    static final String FABRIC_LOADER_VERSION = "0.19.5";
     /**
      * Bump this whenever the Fabric launch/class-loader setup changes. Fabric's
      * processed nested-mod output is not compatible across those changes even
      * when the bundled renderer JAR itself has the same SHA-256.
      */
-    private static final String FABRIC_CACHE_FORMAT = "fabric-cache-v2";
+    private static final String FABRIC_CACHE_FORMAT = "fabric-cache-v3";
     private static final String VERSION_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     private static final String FABRIC_PROFILE = "https://meta.fabricmc.net/v2/versions/loader/%s/%s/profile/json";
+    private static final String MODRINTH_VERSION = "https://api.modrinth.com/v2/version/%s";
+    private static final List<ModVersion> UPSTREAM_MODS = List.of(
+            new ModVersion("Fabric API", "bNnaTiuM", "fabric-api-0.161.0+26.3.jar",
+                    "ed6b2586d6fde11fde8472f5a527c51e99b67026e46f94d4bfd85e7e28ce5ee299173ee16ad576ceb51f39f98d30a811086a6deb1a86a524859cc16e12da109d"),
+            new ModVersion("MaLiLib", "DPcJACN6", "malilib-fabric-26.3-0.30.1.jar",
+                    "65ea34b14757ce1c37f87bc4a519d1290d2a715f77bcb370e47b46d99756b5fccb4f18a636e425dfe66e7526791945273782813fb828e6b9686a2024ce1250bc"),
+            new ModVersion("Litematica", "fEqsesPK", "litematica-fabric-26.3-0.29.0.jar",
+                    "cf0c0310acf8a40eb2a3365061f10611d048771e65a63e6f9679df5da282406d27d93b259b98dee5a9d2107cc21b3c06935608c311cad3110fb0985d9683f3a1"));
+
+    private record ModVersion(String name, String versionId, String filename, String sha512) {}
 
     private final Path runtimeRoot;
     private final Path gameDirectory;
+    private final AgentConfig config;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30))
             .followRedirects(HttpClient.Redirect.NORMAL).build();
     private Consumer<String> log = ignored -> {};
+    private Consumer<InstallProgress> progressListener = ignored -> {};
+    private volatile InstallProgress progress = InstallProgress.idle();
+    private final AtomicLong totalBytes = new AtomicLong();
+    private final AtomicLong completedBytes = new AtomicLong();
+    private final AtomicLong totalFiles = new AtomicLong();
+    private final AtomicLong completedFiles = new AtomicLong();
+    private volatile String stage = "未安装";
+    private volatile String currentFile = "";
 
-    RuntimeInstaller(Path runtimeRoot) {
+    RuntimeInstaller(Path runtimeRoot, AgentConfig config) {
         this.runtimeRoot = runtimeRoot;
         this.gameDirectory = runtimeRoot.resolve("game");
+        this.config = config;
     }
+
+    RuntimeInstaller(Path runtimeRoot) { this(runtimeRoot, null); }
 
     void setLog(Consumer<String> log) { this.log = log; }
 
+    void setProgress(Consumer<InstallProgress> listener) { this.progressListener = listener == null ? ignored -> {} : listener; }
+
+    InstallProgress progress() { return progress; }
+
     LaunchSpec install() throws Exception {
+        beginInstall();
         Files.createDirectories(runtimeRoot);
         Files.createDirectories(gameDirectory.resolve("mods"));
-        installBundledMods();
+        installMods();
         JsonObject manifest = json(VERSION_MANIFEST);
         JsonObject versionRef = null;
         for (JsonElement element : manifest.getAsJsonArray("versions")) {
@@ -67,7 +96,7 @@ final class RuntimeInstaller {
         JsonObject fabric = json(FABRIC_PROFILE.formatted(MINECRAFT_VERSION, FABRIC_LOADER_VERSION));
 
         Path clientJar = runtimeRoot.resolve("versions").resolve(MINECRAFT_VERSION).resolve(MINECRAFT_VERSION + ".jar");
-        download(version.getAsJsonObject("downloads").getAsJsonObject("client"), clientJar);
+        installClient(version.getAsJsonObject("downloads").getAsJsonObject("client"), clientJar);
         JsonObject assetIndex = version.getAsJsonObject("assetIndex");
         Path assetIndexPath = runtimeRoot.resolve("assets/indexes").resolve(assetIndex.get("id").getAsString() + ".json");
         download(assetIndex, assetIndexPath);
@@ -87,7 +116,55 @@ final class RuntimeInstaller {
         List<String> gameArguments = resolveGameArguments(version);
         List<String> fabricJvmArguments = resolveArguments(fabric.getAsJsonObject("arguments"), "jvm");
         String assetId = assetIndex.get("id").getAsString();
+        finishInstall();
         return new LaunchSpec(fabric.get("mainClass").getAsString(), classpath, natives, fabricJvmArguments, gameArguments, assetId);
+    }
+
+    private void beginInstall() {
+        totalBytes.set(0); completedBytes.set(0); totalFiles.set(0); completedFiles.set(0);
+        updateProgress("准备 Minecraft " + MINECRAFT_VERSION, "", true);
+    }
+
+    private void finishInstall() { updateProgress("Minecraft " + MINECRAFT_VERSION + " 已准备", "", true); }
+
+    private void updateProgress(String nextStage, String file, boolean force) {
+        stage = nextStage == null ? "" : nextStage;
+        currentFile = file == null ? "" : file;
+        InstallProgress next = new InstallProgress(stage, currentFile, completedBytes.get(), totalBytes.get(), completedFiles.get(), totalFiles.get(), System.currentTimeMillis());
+        progress = next;
+        if (force || next.changedFrom(progress)) {
+            try { progressListener.accept(next); } catch (Throwable ignored) { }
+        } else {
+            try { progressListener.accept(next); } catch (Throwable ignored) { }
+        }
+    }
+
+    private void emitProgress() {
+        InstallProgress next = new InstallProgress(stage, currentFile, completedBytes.get(), totalBytes.get(), completedFiles.get(), totalFiles.get(), System.currentTimeMillis());
+        progress = next;
+        try { progressListener.accept(next); } catch (Throwable ignored) { }
+    }
+
+    private void registerFile(long size) {
+        totalFiles.incrementAndGet();
+        if (size > 0) totalBytes.addAndGet(size);
+        emitProgress();
+    }
+
+    private void completeFile(long size, boolean downloaded) {
+        if (!downloaded && size > 0) completedBytes.addAndGet(size);
+        completedFiles.incrementAndGet();
+        emitProgress();
+    }
+
+    record InstallProgress(String stage, String currentFile, long completedBytes, long totalBytes,
+                           long completedFiles, long totalFiles, long timestamp) {
+        static InstallProgress idle() { return new InstallProgress("未安装", "", 0, 0, 0, 0, System.currentTimeMillis()); }
+        double fraction() {
+            if (totalBytes > 0) return Math.max(0, Math.min(1, completedBytes / (double) totalBytes));
+            return totalFiles > 0 ? Math.max(0, Math.min(1, completedFiles / (double) totalFiles)) : 0;
+        }
+        boolean changedFrom(InstallProgress other) { return other == null || timestamp != other.timestamp; }
     }
 
     static Path normalizeClasspathEntry(Path path) {
@@ -104,18 +181,66 @@ final class RuntimeInstaller {
         classpath.sort(Comparator.comparing(path -> path.toString().toLowerCase(java.util.Locale.ROOT)));
     }
 
-    private void installBundledMods() throws IOException {
+    private void installMods() throws Exception {
         Path target = gameDirectory.resolve("mods/litematic-gpu-runtime.jar");
         copyResource("/renderer/litematic-gpu-runtime.jar", target);
+        for (ModVersion mod : UPSTREAM_MODS) installUpstreamMod(mod);
         ensureFabricCacheCurrent(gameDirectory, target, log);
     }
 
-    /** 为并行渲染的额外客户端槽位准备 mods 目录（其余运行时文件都在共享的 runtime 根目录）。 */
+    private void installUpstreamMod(ModVersion mod) throws Exception {
+        Path target = gameDirectory.resolve("mods").resolve(mod.filename());
+        if (Files.isRegularFile(target) && mod.sha512().equalsIgnoreCase(hash(target, "SHA-512"))) {
+            registerFile(Files.size(target));
+            completeFile(Files.size(target), false);
+            return;
+        }
+        JsonObject version = json(MODRINTH_VERSION.formatted(mod.versionId()));
+        JsonObject file = null;
+        for (JsonElement element : version.getAsJsonArray("files")) {
+            JsonObject candidate = element.getAsJsonObject();
+            if (mod.filename().equals(candidate.get("filename").getAsString())) {
+                file = candidate;
+                break;
+            }
+        }
+        if (file == null || !mod.sha512().equalsIgnoreCase(file.getAsJsonObject("hashes").get("sha512").getAsString())) {
+            throw new IOException("Modrinth 上的 " + mod.name() + " 固定版本文件与预期不符");
+        }
+        String url = file.get("url").getAsString();
+        if (!"cdn.modrinth.com".equalsIgnoreCase(URI.create(url).getHost())) {
+            throw new IOException("Modrinth 文件地址不是官方 CDN：" + mod.name());
+        }
+        Path verified = target.resolveSibling(mod.filename() + ".download");
+        Files.deleteIfExists(verified);
+        try {
+            updateProgress("下载 Modrinth 模组 " + mod.name(), mod.filename(), true);
+            download(url, verified, file.get("size").getAsLong());
+            if (!mod.sha512().equalsIgnoreCase(hash(verified, "SHA-512"))) {
+                throw new IOException(mod.name() + " SHA-512 校验失败");
+            }
+            Files.move(verified, target, StandardCopyOption.REPLACE_EXISTING);
+            log.accept("已从 Modrinth 安装原版 " + mod.name() + "：" + mod.filename());
+        } finally {
+            Files.deleteIfExists(verified);
+        }
+    }
+
+    /** 并行客户端使用同一组已经校验过的原版模组文件。 */
     void copyBundledMods(Path targetGameDirectory) throws IOException {
         Files.createDirectories(targetGameDirectory.resolve("mods"));
-        Path target = targetGameDirectory.resolve("mods/litematic-gpu-runtime.jar");
-        copyResource("/renderer/litematic-gpu-runtime.jar", target);
-        ensureFabricCacheCurrent(targetGameDirectory, target, log);
+        List<String> filenames = new ArrayList<>();
+        filenames.add("litematic-gpu-runtime.jar");
+        for (ModVersion mod : UPSTREAM_MODS) filenames.add(mod.filename());
+        for (String filename : filenames) {
+            Path source = gameDirectory.resolve("mods").resolve(filename);
+            Path target = targetGameDirectory.resolve("mods").resolve(filename);
+            if (!Files.isRegularFile(source)) throw new IOException("主客户端缺少模组：" + filename);
+            if (!Files.isRegularFile(target) || !sameFileContent(source, target)) {
+                Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        ensureFabricCacheCurrent(targetGameDirectory, targetGameDirectory.resolve("mods/litematic-gpu-runtime.jar"), log);
     }
 
     /**
@@ -123,7 +248,19 @@ final class RuntimeInstaller {
      * so an upgraded runtime cannot reuse processed modules from an older JAR.
      */
     static void ensureFabricCacheCurrent(Path gameDirectory, Path runtimeJar, Consumer<String> log) throws IOException {
-        String fingerprint = FABRIC_CACHE_FORMAT + ":" + sha256(runtimeJar);
+        List<Path> mods;
+        Path modsDirectory = gameDirectory.resolve("mods");
+        if (Files.isDirectory(modsDirectory)) {
+            try (var files = Files.list(modsDirectory)) {
+                mods = files.filter(path -> path.getFileName().toString().endsWith(".jar"))
+                        .sorted(Comparator.comparing(path -> path.getFileName().toString())).toList();
+            }
+        } else {
+            mods = List.of(runtimeJar);
+        }
+        StringBuilder signature = new StringBuilder(FABRIC_CACHE_FORMAT);
+        for (Path mod : mods) signature.append(':').append(mod.getFileName()).append('=').append(sha256(mod));
+        String fingerprint = signature.toString();
         Path fabricDirectory = gameDirectory.resolve(".fabric");
         Path marker = fabricDirectory.resolve("litematic-gpu-runtime.sha256");
         String previous = Files.isRegularFile(marker) ? Files.readString(marker).trim() : "";
@@ -149,9 +286,17 @@ final class RuntimeInstaller {
     }
 
     private static String sha256(Path file) throws IOException {
+        return hash(file, "SHA-256");
+    }
+
+    private static String hash(Path file, String algorithm) throws IOException {
         try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(file));
-            return HexFormat.of().formatHex(digest);
+            MessageDigest digest = MessageDigest.getInstance(algorithm);
+            try (InputStream input = Files.newInputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                for (int read; (read = input.read(buffer)) >= 0;) if (read > 0) digest.update(buffer, 0, read);
+            }
+            return HexFormat.of().formatHex(digest.digest());
         } catch (java.security.NoSuchAlgorithmException impossible) {
             throw new AssertionError(impossible);
         }
@@ -188,25 +333,54 @@ final class RuntimeInstaller {
         return Files.size(first) == Files.size(second) && Files.mismatch(first, second) == -1L;
     }
 
+    private void installClient(JsonObject descriptor, Path target) throws Exception {
+        String configured = config == null || config.localMinecraftClientPath == null ? "" : config.localMinecraftClientPath.trim();
+        if (configured.isBlank()) {
+            download(descriptor, target);
+            return;
+        }
+        Path source = Path.of(configured).toAbsolutePath().normalize();
+        if (!Files.isRegularFile(source) || !Files.isReadable(source)) throw new IOException("本地 Minecraft 客户端不存在或不可读：" + source);
+        if (!isJar(source)) throw new IOException("本地 Minecraft 客户端不是有效 JAR：" + source);
+        Files.createDirectories(target.getParent());
+        if (!Files.exists(target) || !sameFileContent(source, target)) Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+        String expected = descriptor.has("sha1") ? descriptor.get("sha1").getAsString() : "";
+        if (!expected.isBlank() && !expected.equalsIgnoreCase(sha1(source))) {
+            log.accept("警告：本地客户端 SHA-1 与官方 Minecraft 26.3 不同，若启动失败请换用官方客户端 JAR：" + source.getFileName());
+        } else log.accept("已导入本地 Minecraft 26.3 客户端：" + source);
+        registerFile(Files.size(source));
+        completeFile(Files.size(source), false);
+    }
+
+    private static boolean isJar(Path file) {
+        try (ZipFile ignored = new ZipFile(file.toFile())) {
+            return ignored.getEntry("META-INF/MANIFEST.MF") != null || ignored.getEntry("net/minecraft/client/main/Main.class") != null;
+        } catch (IOException ignored) { return false; }
+    }
+
     private void installAssets(JsonObject index) throws Exception {
-        Map<String, Path> downloads = new HashMap<>();
+        Map<String, AssetDownload> downloads = new HashMap<>();
         for (Map.Entry<String, JsonElement> entry : index.getAsJsonObject("objects").entrySet()) {
-            String hash = entry.getValue().getAsJsonObject().get("hash").getAsString();
-            downloads.putIfAbsent(hash, runtimeRoot.resolve("assets/objects").resolve(hash.substring(0, 2)).resolve(hash));
+            JsonObject object = entry.getValue().getAsJsonObject();
+            String hash = object.get("hash").getAsString();
+            long size = object.has("size") ? object.get("size").getAsLong() : 0;
+            downloads.putIfAbsent(hash, new AssetDownload(runtimeRoot.resolve("assets/objects").resolve(hash.substring(0, 2)).resolve(hash), size));
         }
         log.accept("检查 Minecraft 资源文件（" + downloads.size() + " 个对象）");
         try (var executor = Executors.newFixedThreadPool(Math.min(16, Runtime.getRuntime().availableProcessors() * 2))) {
             List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
-            for (Map.Entry<String, Path> entry : downloads.entrySet()) {
-                if (Files.exists(entry.getValue())) continue;
+            for (Map.Entry<String, AssetDownload> entry : downloads.entrySet()) {
+                if (Files.exists(entry.getValue().path())) continue;
                 futures.add(executor.submit(() -> {
-                    try { download("https://resources.download.minecraft.net/" + entry.getKey().substring(0, 2) + "/" + entry.getKey(), entry.getValue()); }
+                    try { download("https://resources.download.minecraft.net/" + entry.getKey().substring(0, 2) + "/" + entry.getKey(), entry.getValue().path(), entry.getValue().size()); }
                     catch (Exception exception) { throw new RuntimeException(exception); }
                 }));
             }
             for (var future : futures) future.get();
         }
     }
+
+    private record AssetDownload(Path path, long size) {}
 
     private void installLibraries(JsonArray libraries, List<Path> classpath, Path natives) throws Exception {
         if (libraries == null) return;
@@ -344,20 +518,69 @@ final class RuntimeInstaller {
     }
 
     private void download(JsonObject descriptor, Path target) throws Exception {
-        download(descriptor.get("url").getAsString(), target);
+        download(descriptor.get("url").getAsString(), target, descriptor.has("size") ? descriptor.get("size").getAsLong() : 0);
     }
 
     private void download(String url, Path target) throws Exception {
-        if (Files.isRegularFile(target) && Files.size(target) > 0) return;
+        download(url, target, 0);
+    }
+
+    private void download(String url, Path target, long expectedSize) throws Exception {
+        registerFile(expectedSize);
+        boolean modDownload = target.getParent() != null
+                && "mods".equals(target.getParent().getFileName().toString())
+                && target.getFileName().toString().endsWith(".jar.download");
+        currentFile = modDownload
+                ? target.getFileName().toString().replaceFirst("\\.download$", "")
+                : target.getFileName().toString();
+        stage = modDownload ? "下载 Modrinth 模组"
+                : target.toString().contains("assets") ? "下载 Minecraft 资源" : "下载运行时文件";
+        emitProgress();
+        if (Files.isRegularFile(target) && Files.size(target) > 0) {
+            completeFile(Files.size(target), false);
+            return;
+        }
         Files.createDirectories(target.getParent());
         Path temporary = target.resolveSibling(target.getFileName() + ".part");
-        HttpResponse<Path> response = http.send(HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofMinutes(10)).build(),
-                HttpResponse.BodyHandlers.ofFile(temporary));
+        HttpResponse<InputStream> response = http.send(HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofMinutes(10)).build(),
+                HttpResponse.BodyHandlers.ofInputStream());
         if (response.statusCode() / 100 != 2) {
             Files.deleteIfExists(temporary);
+            response.body().close();
             throw new IOException("下载失败 HTTP " + response.statusCode() + "：" + url);
         }
+        long responseSize = response.headers().firstValueAsLong("Content-Length").orElse(0L);
+        if (expectedSize <= 0 && responseSize > 0) {
+            totalBytes.addAndGet(responseSize);
+            emitProgress();
+        }
+        long copied = 0;
+        try (InputStream input = response.body(); var output = Files.newOutputStream(temporary)) {
+            byte[] buffer = new byte[64 * 1024];
+            for (int read; (read = input.read(buffer)) >= 0;) {
+                if (read == 0) continue;
+                output.write(buffer, 0, read);
+                copied += read;
+                completedBytes.addAndGet(read);
+                if ((copied & ((256 * 1024) - 1)) < buffer.length) emitProgress();
+            }
+        } catch (Throwable error) {
+            Files.deleteIfExists(temporary);
+            throw error;
+        }
         Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+        completeFile(copied, true);
+    }
+
+    private static String sha1(Path file) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-1");
+            try (InputStream input = Files.newInputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                for (int read; (read = input.read(buffer)) >= 0;) if (read > 0) digest.update(buffer, 0, read);
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
 
     record LaunchSpec(String mainClass, List<Path> classpath, Path natives, List<String> jvmArguments,

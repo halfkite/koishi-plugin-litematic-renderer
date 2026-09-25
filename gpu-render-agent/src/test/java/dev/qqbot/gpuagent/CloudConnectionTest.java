@@ -29,14 +29,14 @@ final class CloudConnectionTest {
                 new int[] {10, 4}, new int[] {6, 8}, new int[] {8, 6});
         CloudConnection.MergedPng result = CloudConnection.mergeImages(images, view(), "horizontal");
 
-        assertEquals(10 + 6 + 8 + 32 * 2, result.width());
+        assertEquals(10 + 6 + 8, result.width());
         assertEquals(8, result.height());
         BufferedImage decoded = ImageIO.read(new ByteArrayInputStream(result.bytes()));
         assertNotNull(decoded);
         assertEquals(result.width(), decoded.getWidth());
         assertEquals(result.height(), decoded.getHeight());
         assertEquals(Color.RED.getRGB(), decoded.getRGB(0, 2));
-        assertEquals(Color.BLUE.getRGB(), decoded.getRGB(10 + 32, 0));
+        assertEquals(Color.BLUE.getRGB(), decoded.getRGB(10, 0));
     }
 
     @Test
@@ -46,13 +46,13 @@ final class CloudConnectionTest {
         CloudConnection.MergedPng result = CloudConnection.mergeImages(images, view(), "vertical");
 
         assertEquals(10, result.width());
-        assertEquals(4 + 8 + 6 + 32 * 2, result.height());
+        assertEquals(4 + 8 + 6, result.height());
         BufferedImage decoded = ImageIO.read(new ByteArrayInputStream(result.bytes()));
         assertNotNull(decoded);
         assertEquals(result.width(), decoded.getWidth());
         assertEquals(result.height(), decoded.getHeight());
         assertEquals(Color.RED.getRGB(), decoded.getRGB(0, 0));
-        assertEquals(Color.BLUE.getRGB(), decoded.getRGB(2, 4 + 32));
+        assertEquals(Color.BLUE.getRGB(), decoded.getRGB(2, 4));
     }
 
     private List<RenderModels.Image> writeImages(int[]... sizes) throws Exception {

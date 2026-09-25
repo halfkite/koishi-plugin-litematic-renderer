@@ -3,18 +3,21 @@ package dev.qqbot.gpuruntime;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.yiyihehe.quickcraft.litematica.QuickLitematicaPreview3D;
+import fi.dy.masa.litematica.world.SchematicWorldHandler;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.gui.screens.worldselection.WorldOpenFlows;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.gamerules.GameRules;
-import org.lwjgl.glfw.GLFW;
 import org.lwjgl.opengl.GL11;
+import org.lwjgl.sdl.SDLVideo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,8 +36,15 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public final class GpuRuntimeClient implements ClientModInitializer {
+    private static GpuRuntimeClient instance;
+    public static void clientTick(Minecraft client) {
+        if (instance != null) instance.tick(client);
+    }
     private static final Logger LOGGER = LoggerFactory.getLogger("litematic-gpu-runtime");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final String RENDER_WORLD = "litematic-gpu-runtime-void";
@@ -46,11 +56,16 @@ public final class GpuRuntimeClient implements ClientModInitializer {
     private final Path results = root.resolve("results");
     private final Path renderWorld = FabricLoader.getInstance().getGameDir().resolve("saves").resolve(RENDER_WORLD);
     private ActiveJob active;
+    private volatile boolean mapArtBusy;
     private boolean openingWorld;
     private boolean windowHidden;
     private boolean clientDefaultsApplied;
+    private boolean initialResourcesReady;
+    private ClientLevel registryWorld;
+    private boolean registryWarningLogged;
     private boolean worldDefaultsScheduled;
     private volatile boolean worldDefaultsApplied;
+    private ScheduledExecutorService tickExecutor;
     private int scanCooldown;
     private int statusCooldown;
     private String gpu = "unknown";
@@ -61,7 +76,7 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             Files.createDirectories(jobs); Files.createDirectories(processing); Files.createDirectories(results);
             installRenderWorld();
         } catch (IOException error) { throw new IllegalStateException("Unable to initialize GPU render queue", error); }
-        ClientTickEvents.END_CLIENT_TICK.register(this::tick);
+        instance = this;
         LOGGER.info("Litematic GPU runtime queue: {}, night vision={}, brightness level={}",
                 root, QuickLitematicaPreview3D.nightVisionEnabled(), QuickLitematicaPreview3D.nightVisionLevel());
     }
@@ -71,8 +86,15 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             hideWindow(client);
             applyClientDefaults(client);
             applyWorldDefaults(client);
+            if (!initialResourcesReady && client.isGameLoadFinished()) {
+                initialResourcesReady = true;
+                LOGGER.info("Minecraft initial resources ready; GPU render queue is accepting jobs");
+            }
             if (--statusCooldown <= 0) { statusCooldown = 20; writeStatus(client); }
+            if (!initialResourcesReady) return;
+            if (client.level != null && !synchronizeLitematicaRegistries(client.level)) return;
             if (active != null) { advanceActive(); return; }
+            if (mapArtBusy) return;
             if (--scanCooldown > 0) return;
             scanCooldown = 10;
             Path queued = nextJob();
@@ -80,6 +102,35 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             if (client.level == null) { openRenderWorld(client); return; }
             startJob(queued);
         } catch (Throwable error) { failActive(error); }
+    }
+
+    private boolean synchronizeLitematicaRegistries(ClientLevel level) {
+        if (registryWorld == level) return true;
+
+        RegistryAccess registries = level.registryAccess();
+        if (!(registries instanceof RegistryAccess.Frozen frozen)) {
+            if (!registryWarningLogged) {
+                LOGGER.error("Minecraft 26.3 client level did not expose a frozen registry access: {}",
+                        registries.getClass().getName());
+                registryWarningLogged = true;
+            }
+            return false;
+        }
+        if (registries.lookup(Registries.BLOCK).isEmpty()) {
+            if (!registryWarningLogged) {
+                LOGGER.error("Minecraft 26.3 client level registry access is missing minecraft:block: {}",
+                        registries.getClass().getName());
+                registryWarningLogged = true;
+            }
+            return false;
+        }
+
+        SchematicWorldHandler.INSTANCE.setDynamicRegistryManager(frozen);
+        registryWorld = level;
+        registryWarningLogged = false;
+        LOGGER.info("Synchronized Litematica registry access from render world: {} (minecraft:block available)",
+                level.dimension().identifier());
+        return true;
     }
 
     private void applyClientDefaults(Minecraft client) {
@@ -114,7 +165,7 @@ public final class GpuRuntimeClient implements ClientModInitializer {
         if (windowHidden) return;
         long handle = client.getWindow().handle();
         if (handle != 0L) {
-            GLFW.glfwHideWindow(handle);
+            SDLVideo.SDL_HideWindow(handle);
             gpu = String.valueOf(GL11.glGetString(GL11.GL_RENDERER));
             maxTextureSize = GL11.glGetInteger(GL11.GL_MAX_TEXTURE_SIZE);
             windowHidden = true;
@@ -133,6 +184,32 @@ public final class GpuRuntimeClient implements ClientModInitializer {
         Path output = Path.of(request.outputDirectory).toAbsolutePath().normalize();
         Files.createDirectories(output);
         validateViews(request.views, output);
+        if (request.views.size() == 1 && "extra-map-art".equals(request.views.getFirst().id)) {
+            mapArtBusy = true;
+            event("accepted", request.id, 0.0, "map-art-colors");
+            RenderJob mapRequest = request;
+            Thread.startVirtualThread(() -> {
+                long started = System.nanoTime();
+                try {
+                    Path image = output.resolve("extra-map-art.png");
+                    QuickLitematicaPreview3D.MapArtImage dimensions = QuickLitematicaPreview3D.renderMapArt(input, image);
+                    long elapsed = (System.nanoTime() - started) / 1_000_000L;
+                    writeResult(new RenderResult(mapRequest.id, true, null, null, elapsed, false, gpu,
+                            List.of(new ResultImage("extra-map-art", image.getFileName().toString(),
+                                    dimensions.width(), dimensions.height(), image.toAbsolutePath().toString()))));
+                    event("complete", mapRequest.id, 1.0, "complete");
+                } catch (Throwable error) {
+                    LOGGER.error("Minecraft map-color render failed", error);
+                    writeResult(new RenderResult(mapRequest.id, false, "MAP_ART_FAILED", error.getMessage(),
+                            (System.nanoTime() - started) / 1_000_000L, false, gpu, List.of()));
+                    event("error", mapRequest.id, 0.0, "MAP_ART_FAILED");
+                } finally {
+                    try { Files.deleteIfExists(claimed); } catch (IOException ignored) { }
+                    mapArtBusy = false;
+                }
+            });
+            return;
+        }
         active = new ActiveJob(request, claimed, output, QuickLitematicaPreview3D.createHeadlessPreview(input), System.nanoTime());
         event("accepted", request.id, 0.0, "building-mesh");
     }
@@ -153,7 +230,7 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             job.exporting = true;
             event("progress", job.request.id, (double) job.viewIndex / job.request.views.size(), "rendering-" + view.id);
             job.preview.export(raw, captureWidth, captureHeight, background(view), view.yaw, view.pitch,
-                    value(view.zoom, 1.0), Boolean.TRUE.equals(view.autoFill), effectiveBrightness(view),
+                    value(view.zoom, 1.0), view.autoFill == null || view.autoFill, effectiveBrightness(view),
                     error -> finishView(job, view, raw, error));
         } catch (Throwable error) { failActive(error); }
     }
@@ -245,10 +322,10 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             List<String> packs = client.getResourcePackRepository().getSelectedIds().stream().sorted().toList();
             String fingerprint = Integer.toHexString(packs.hashCode());
             double progress = active == null ? 0.0 : active.preview.progress();
-            String stage = active == null ? "idle" : active.exporting ? "rendering" : "building";
+            String stage = mapArtBusy ? "map-art-colors" : active == null ? "idle" : active.exporting ? "rendering" : "building";
             writeAtomic(root.resolve("status.json"), GSON.toJson(new RenderStatus(System.currentTimeMillis(),
-                    active == null, active != null, client.level != null,
-                    "0.1.0", "26.2", gpu, maxTextureSize, fingerprint, progress, stage,
+                    active == null && !mapArtBusy && initialResourcesReady, active != null || mapArtBusy, client.level != null,
+                    "0.1.1", "26.3", gpu, maxTextureSize, fingerprint, progress, stage,
                     clientDefaultsApplied, worldDefaultsApplied, worldDefaultsApplied, RENDER_WORLD,
                     QuickLitematicaPreview3D.nightVisionEnabled(), QuickLitematicaPreview3D.nightVisionLevel())));
         } catch (IOException error) { LOGGER.warn("Unable to write GPU runtime status", error); }

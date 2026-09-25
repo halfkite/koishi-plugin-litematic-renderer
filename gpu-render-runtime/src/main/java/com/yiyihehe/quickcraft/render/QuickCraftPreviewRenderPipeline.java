@@ -1,9 +1,9 @@
 package com.yiyihehe.quickcraft.render;
 
-import com.mojang.blaze3d.PrimitiveTopology;
-import com.mojang.blaze3d.pipeline.ColorTargetState;
-import com.mojang.blaze3d.pipeline.RenderPipeline;
-import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.renderpearl.api.pipeline.ColorTargetState;
+import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+import com.mojang.renderpearl.api.pipeline.ShaderType;
+import com.mojang.renderpearl.api.vertex.VertexFormat;
 import net.minecraft.client.renderer.ShaderDefines;
 import net.minecraft.resources.Identifier;
 
@@ -28,7 +28,7 @@ public final class QuickCraftPreviewRenderPipeline {
     }
 
     public static RenderPipeline forPreview(RenderPipeline original) {
-        String vertexShader = original.getVertexShader().toString();
+        String vertexShader = original.getShaders().get(ShaderType.VERTEX).toString();
         if (!vertexShader.endsWith(":core/entity") && !vertexShader.equals("core/entity")) {
             return original;
         }
@@ -51,8 +51,8 @@ public final class QuickCraftPreviewRenderPipeline {
                         "quickcraft",
                         "preview/entity-" + NEXT_ID.incrementAndGet()
                 ))
-                .withVertexShader(original.getVertexShader())
-                .withFragmentShader(original.getFragmentShader())
+                .withVertexShader(original.getShaders().get(ShaderType.VERTEX))
+                .withFragmentShader(original.getShaders().get(ShaderType.FRAGMENT))
                 .withCull(original.isCull())
                 .withPolygonMode(original.getPolygonMode())
                 .withDepthStencilState(original.getDepthStencilState())
@@ -68,9 +68,9 @@ public final class QuickCraftPreviewRenderPipeline {
             builder.withBindGroupLayout(layout);
         }
 
-        ColorTargetState[] colorTargets = original.getColorTargetStates();
-        for (int i = 0; i < colorTargets.length; i++) {
-            ColorTargetState colorTarget = colorTargets[i];
+        java.util.List<ColorTargetState> colorTargets = original.getColorTargetStates();
+        for (int i = 0; i < colorTargets.size(); i++) {
+            ColorTargetState colorTarget = colorTargets.get(i);
             if (colorTarget == null) {
                 builder.withUnusedColorTargetState(i);
             } else {
@@ -78,10 +78,10 @@ public final class QuickCraftPreviewRenderPipeline {
             }
         }
 
-        VertexFormat[] vertexFormats = original.getVertexFormatBindings();
-        for (int i = 0; i < vertexFormats.length; i++) {
-            if (vertexFormats[i] != null) {
-                builder.withVertexBinding(i, vertexFormats[i]);
+        java.util.List<VertexFormat> vertexFormats = original.getVertexFormatBindings();
+        for (int i = 0; i < vertexFormats.size(); i++) {
+            if (vertexFormats.get(i) != null) {
+                builder.withVertexBinding(i, vertexFormats.get(i));
             }
         }
 

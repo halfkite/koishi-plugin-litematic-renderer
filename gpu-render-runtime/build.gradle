@@ -5,7 +5,7 @@ plugins {
 
 version = project.mod_version
 group = project.maven_group
-base { archivesName = 'litematic-gpu-runtime-mc26.2' }
+base { archivesName = 'litematic-gpu-runtime-mc26.3' }
 
 repositories {
     mavenCentral()
@@ -16,13 +16,14 @@ dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-    include(implementation("net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"))
+    // Minecraft 26.3 no longer exposes LWJGL native bindings on the compile classpath;
+    // the client still supplies the matching native runtime at launch.
+    compileOnly "org.lwjgl:lwjgl-glfw:3.3.3"
+    compileOnly "org.lwjgl:lwjgl-tinyfd:3.3.3"
     compileOnly "maven.modrinth:malilib:${project.malilib_version}"
     runtimeOnly "maven.modrinth:malilib:${project.malilib_version}"
-    include(implementation("maven.modrinth:malilib:${project.malilib_version}"))
     compileOnly "maven.modrinth:litematica:${project.litematica_version}"
     runtimeOnly "maven.modrinth:litematica:${project.litematica_version}"
-    include(implementation("maven.modrinth:litematica:${project.litematica_version}"))
     testImplementation platform('org.junit:junit-bom:5.13.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
 }

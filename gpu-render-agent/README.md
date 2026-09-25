@@ -1,34 +1,40 @@
-# Litematic GPU Agent 0.4.4
+# Litematic GPU Agent 0.5.1
 
-跨平台可执行 JAR 与 Windows x64 便携 GPU Agent，用于 Minecraft 26.2 / Fabric 0.19.3 投影渲染。
+跨平台可执行 JAR 与 Windows x64 便携 GPU Agent，用于 Minecraft 26.3 / Fabric 0.19.5 投影渲染。
+
+0.5.1 发布版本。0.4.63 新增机器人功能单项开关，关闭后即时拦截对应功能并同步移除官方 QQ `/` 指令；帮助与介绍图片按启用项生成。群文件自动渲染也可单独停用。0.4.62 增加单次定时公告，发送前导入自选位置的旧渲染索引并刷新 OneBot 群列表；桌面工具新增打开配置文件和客户端目录的入口。0.4.61 新增公告页，可编辑消息并逐群发送，显示每个群的结果。0.4.60 更新机器人 `/帮助` 图片与文字内容。
+
+0.4.59 为机器人渲染结果附加固定投影编号；搜索图片仅列出编号和名称。移除“渲染搜索”，发送投影改为按编号或完整名称精确查找，同名时不发送。
+
+0.4.58 补上右视图；详细视图和地图视图图片下方显示投影名称、投影编号与视角。多图拼接取消中间隔断，图片文字加大并缩紧行距。
 
 ## 运行
 
 JAR 需要目标机器安装 Java 25：
 
 ```text
-java -jar litematic-gpu-agent-0.4.4-all.jar
-java -jar litematic-gpu-agent-0.4.4-all.jar --version
-java -jar litematic-gpu-agent-0.4.4-all.jar --help
-java -jar litematic-gpu-agent-0.4.4-all.jar --web
-java -jar litematic-gpu-agent-0.4.4-all.jar --bot
+java -jar litematic-gpu-agent-0.5.1-all.jar
+java -jar litematic-gpu-agent-0.5.1-all.jar --version
+java -jar litematic-gpu-agent-0.5.1-all.jar --help
+java -jar litematic-gpu-agent-0.5.1-all.jar --web
+java -jar litematic-gpu-agent-0.5.1-all.jar --bot
 ```
 
 也可以直接双击 `start-agent.bat` 启动桌面工具；把 `--web` 或 `--bot` 作为参数传给脚本即可启动对应模式。Linux/macOS 可执行 `./start-agent.sh --web`，脚本会自动查找 Java 和同目录 JAR。
 
-Windows 用户也可以解压 `litematic-gpu-agent-0.4.4-windows-x64.zip` 后直接启动 `Litematic GPU Agent/Litematic GPU Agent.exe`；该包已经内置 Java 25 Runtime，不需要安装 Java。首次渲染时，程序会从官方地址下载 Minecraft 26.2 客户端、资源和 Fabric Loader，不需要登录账号，也不使用已有游戏目录。
+Windows 用户也可以解压 `litematic-gpu-agent-0.5.1-windows-x64.zip` 后直接启动 `Litematic GPU Agent/Litematic GPU Agent.exe`；该包已经内置 Java 25 Runtime，不需要安装 Java。首次渲染时，程序会从官方地址下载 Minecraft 26.3 客户端、资源和 Fabric Loader，并从 Modrinth 下载固定版本的 Fabric API、MaLiLib 与 Litematica，不需要登录账号，也不使用已有游戏目录。下载时桌面顶部和 Web 状态页会显示阶段、文件和进度；如果已有客户端，可在“渲染设置”选择 JAR，或在 Web 配置页上传本地 Minecraft 26.3 客户端。
 
 ### Linux Web 后台
 
 Linux 无桌面环境直接运行 `--web`，默认访问 `http://服务器IP:2618/`：
 
 ```text
-java -jar litematic-gpu-agent-0.4.4-all.jar --web
+java -jar litematic-gpu-agent-0.5.1-all.jar --web
 ```
 
 首次启动会在终端和 `web-credentials.txt` 输出随机 12 位数字密码，用户名默认是 `admin`。网页可配置多个官方 QQ 和 OneBot/NekoBot 账号、视角、亮度、拼接、缓存、资源包和云端连接。群消息模式有“接收群文件自动识别（不要求 @）”“仅被 @ 时识别”和“都可以（文件或 @）”三种选择。官方 QQ 与 OneBot 账号会在 Agent 内直接连接，不依赖 Koishi；OneBot 支持正向 WebSocket 与反向 WebSocket。`--bot` 只启动机器人和渲染服务，不启动网页。
 
-桌面 GUI 无参数启动时默认不打开网页。进入“连接设置”，勾选“启用 Web 管理后台”即可直接启动；同一页也可以填写两次新 Web 密码，保存后立即更新密码和 `web-credentials.txt`，留空则保持原密码不变。网页和本地 GUI 的“投影信息”设置共用同一份 `agent.json`，可以分别控制投影名称、保存者游戏 ID、创建时间、方块数/体积、尺寸、Litematic 版本和游戏版本是否发送。账号、云端开关、视角、亮度、拼接、投影信息和内存阈值保存后即时应用；资源包会事务式重载。缓存目录、并行客户端数、Java 路径和 Web 监听地址/端口需要重启。
+桌面 GUI 无参数启动时默认不打开网页。进入“连接设置”，勾选“启用 Web 管理后台”即可直接启动；同一页也可以填写两次新 Web 密码，保存后立即更新密码和 `web-credentials.txt`，留空则保持原密码不变。网页和本地 GUI 的“投影信息”设置共用同一份 `agent.json`，可以分别控制投影名称、保存者游戏 ID、创建时间、方块数/体积、尺寸、Litematic 版本和游戏版本是否发送。图片模式将多视角横向拼接、信息卡放在下方合成一张图；游戏 ID/创建时间、方块数/尺寸、投影版本/游戏版本分别左右对齐显示。桌面 GUI 将分辨率、本地渲染、缓存、文件大小上限、本地客户端和搜索投影集中在“渲染设置”页；Web 后台保留独立的“搜索投影”页面。账号、云端开关、视角、亮度、拼接、投影信息和内存阈值保存后即时应用；资源包会事务式重载。缓存目录、并行客户端数、Java 路径和 Web 监听地址/端口需要重启。
 
 可以创建 `/etc/systemd/system/litematic-gpu-agent.service`：
 
@@ -39,7 +45,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=/opt/litematic-gpu-agent
-ExecStart=/usr/bin/java -jar /opt/litematic-gpu-agent/litematic-gpu-agent-0.4.4-all.jar --web
+ExecStart=/usr/bin/java -jar /opt/litematic-gpu-agent/litematic-gpu-agent-0.5.1-all.jar --web
 Restart=on-failure
 User=litematic
 
@@ -49,7 +55,27 @@ WantedBy=multi-user.target
 
 默认监听 `0.0.0.0`，公网部署请使用防火墙和 HTTPS 反向代理或 VPN，不要直接暴露管理端口。
 
-图形界面的“本地渲染”页支持一次选择多个 `.litematic` 文件，也支持把多个文件直接拖到“导入投影”按钮或投影列表；点击“开始渲染”后会按列表逐个输出。该页的“视角表”同时决定本地渲染和云端任务回传的视角数量、角度、缩放、亮度与分辨率，亮度范围为 `25%`–`300%`，`100%` 为该视角基准亮度；底视图以原来的 `150%` 实际亮度作为新的 `100%`，其他视角 `100%` 保持原始亮度。云端合成图可选择横向或竖向拼接。
+### 内置客户端兼容性
+
+Agent 内置的只有本项目的独立 Fabric 渲染模组。Fabric API 0.161.0+26.3、MaLiLib 0.30.1 和 Litematica 0.29.0 在首次启动时从 Modrinth 固定版本下载，SHA-512 校验通过后直接放入独立客户端的 `mods` 目录；不会重新分发或修改这三个原版 JAR。后续启动会校验文件并复用。若使用本地客户端，必须选择 Minecraft 26.3 客户端 JAR，Agent 会校验 JAR 格式，并在 SHA-1 与 Mojang 官方值不一致时记录警告。
+
+图形界面的“本地渲染”页支持一次选择多个 `.litematic` 文件，也支持把多个文件直接拖到“导入投影”按钮或投影列表；点击“开始渲染”后会按列表逐个输出。“渲染设置”页集中管理分辨率、本地拼接、缓存、文件大小上限、本地 Minecraft 客户端、投影信息和搜索投影设置。视角表同时决定本地渲染和云端任务回传的视角数量、角度、缩放、亮度与分辨率，亮度范围为 `25%`–`300%`，`100%` 为该视角基准亮度；底视图以原来的 `150%` 实际亮度作为新的 `100%`，其他视角 `100%` 保持原始亮度。渲染图发送方式支持“横向拼接”“竖向拼接”和“不拼接发送”三种模式；合成 PNG 超过 10MB 时自动逐张发送。
+
+### 搜索并发送缓存投影
+
+机器人会在统一缓存中搜索，不会因为搜索命令重新渲染。发送 `搜索投影 关键词` 后，最近半年保存的投影优先占前五位，其余按渲染次数排序，默认显示 15 个结果；可在 Agent 配置中的“搜索结果数量”修改为 1–100。搜索结果图片只显示固定投影编号和投影名称，不读取或展示渲染缩略图；排序变化不会改变编号，删除缓存项后旧编号也不会复用。
+
+发送 `/发送投影1` 或 `/发送投影 1` 可按固定编号获取渲染图和原始 `.litematic` 文件；`/发送投影 完整投影名称` 仅在名称除后缀后完全一致且唯一时发送。同名投影必须改用编号。发送结果会增加缓存调用次数，渲染信息附带投影编号。未携带智能缩放字段的旧任务按默认开启处理；渲染图按实际前景边界裁切、居中并保留约 5% 边缘。信标方块仍显示，但不绘制信标光柱。
+
+`导出材料3 关键词` 会按缓存搜索结果序号读取投影，并发送 `.xlsx` 工作簿。材料和容器材料左右并排，中间留空列；投影信息按样例逐行显示。列宽按材料表样例固定，Minecraft 原版物品 ID 显示为 `stone` 等短形式，模组 ID 保留命名空间；表格包含名称、ID、总数量和盒数量，盒数量按总数量除以 1728 后向上保留一位小数。中文物品名称优先使用本地 Minecraft 中文语言资源，未安装资源时回退到注册名；容器内物品按类型汇总，支持传统 `Items` 标签和物品容器组件。`投影列表` 会重建缓存索引并发送名为 `BOT投影缓存-yyyy-MMdd-HHmm.csv` 的 UTF-8 BOM 文件，列出序号、投影名称、原文件名、哈希值和相对路径。`/介绍投影BOT` 会发送图片版介绍；帮助仍发送指令图片。投影介绍格式可选完整文字、精简文字或图片版；图片版中多视角横向拼接，投影信息卡置于下方，生成单张 PNG。
+
+每个账号都可以设置“指令需要 @”。默认开启时，群里的文字指令必须 @ 机器人；关闭后不需要 @，但投影文件自动识别始终按“群消息模式”独立工作。官方 QQ 连接成功后，Agent 会自动创建或更新其自管的群聊和单聊 `/` 指令面板，覆盖搜索、发送投影、材料导出、投影列表、帮助和介绍；只管理带 Agent 标记的面板，不改动手工面板。开启“获取群内全部消息”时，Agent 会检查 `mentions` 识别全量事件中是否 @ 到本机器人。设置页展示可配置指令，可修改名称并管理别名；官方面板按当前设置同步。
+
+### 发送公告
+
+桌面工具的“发送公告”页可编辑最多 2000 字符的文字公告。OneBot 账号通过 `get_group_list` 获取当前群列表；官方 QQ 没有可用的全量群列表接口，页面使用该账号已经收到群事件的群 OpenID，也允许手动补充。只保存群标识，不保存群消息作为发送凭证。发送前可取消勾选目标并确认内容，随后逐群主动发送，页面显示每个群的结果。官方 QQ 主动消息必须由平台为对应群开通权限，并受频次限制；失败不会自动重发，以免重复公告。
+
+可选定未来时间添加单次定时公告。到点前，Agent 会从所选旧索引导入该账号的群标识，并刷新在线 OneBot 的群列表，再向届时可用的目标群发送。任务保存在 `announcement-schedules.json`；发送中途退出会标记为中断，不自动重发。旧索引位置可在公告页选择并保存。顶部“打开配置文件”可编辑 `agent.json`；渲染设置中的“打开下载位置”会定位到内置 Minecraft 客户端。
 
 ## 缓存
 
@@ -58,17 +84,27 @@ WantedBy=multi-user.target
 ```text
 litematic-renderer-cache/
   index.json5
+  projection-index.json5
   <投影 SHA-256>/
     原始投影文件名.litematic
     isometric.png
     isometric-reverse.png
     six-faces.png
+    search-preview.jpg
     about.json5
 ```
 
-图片分辨率、视角、缩放、亮度、超采样、材质包、夜视或有效工具版本变化时会重新渲染。`about.json5` 保存每个视角的实际亮度、亮度百分比和“出图配置识别数”；缓存读取会同时核对识别数和视角参数。文件使用严格 JSON 子集编写，扩展名保留为 JSON5，方便 Node、Java 和文本编辑器共同读取；哈希目录和图片仍可直接手动打开。
+图片分辨率、视角、缩放、亮度、超采样、材质包、夜视或有效工具版本变化时会重新渲染。`about.json5` 保存投影自身的保存时间、每个视角的亮度、“出图配置识别数”、缓存调用次数和实际渲染次数；缓存读取会同时核对识别数和视角参数。旧版生成的 `search-preview.jpg` 不影响搜索列表，保留的缓存图片不会因这次升级被清空。哈希目录和图片仍可直接手动打开；渲染中转 PNG 在保存到缓存后会自动删除，不会在数据目录额外留一份。
 
-“本地渲染”页可控制本地拼接、拼接方向、缓存目录、并行客户端、空闲关闭和内存重启阈值；夜视配置字段仍保留在配置文件中，但当前界面暂时隐藏，方便以后恢复。本地拼接开启后，每个投影结果目录会额外生成 `merged.png`，各视角原图仍会保留；拼接方向同时用于本地拼接和云端多视角结果。修改后点击“保存渲染设置并重启”，让内置 Minecraft 客户端加载新设置。连接地址、共享密钥和托盘/开机选项仍在“连接设置”页。
+缓存上限分为“近一年投影渲染图”和“历史投影渲染图”两项，默认分别为 8GB 和 2GB。每个分组超限时只淘汰该组图片，优先清理调用较少、较久未使用的完整渲染图，再考虑搜索缩略图；投影源 `.litematic`、`about.json5` 和根索引不会被删除。若要让 Agent 与 Koishi 完全共用一份图片缓存，请在两边填写同一个绝对缓存目录。
+
+本地渲染页的“导出投影文件”按钮会把当前缓存中的全部 `.litematic` 文件和 `projection-index.json5` 压缩为一个 `缓存投影文件yyyy-MMdd-HHmm.zip`，默认压平哈希目录；勾选“导出时保留哈希值目录”后会按 SHA-256 目录保留层级。导出包不包含 PNG、`about.json5` 或其他缓存记录。
+
+`projection-index.json5` 是搜索专用的根目录索引，记录投影名称、原文件名和 SHA-256 哈希。Agent 启动时会从现有哈希目录自动重建它，兼容旧版本缓存；渲染、导入和导出时会增量更新或合并。搜索先读取该索引，再校验实际投影文件，避免逐个扫描目录。桌面工具的缓存设置和 Web“投影缓存”页都有“重建搜索索引”按钮，会重新扫描全部哈希目录并报告有效投影数量；损坏或无效的投影文件不会写入索引。
+
+桌面端“导入缓存”按钮和 Web 配置页的“导入缓存”可以直接读取其他机器导出的 ZIP，兼容是否保留哈希目录的两种格式。导出包会额外包含 `projection-index.json5`；导入时按文件内容重新计算哈希，并将压缩包索引与本机缓存合并。只保留 `.litematic` 源文件，旧图片不会导入，首次使用时会按当前视角、分辨率、亮度、材质包和工具版本重新渲染。
+
+“渲染设置”页可控制本地拼接、渲染图发送方式、缓存目录、并行客户端、空闲关闭、内存重启阈值、文件大小上限、本地 Minecraft 客户端和搜索投影数量；夜视配置字段仍保留在配置文件中，但当前界面暂时隐藏，方便以后恢复。本地拼接开启且选择拼接模式后，每个投影结果目录会额外生成 `merged.png`，各视角原图仍会保留；发送方式同时用于本地拼接和云端多视角结果。修改后点击“保存渲染设置并重启”，让内置 Minecraft 客户端加载新设置。连接地址、共享密钥和托盘/开机选项仍在“连接设置”页。
 
 ## 构建
 
@@ -77,7 +113,9 @@ gradlew.bat test fatJar
 .\package-windows.ps1 -JavaHome "C:\Program Files\Java\jdk-25.0.3"
 ```
 
-0.4.4 发布文件为 `litematic-gpu-agent-0.4.4-all.jar` 和 `litematic-gpu-agent-0.4.4-windows-x64.zip`，不生成安装器、Linux/macOS 包或 npm 包。完整操作说明见 [USAGE-0.4.4.md](./USAGE-0.4.4.md)。
+0.4.57 将额外视角统一命名为正轴视图、反轴视图、正视图、后视图、左视图、俯视图、仰视图、地图视图。正/后/左视图改为严格水平轴向，俯/仰视图改为精确 90°；内置 26.3 渲染模组也解除原有 85° 俯仰角限制。地图视图仍使用 Minecraft MapColor 像素配色。
+
+0.4.56 修复了 0.4.55 的按钮消失问题：官方 QQ 会忽略富媒体图片消息中的键盘，因此现在先发送图片，再发送带可点击按钮的操作卡。若要图片与按钮同处一条 Markdown 消息，需另行提供可公开访问的 HTTPS 图片地址。0.4.54 为缓存投影分配固定数字序号；搜索、发送、材料导出和 CSV 清单统一使用这个编号。引用原始投影文件、机器人发送的渲染图或投影文件均可导出材料。额外视图单独缓存。地图画模式读取投影顶层方块的 Minecraft MapColor 基础配色，每个方块对应一个地图像素，不使用 3D 截图；也可运行 `java -jar litematic-gpu-agent-0.4.56-all.jar --map-art FILE.litematic --output DIRECTORY` 单独导出。0.4.53 将 GPU 运行时代码做成独立 Fabric 模组，三个上游模组改由 Modrinth 下载固定版本，移除了修改上游 JAR 的兼容补丁。对不影响外观的容器方块实体跳过高耗时的数据版本转换，已用“全逻辑单核控蜂_by_tuzier.litematic”实测生成两张 GPU 渲染图。0.4.52 修复了红石线 mixin 缺失引起的 ClassCastException。构建使用 Minecraft 26.3、Litematica 0.29.0 和 MaLiLib 0.30.1。不生成安装器、Linux/macOS 包或 npm 包。完整操作说明见 [USAGE-0.4.12.md](./USAGE-0.4.12.md)。
 
 运行时数据默认位于 Windows 的 `%LOCALAPPDATA%\LitematicGpuAgent`，Linux/macOS 使用用户数据目录。设置 `LITEMATIC_GPU_AGENT_HOME` 可指定便携或服务目录。
 

@@ -22,6 +22,7 @@ import java.util.function.Consumer;
  * 并通过 NTFS 目录联接共享槽位 0 的网格缓存（litematica-preview-cache），避免重复建网格。
  */
 final class RuntimeManager implements AutoCloseable {
+    private static final long STATUS_MAX_AGE_MILLIS = 5_000L;
     private final Path root;
     private final AgentConfig config;
     private final RuntimeInstaller installer;
@@ -43,7 +44,7 @@ final class RuntimeManager implements AutoCloseable {
     RuntimeManager(Path applicationRoot, AgentConfig config) {
         this.root = applicationRoot.resolve("runtime");
         this.config = config;
-        this.installer = new RuntimeInstaller(root);
+        this.installer = new RuntimeInstaller(root, config);
         int count = Math.max(1, Math.min(4, config.maxConcurrentRenders));
         for (int index = 0; index < count; index++) slots.add(new Slot(index));
     }
@@ -99,12 +100,30 @@ final class RuntimeManager implements AutoCloseable {
 
     RenderModels.RuntimeStatus currentStatus(int slot) {
         if (slot < 0 || slot >= slots.size()) return null;
+        if (!isAlive(slot)) return null;
         try {
-            return Protocol.GSON.fromJson(Files.readString(slots.get(slot).gameDirectory.resolve("gpu-render-runtime/status.json")), RenderModels.RuntimeStatus.class);
+            RenderModels.RuntimeStatus status = Protocol.GSON.fromJson(
+                    Files.readString(slots.get(slot).gameDirectory.resolve("gpu-render-runtime/status.json")),
+                    RenderModels.RuntimeStatus.class);
+            if (status == null || System.currentTimeMillis() - status.timestamp() > STATUS_MAX_AGE_MILLIS) return null;
+            return status;
         } catch (IOException | RuntimeException ignored) { return null; }
     }
 
     void setLog(Consumer<String> log) { this.log = log; installer.setLog(log); }
+
+    void setInstallProgress(Consumer<RuntimeInstaller.InstallProgress> listener) { installer.setProgress(listener); }
+
+    RuntimeInstaller.InstallProgress installProgress() { return installer.progress(); }
+
+    /** 停止现有客户端后导入并校验本地 Minecraft 客户端，供桌面/Web 管理入口使用。 */
+    synchronized Path importLocalClient(Path source) throws Exception {
+        if (source == null) throw new IllegalArgumentException("本地客户端路径不能为空");
+        config.localMinecraftClientPath = source.toAbsolutePath().normalize().toString();
+        stop();
+        installer.install();
+        return minecraftClientJar();
+    }
 
     synchronized void ensureRunning(Duration timeout) throws Exception { ensureRunning(0, timeout); }
 
@@ -144,6 +163,10 @@ final class RuntimeManager implements AutoCloseable {
         command.add(javaExecutable().toString());
         command.add("-Xms512m");
         command.add("-Xmx4g");
+        // C1 compilation of the 26.3 shader pipeline builder crashes HotSpot on
+        // this Java 25 runtime. Keep that one-time pipeline setup interpreted.
+        command.add("-XX:TieredStopAtLevel=1");
+        command.add("-XX:CompileCommand=exclude,com/mojang/renderpearl/frontend/shaders/PipelineBuilder.*");
         command.add("--sun-misc-unsafe-memory-access=allow");
         command.add("--enable-native-access=ALL-UNNAMED");
         command.add("-Djava.library.path=" + spec.natives());
@@ -161,6 +184,7 @@ final class RuntimeManager implements AutoCloseable {
         command.add("--width"); command.add("1");
         command.add("--height"); command.add("1");
         if (slot.index == 0) writeLaunchDiagnostics(command, spec);
+        Files.deleteIfExists(slot.gameDirectory.resolve("gpu-render-runtime/status.json"));
         ProcessBuilder builder = new ProcessBuilder(command).directory(slot.gameDirectory.toFile()).redirectErrorStream(true);
         try {
             slot.process = builder.start();
@@ -171,7 +195,14 @@ final class RuntimeManager implements AutoCloseable {
         Thread reader = new Thread(() -> readLogs(slot, child), "minecraft-runtime-log-" + slot.index);
         reader.setDaemon(true);
         reader.start();
-        log.accept("Minecraft 26.2 GPU 运行时已启动（隐藏窗口，客户端 " + (slot.index + 1) + "/" + slots.size() + "）");
+        child.onExit().thenAccept(process -> {
+            int exitCode = process.exitValue();
+            if (exitCode != 0) {
+                CrashLogger.runtimeExit(root, slot.index, exitCode);
+                log.accept("Minecraft 26.3 GPU 运行时异常退出（客户端 " + (slot.index + 1) + "，退出码 " + exitCode + "）");
+            }
+        });
+        log.accept("Minecraft 26.3 GPU 运行时已启动（隐藏窗口，客户端 " + (slot.index + 1) + "/" + slots.size() + "）");
     }
 
     /** 为非 0 槽位准备独立游戏目录：mods 里的渲染 jar + 共享网格缓存（目录联接到槽位 0）。 */

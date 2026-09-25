@@ -230,6 +230,7 @@ test('shows every effective config field and omits obsolete fields', () => {
   assert.ok(fields.gpuRendererCommand === undefined)
   assert.equal(fields.cellSize, undefined)
   assert.equal(fields.diagnosticsExport, undefined)
+  assert.equal(fields.projectionSearchResultLimit.meta.default, 15)
   for (const index of [3, 4, 5]) {
     assert.equal(RendererConfig.list[index].meta.collapse, true, `${RendererConfig.list[index].meta.description} should be collapsed`)
   }
@@ -260,22 +261,31 @@ test('includes the projection name in forwarded metadata', () => {
   assert.match(formatLitematicMetadata(metadata, '测试投影.litematic'), /^投影名称：测试投影\n/)
 })
 
-test('keeps versioned cache entries until the total limit requires LRU eviction', async () => {
+test('evicts only least-used image caches while preserving projection sources and metadata', async () => {
   const root = await mkdtemp(join(tmpdir(), 'litematic-cache-test-'))
-  const oldEntry = join(root, 'v0.3.6', 'old-hash')
-  const currentEntry = join(root, 'v0.3.7', 'current-hash')
+  const oldEntry = join(root, '0'.repeat(64))
+  const currentEntry = join(root, '1'.repeat(64))
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
   try {
     await mkdir(oldEntry, { recursive: true })
     await mkdir(currentEntry, { recursive: true })
     await writeFile(join(oldEntry, 'projection.litematic'), Buffer.alloc(80, 1))
     await writeFile(join(currentEntry, 'projection.litematic'), Buffer.alloc(80, 2))
+    await writeFile(join(oldEntry, 'isometric.png'), png)
+    await writeFile(join(currentEntry, 'isometric.png'), png)
+    await writeFile(join(oldEntry, 'about.json5'), JSON.stringify({ 缓存调用次数: 1 }))
+    await writeFile(join(currentEntry, 'about.json5'), JSON.stringify({ 缓存调用次数: 10 }))
     const oldTime = new Date(Date.now() - 60_000)
     await utimes(oldEntry, oldTime, oldTime)
 
-    const result = await enforceCacheLimit(root, 100, currentEntry)
+    const result = await enforceCacheLimit(root, 1, currentEntry)
     assert.equal(result.removedEntries, 1)
-    await assert.rejects(access(oldEntry))
+    await access(join(oldEntry, 'projection.litematic'))
+    await access(join(oldEntry, 'about.json5'))
+    await assert.rejects(access(join(oldEntry, 'isometric.png')))
     await access(currentEntry)
+    await access(join(currentEntry, 'projection.litematic'))
+    await access(join(currentEntry, 'isometric.png'))
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -321,9 +331,9 @@ test('resolves the last matching per-group send override', () => {
       { groupId: '456', sendMode: 'combined', replyAndMention: 'disabled' },
     ],
   }
-  assert.deepEqual(resolveSendOptions(config, '123'), { qqBotType: 'selfHosted', sendMode: 'combined', replyAndMention: true, showViewTitles: false, sixFaceOverview: false })
-  assert.deepEqual(resolveSendOptions(config, '456'), { qqBotType: 'selfHosted', sendMode: 'combined', replyAndMention: false, showViewTitles: false, sixFaceOverview: false })
-  assert.deepEqual(resolveSendOptions(config, '789'), { qqBotType: 'selfHosted', sendMode: 'forward', replyAndMention: false, showViewTitles: false, sixFaceOverview: true })
+  assert.deepEqual(resolveSendOptions(config, '123'), { qqBotType: 'selfHosted', sendMode: 'combined', replyAndMention: true, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: false })
+  assert.deepEqual(resolveSendOptions(config, '456'), { qqBotType: 'selfHosted', sendMode: 'combined', replyAndMention: false, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: false })
+  assert.deepEqual(resolveSendOptions(config, '789'), { qqBotType: 'selfHosted', sendMode: 'forward', replyAndMention: false, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: true })
   assert.equal(resolveSendOptions({ ...config, sixFaceOverview: false }, '789').sixFaceOverview, false)
   assert.equal(resolveSendOptions({ ...config, qqBotType: 'official', sendAsForward: false }, '789').sixFaceOverview, true)
 })
@@ -337,7 +347,7 @@ test('sends two images and metadata as one combined message with optional reply 
   await sendImages(session, [
     { title: '正二轴测', path: 'normal.png' },
     { title: '反向正二轴测', path: 'reverse.png' },
-  ], '投影信息', { qqBotType: 'selfHosted', sendMode: 'combined', replyAndMention: true, showViewTitles: false, sixFaceOverview: false }, '测试投影')
+  ], '投影信息', { qqBotType: 'selfHosted', sendMode: 'combined', replyAndMention: true, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: false }, '测试投影')
 
   assert.equal(sent.length, 1)
   assert.deepEqual(sent[0].map(element => element.type), ['quote', 'at', 'text', 'img', 'img', 'text'])
@@ -348,7 +358,7 @@ test('keeps Chinese projection names in cache folders and formats size-limit err
   assert.equal(cacheNameSegment('城堡 主楼?.litematic'), '城堡 主楼_')
   assert.equal(formatRenderError(new Error('文件超过 1 MB 限制'), { maxFileSize: 2 * 1024 }), '文件大小超过 2.00 MB，不渲染。')
   assert.equal(formatRenderError(new Error('独立 Java 渲染器不存在：C:\\private\\renderer.jar'), { maxFileSize: 1024 }), '独立渲染器不可用，请重装插件或检查 Java 渲染配置。')
-  assert.equal(formatRenderError(new Error('Minecraft 26.2 GPU 渲染端未运行；请启动客户端'), { maxFileSize: 1024 }), '请启动 Minecraft 26.2-Fabricjqr GPU 渲染客户端，停在主菜单即可，无需手动进入存档。')
+    assert.equal(formatRenderError(new Error('Minecraft 26.3 GPU 渲染端未运行；请启动客户端'), { maxFileSize: 1024 }), '请启动 Minecraft 26.3-Fabric GPU 渲染客户端，停在主菜单即可，无需手动进入存档。')
 })
 
 test('omits unsupported mentions and blank lines from QQ official replies', () => {
@@ -371,7 +381,7 @@ test('sends forward content before one concise result mention', async () => {
     { title: '正二轴测', path: 'normal.png' },
     { title: '反向正二轴测', path: 'reverse.png' },
     { title: '六面正投影', path: 'six-faces.png' },
-  ], '投影信息', { qqBotType: 'selfHosted', sendMode: 'forward', replyAndMention: true, showViewTitles: false, sixFaceOverview: true }, '测试投影')
+  ], '投影信息', { qqBotType: 'selfHosted', sendMode: 'forward', replyAndMention: true, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: true }, '测试投影')
 
   assert.equal(sent.length, 2)
   assert.equal(sent[0].type, 'figure')
@@ -386,7 +396,7 @@ test('always sends one plain success notification after forward content without 
   await sendImages(session, [
     { title: '正二轴测', path: 'normal.png' },
     { title: '反向正二轴测', path: 'reverse.png' },
-  ], '投影信息', { qqBotType: 'selfHosted', sendMode: 'forward', replyAndMention: false, showViewTitles: false, sixFaceOverview: true }, '测试投影')
+  ], '投影信息', { qqBotType: 'selfHosted', sendMode: 'forward', replyAndMention: false, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: true }, '测试投影')
   assert.equal(sent.length, 2)
   assert.equal(sent[1], '测试投影 已渲染成功，结果如上')
 })
@@ -407,7 +417,7 @@ test('sends QQ official forward-mode results as one overview image with metadata
       await writeFile(path, png)
       return { title: `视图 ${index + 1}`, path }
     }))
-    await sendImages(session, images, '投影信息', { qqBotType: 'official', sendMode: 'forward', replyAndMention: false, showViewTitles: false, sixFaceOverview: true }, '测试投影')
+    await sendImages(session, images, '投影信息', { qqBotType: 'official', sendMode: 'forward', replyAndMention: false, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: true }, '测试投影')
 
     assert.equal(sent.length, 1)
     assert.deepEqual(sent[0].map(element => element.type), ['img', 'text'])
@@ -415,7 +425,7 @@ test('sends QQ official forward-mode results as one overview image with metadata
     assert.equal(new URL(sent[0][0].attrs.src).protocol, 'file:')
     assert.equal(sent[0][0].attrs.src.includes('\\'), false)
     const overview = await readFile(join(directory, 'qq-overview.png'))
-    assert.deepEqual([overview.readUInt32BE(16), overview.readUInt32BE(20)], [128, 132])
+    assert.deepEqual([overview.readUInt32BE(16), overview.readUInt32BE(20)], [392, 86])
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
@@ -437,7 +447,7 @@ test('keeps the quote and metadata while omitting unsupported mentions from the 
       await writeFile(path, png)
       return { title: name, path }
     }))
-    await sendImages(session, images, '投影信息', { qqBotType: 'official', sendMode: 'forward', replyAndMention: true, showViewTitles: false, sixFaceOverview: true }, '测试投影')
+    await sendImages(session, images, '投影信息', { qqBotType: 'official', sendMode: 'forward', replyAndMention: true, imageSendLayout: 'horizontal', showViewTitles: false, sixFaceOverview: true }, '测试投影')
 
     assert.equal(sent.length, 1)
     assert.deepEqual(sent[0].map(element => element.type), ['quote', 'img', 'text'])
@@ -447,6 +457,23 @@ test('keeps the quote and metadata while omitting unsupported mentions from the 
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test('sends official QQ render images separately when bitmap stitching is disabled', async () => {
+  const sent = []
+  const session = {
+    platform: 'qq', selfId: 'bot', userId: 'user', messageId: 'message',
+    send: async content => { sent.push(content) },
+  }
+  await sendImages(session, [
+    { title: '正二轴测', path: 'normal.png' },
+    { title: '反向正二轴测', path: 'reverse.png' },
+  ], '投影信息', { qqBotType: 'official', sendMode: 'combined', replyAndMention: true, imageSendLayout: 'separate', showViewTitles: false, sixFaceOverview: false }, '测试投影')
+
+  assert.equal(sent.length, 2)
+  assert.deepEqual(sent[0].map(element => element.type), ['quote', 'img'])
+  assert.deepEqual(sent[1].map(element => element.type), ['img', 'text'])
+  assert.equal(sent[1].at(-1).attrs.content, '\n投影信息')
 })
 
 test('detects litematic files from message content when session elements are unavailable', () => {

@@ -8,6 +8,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -20,6 +21,8 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
@@ -28,6 +31,8 @@ import java.util.function.Consumer;
 final class WebAdminServer implements AutoCloseable {
     private static final int MAX_BODY_BYTES = 2 * 1024 * 1024;
     private static final int MAX_RESOURCE_REQUEST_BYTES = 350 * 1024 * 1024;
+    private static final int MAX_RUNTIME_CLIENT_REQUEST_BYTES = 450 * 1024 * 1024;
+    private static final int MAX_CACHE_IMPORT_REQUEST_BYTES = 700 * 1024 * 1024;
     private final Path root;
     private final Path configPath;
     private final AgentConfig config;
@@ -63,10 +68,15 @@ final class WebAdminServer implements AutoCloseable {
             if ("/api/auth/change-password".equals(path)) { changePassword(exchange); return; }
             if ("/api/auth/change-username".equals(path)) { changeUsername(exchange); return; }
             if ("/api/config".equals(path)) { config(exchange); return; }
+            if ("/api/commands/sync".equals(path)) { syncCommands(exchange); return; }
             if ("/api/status".equals(path)) { status(exchange); return; }
             if ("/api/logs".equals(path)) { logs(exchange); return; }
+            if ("/api/logs/export".equals(path)) { exportLogs(exchange); return; }
             if (path.startsWith("/api/accounts/") && path.endsWith("/reload")) { reloadAccount(exchange, path); return; }
             if ("/api/resource-packs".equals(path)) { resourcePack(exchange); return; }
+            if ("/api/runtime-client".equals(path)) { runtimeClient(exchange); return; }
+            if ("/api/cache/import".equals(path)) { importCache(exchange); return; }
+            if ("/api/cache/reindex".equals(path)) { rebuildCacheIndex(exchange); return; }
             json(exchange, 404, error("接口不存在"));
         } catch (Throwable error) {
             log.accept("Web 管理请求失败：" + error.getMessage());
@@ -147,6 +157,8 @@ final class WebAdminServer implements AutoCloseable {
         int oldConcurrentRenders = config.maxConcurrentRenders;
         String oldWebUsername = config.webUsername;
         String oldResourcePacks = Protocol.GSON.toJson(config.resourcePacks);
+        String oldBotProfiles = Protocol.GSON.toJson(config.botProfiles);
+        String oldCommands = Protocol.GSON.toJson(config.commands);
         JsonObject incoming = parseBody(exchange);
         JsonObject merged = merge(Protocol.GSON.toJsonTree(config).getAsJsonObject(), incoming);
         AgentConfig updated = Protocol.GSON.fromJson(merged, AgentConfig.class);
@@ -157,14 +169,22 @@ final class WebAdminServer implements AutoCloseable {
         if (updated.webUsername == null || updated.webUsername.isBlank()) throw new IllegalArgumentException("网页登录用户名不能为空");
         if (updated.webSessionTimeoutMillis < 5 * 60 * 1000L) throw new IllegalArgumentException("会话时长不能少于 5 分钟");
         if (updated.maxFileSizeKb < 1 || updated.privateMaxFileSizeKb < 1) throw new IllegalArgumentException("全局文件大小上限必须为正整数 KB");
-        if (!"compact".equalsIgnoreCase(updated.metadataFormat)) updated.metadataFormat = "full";
+        if (updated.projectionSearchResultLimit < 1 || updated.projectionSearchResultLimit > 100) throw new IllegalArgumentException("搜索结果数量必须为 1-100");
+        if (updated.cacheRecentImageMaxBytes < 0 || updated.cacheHistoricalImageMaxBytes < 0) throw new IllegalArgumentException("近期和历史图片缓存上限不能为负数");
+        updated.cacheMaxBytes = updated.cacheRecentImageMaxBytes + updated.cacheHistoricalImageMaxBytes;
+        if (!"compact".equalsIgnoreCase(updated.metadataFormat)
+                && !"image".equalsIgnoreCase(updated.metadataFormat)) updated.metadataFormat = "full";
         if (updated.botProfiles != null) for (AgentConfig.BotProfile profile : updated.botProfiles) if (profile != null) profile.normalize();
+        updated.normalizeCommandDefinitions();
+        OfficialSlashCommandPanels.validateConfiguredNames(updated);
         boolean restartRequired = !java.util.Objects.equals(oldBindHost, updated.webBindHost) || oldPort != updated.webPort
                 || config.webEnabled != updated.webEnabled
                 || !java.util.Objects.equals(oldCacheDirectory, updated.cacheDirectory)
                 || !java.util.Objects.equals(oldJavaPath, updated.javaPath)
                 || oldConcurrentRenders != updated.maxConcurrentRenders;
         boolean resourcePacksChanged = !java.util.Objects.equals(oldResourcePacks, Protocol.GSON.toJson(updated.resourcePacks));
+        boolean botProfilesChanged = !java.util.Objects.equals(oldBotProfiles, Protocol.GSON.toJson(updated.botProfiles));
+        boolean commandsChanged = !java.util.Objects.equals(oldCommands, Protocol.GSON.toJson(updated.commands));
         boolean startupChanged = config.startWithWindows != updated.startWithWindows;
         boolean cloudChanged = config.cloudEnabled != updated.cloudEnabled
                 || !java.util.Objects.equals(config.cloudWebSocketUrl, updated.cloudWebSocketUrl)
@@ -184,8 +204,15 @@ final class WebAdminServer implements AutoCloseable {
             catch (Exception error) { log.accept("同步 Windows 启动项失败，配置已保存：" + error.getMessage()); }
         }
         if (cloudChanged) cloud.reload();
-        bots.reload();
+        if (botProfilesChanged) bots.reload();
+        else if (commandsChanged) bots.syncOfficialCommandPanels();
         JsonObject result = ok(); result.addProperty("restartRequired", restartRequired); json(exchange, 200, result);
+    }
+
+    private void syncCommands(HttpExchange exchange) throws IOException {
+        if (!"POST".equals(exchange.getRequestMethod())) { json(exchange, 405, error("method not allowed")); return; }
+        bots.syncOfficialCommandPanels();
+        json(exchange, 200, ok());
     }
 
     private void status(HttpExchange exchange) throws IOException {
@@ -196,6 +223,14 @@ final class WebAdminServer implements AutoCloseable {
         result.addProperty("currentFile", renderer.currentFile() == null ? "" : renderer.currentFile()); result.addProperty("cacheDirectory", renderer.cacheDirectory().toString());
         RenderModels.RuntimeStatus runtime = renderer.runtime().currentStatus();
         if (runtime != null) { result.addProperty("runtimeReady", runtime.ready()); result.addProperty("gpu", runtime.gpu()); result.addProperty("minecraftVersion", runtime.minecraftVersion()); result.addProperty("stage", runtime.stage()); result.addProperty("progress", runtime.progress()); }
+        RuntimeInstaller.InstallProgress install = renderer.runtime().installProgress();
+        result.addProperty("installStage", install.stage()); result.addProperty("installFile", install.currentFile());
+        result.addProperty("installProgress", install.fraction()); result.addProperty("installCompletedBytes", install.completedBytes());
+        result.addProperty("installTotalBytes", install.totalBytes()); result.addProperty("installCompletedFiles", install.completedFiles()); result.addProperty("installTotalFiles", install.totalFiles());
+        BotManager.DownloadProgress attachment = bots.downloadProgress();
+        result.addProperty("attachmentDownloadFile", attachment.file()); result.addProperty("attachmentDownloadActive", attachment.active());
+        result.addProperty("attachmentDownloadProgress", attachment.fraction()); result.addProperty("attachmentDownloadCompletedBytes", attachment.downloadedBytes());
+        result.addProperty("attachmentDownloadTotalBytes", attachment.totalBytes()); result.addProperty("attachmentDownloadError", attachment.error());
         JsonArray accounts = new JsonArray(); for (BotStatus item : bots.statuses()) { JsonObject value = new JsonObject(); value.addProperty("id", item.profileId()); value.addProperty("name", item.name()); value.addProperty("type", item.type()); value.addProperty("enabled", item.enabled()); value.addProperty("connected", item.connected()); value.addProperty("state", item.state()); value.addProperty("reconnects", item.reconnects()); value.addProperty("lastError", item.lastError()); accounts.add(value); } result.add("accounts", accounts);
         json(exchange, 200, result);
     }
@@ -203,8 +238,39 @@ final class WebAdminServer implements AutoCloseable {
     private void logs(HttpExchange exchange) throws IOException {
         int limit = 200;
         try { if (exchange.getRequestURI().getQuery() != null) limit = Math.max(1, Math.min(1000, Integer.parseInt(exchange.getRequestURI().getQuery().replaceFirst(".*limit=", "")))); } catch (RuntimeException ignored) { }
-        List<String> lines = new ArrayList<>(); for (Path file : List.of(root.resolve("agent-gui.log"), root.resolve("agent.log"))) if (Files.isRegularFile(file)) { lines = Files.readAllLines(file); if (!lines.isEmpty()) break; }
+        List<String> lines = new ArrayList<>(); for (Path file : List.of(root.resolve("agent-gui.log"), root.resolve("agent.log"), root.resolve("agent-crash.log"))) if (Files.isRegularFile(file)) { lines = Files.readAllLines(file); if (!lines.isEmpty()) break; }
         int start = Math.max(0, lines.size() - limit); JsonArray values = new JsonArray(); for (int i = start; i < lines.size(); i++) values.add(lines.get(i)); JsonObject result = new JsonObject(); result.add("lines", values); json(exchange, 200, result);
+    }
+
+    private void exportLogs(HttpExchange exchange) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) { json(exchange, 405, error("method not allowed")); return; }
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
+            List<Path> files = List.of(
+                    root.resolve("agent.log"), root.resolve("agent-gui.log"), root.resolve("agent-gui.log.old"),
+                    root.resolve("agent-crash.log"), root.resolve("send-debug.log"), root.resolve("cache-debug.log"),
+                    root.resolve("runtime-crash.log"), root.resolve("runtime/launch-diagnostics.txt"),
+                    root.resolve("runtime/minecraft-runtime.log"), root.resolve("runtime/minecraft-runtime-2.log"),
+                    root.resolve("runtime/minecraft-runtime-3.log"));
+            for (Path file : files) addZipFile(zip, file, null);
+            if (Files.isRegularFile(configPath)) {
+                JsonObject safe = redactedConfig();
+                addZipFile(zip, configPath, Protocol.GSON.toJson(safe).getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        byte[] body = bytes.toByteArray();
+        exchange.getResponseHeaders().set("Content-Type", "application/zip");
+        exchange.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"litematic-agent-logs.zip\"");
+        exchange.sendResponseHeaders(200, body.length);
+        try (var output = exchange.getResponseBody()) { output.write(body); }
+    }
+
+    private static void addZipFile(ZipOutputStream zip, Path file, byte[] replacement) throws IOException {
+        if (replacement == null && !Files.isRegularFile(file)) return;
+        byte[] data = replacement == null ? Files.readAllBytes(file) : replacement;
+        zip.putNextEntry(new ZipEntry(file.getFileName().toString()));
+        zip.write(data);
+        zip.closeEntry();
     }
 
     private void reloadAccount(HttpExchange exchange, String path) throws IOException {
@@ -229,6 +295,78 @@ final class WebAdminServer implements AutoCloseable {
         try { new ResourcePackManager(config, renderer.runtime(), log).applyTransactional(entries); }
         catch (Exception error) { throw new IOException("资源包应用失败：" + error.getMessage(), error); }
         config.save(configPath); json(exchange, 200, ok());
+    }
+
+    private void runtimeClient(HttpExchange exchange) throws IOException {
+        if (!"POST".equals(exchange.getRequestMethod())) { json(exchange, 405, error("method not allowed")); return; }
+        JsonObject body = parseBody(exchange, MAX_RUNTIME_CLIENT_REQUEST_BYTES);
+        String filename = safeFilename(string(body, "filename"));
+        String encoded = string(body, "base64");
+        if (filename.isBlank() || !filename.toLowerCase(java.util.Locale.ROOT).endsWith(".jar") || encoded.isBlank()) {
+            throw new IllegalArgumentException("请上传 .jar 格式的 Minecraft 26.3 客户端");
+        }
+        byte[] bytes;
+        try { bytes = Base64.getDecoder().decode(encoded); }
+        catch (IllegalArgumentException error) { throw new IllegalArgumentException("客户端文件不是有效的 Base64 数据", error); }
+        if (bytes.length > 300 * 1024 * 1024) throw new IllegalArgumentException("客户端 JAR 超过 300 MB");
+        Path directory = root.resolve("imports"); Files.createDirectories(directory);
+        Path target = directory.resolve("minecraft-26.3-client.jar");
+        Path temporary = directory.resolve("minecraft-26.3-client.jar.part");
+        Files.write(temporary, bytes);
+        if (!isZipFile(temporary)) { Files.deleteIfExists(temporary); throw new IllegalArgumentException("上传文件不是有效的 JAR"); }
+        Files.move(temporary, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        config.localMinecraftClientPath = target.toAbsolutePath().toString(); config.save(configPath);
+        log.accept("已导入本地 Minecraft 26.3 客户端：" + filename + "，将使用它准备内置运行时");
+        Thread.startVirtualThread(() -> {
+            try { renderer.runtime().importLocalClient(target); log.accept("本地 Minecraft 26.3 客户端已准备完成"); }
+            catch (Throwable error) { log.accept("本地 Minecraft 客户端准备失败：" + error.getMessage()); }
+        });
+        JsonObject result = ok(); result.addProperty("path", target.toString()); result.addProperty("message", "文件已导入，正在准备运行时，可在状态页查看进度"); json(exchange, 200, result);
+    }
+
+    private void importCache(HttpExchange exchange) throws IOException {
+        if (!"POST".equals(exchange.getRequestMethod())) { json(exchange, 405, error("method not allowed")); return; }
+        JsonObject body = parseBody(exchange, MAX_CACHE_IMPORT_REQUEST_BYTES);
+        String filename = safeFilename(string(body, "filename"));
+        String encoded = string(body, "base64");
+        if (filename.isBlank() || !filename.toLowerCase(java.util.Locale.ROOT).endsWith(".zip") || encoded.isBlank()) {
+            throw new IllegalArgumentException("请上传缓存 ZIP 压缩包");
+        }
+        byte[] bytes;
+        try { bytes = Base64.getDecoder().decode(encoded); }
+        catch (IllegalArgumentException error) { throw new IllegalArgumentException("缓存压缩包不是有效的 Base64 数据", error); }
+        if (bytes.length > ProjectionArchiveImporter.MAX_ARCHIVE_BYTES) throw new IllegalArgumentException("缓存压缩包超过 512 MB");
+        Files.createDirectories(root);
+        Path temporary = Files.createTempFile(root, ".cache-import-", ".zip");
+        try {
+            Files.write(temporary, bytes);
+            if (!isZipFile(temporary)) throw new IllegalArgumentException("上传文件不是有效的 ZIP 压缩包");
+            ProjectionArchiveImporter.ImportResult result = renderer.importCacheArchive(temporary);
+            JsonObject response = ok();
+            response.addProperty("imported", result.importedCount());
+            response.addProperty("existing", result.existingFiles());
+            response.addProperty("invalid", result.invalidEntries());
+            response.addProperty("uncompressedBytes", result.uncompressedBytes());
+            response.addProperty("message", "缓存投影已导入，图片会按当前配置重新生成");
+            json(exchange, 200, response);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    private void rebuildCacheIndex(HttpExchange exchange) throws IOException {
+        if (!"POST".equals(exchange.getRequestMethod())) { json(exchange, 405, error("method not allowed")); return; }
+        int count = renderer.rebuildProjectionIndex();
+        JsonObject response = ok();
+        response.addProperty("count", count);
+        response.addProperty("index", renderer.cacheDirectory().resolve(ProjectionCacheIndex.NAME).toString());
+        response.addProperty("message", "已重建投影名称与哈希索引");
+        json(exchange, 200, response);
+    }
+
+    private static boolean isZipFile(Path file) {
+        try (java.util.zip.ZipFile ignored = new java.util.zip.ZipFile(file.toFile())) { return true; }
+        catch (IOException ignored) { return false; }
     }
 
     private JsonObject redactedConfig() {

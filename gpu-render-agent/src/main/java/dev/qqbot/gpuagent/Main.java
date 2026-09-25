@@ -14,7 +14,7 @@ import java.util.function.Consumer;
 
 public final class Main {
     /** 工具版本号：与 build.gradle 和预发布包名保持一致。 */
-    public static final String VERSION = "0.4.4";
+    public static final String VERSION = "0.5.1";
 
     private Main() {}
 
@@ -32,8 +32,18 @@ public final class Main {
         Path root = configuredHome == null || configuredHome.isBlank()
                 ? defaultDataRoot()
                 : Path.of(configuredHome).toAbsolutePath().normalize();
+        Files.createDirectories(root);
+        CrashLogger.install(root, System.err::println);
         Path configPath = root.resolve("agent.json");
         AgentConfig config = AgentConfig.load(configPath);
+        try {
+            if (ResourcePackManager.recoverLegacyPacks(root, config)) {
+                config.save(configPath);
+                System.out.println("已恢复历史资源包到：" + root.resolve("resource-packs").toAbsolutePath());
+            }
+        } catch (IOException error) {
+            System.err.println("恢复历史资源包失败：" + error.getMessage());
+        }
         if (args.length > 0) {
             if (args.length == 1 && ("--web".equals(args[0]) || "--bot".equals(args[0]))) {
                 runHeadless(root, configPath, config, "--web".equals(args[0]));
@@ -50,19 +60,27 @@ public final class Main {
     }
 
     private static void runCli(Path root, AgentConfig config, String[] args) throws Exception {
-        if (args.length != 4 || !"--render".equals(args[0]) || !"--output".equals(args[2])) {
-            System.err.println("用法：java -jar litematic-gpu-agent-" + VERSION + "-all.jar --render FILE.litematic --output DIRECTORY");
+        if (args.length != 4 || (!"--render".equals(args[0]) && !"--map-art".equals(args[0]))
+                || !"--output".equals(args[2])) {
+            System.err.println("用法：java -jar litematic-gpu-agent-" + VERSION
+                    + "-all.jar --render|--map-art FILE.litematic --output DIRECTORY");
             System.exit(2);
         }
         Path input = Path.of(args[1]).toAbsolutePath().normalize();
         Path output = Path.of(args[3]).toAbsolutePath().normalize();
         try (RenderService renderer = new RenderService(root, config)) {
             renderer.setLog(System.out::println);
-            List<RenderModels.View> views = List.of(
-                    new RenderModels.View("isometric", "正二轴测", 135, 36, 0.82, true, 2048, 2048, "#000000", false, 1),
-                    new RenderModels.View("isometric-reverse", "反向正二轴测", 315, 36, 0.82, true, 2048, 2048, "#000000", false, 1));
+            boolean mapArt = "--map-art".equals(args[0]);
+            List<RenderModels.View> views = mapArt
+                    ? List.of(new RenderModels.View("extra-map-art", "地图视图", 0, 90, 1.0, true,
+                            1024, 1024, "#000000", false, 1))
+                    : List.of(
+                            new RenderModels.View("isometric", "正二轴测", 135, 36, 0.82, true, 2048, 2048, "#000000", false, 1),
+                            new RenderModels.View("isometric-reverse", "反向正二轴测", 315, 36, 0.82, true, 2048, 2048, "#000000", false, 1));
             var request = new RenderModels.Request(2, UUID.randomUUID().toString(), input.getFileName().toString(), views, null, "0", null);
-            var result = renderer.submit(request, Files.readAllBytes(input), Duration.ofMillis(config.renderTimeoutMillis)).join();
+            var result = mapArt
+                    ? renderer.submitAuxiliary(request, Files.readAllBytes(input), Duration.ofMillis(config.renderTimeoutMillis), "命令行地图画", null).join()
+                    : renderer.submit(request, Files.readAllBytes(input), Duration.ofMillis(config.renderTimeoutMillis)).join();
             Files.createDirectories(output);
             for (var image : result.images()) Files.copy(image.path(), output.resolve(image.name()), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             System.out.println("Rendered " + result.images().size() + " image(s) in " + result.elapsedMillis() + " ms to " + output);
@@ -143,6 +161,8 @@ public final class Main {
         System.out.println("      无桌面启动机器人和渲染服务，不启动 Web 后台");
         System.out.println("  java -jar litematic-gpu-agent-" + VERSION + "-all.jar --render FILE.litematic --output DIRECTORY");
         System.out.println("      使用本地 GPU 运行时渲染投影");
+        System.out.println("  java -jar litematic-gpu-agent-" + VERSION + "-all.jar --map-art FILE.litematic --output DIRECTORY");
+        System.out.println("      按 Minecraft 方块地图颜色导出俯视像素图");
         System.out.println("  --version       显示版本");
         System.out.println("  --help          显示帮助");
     }

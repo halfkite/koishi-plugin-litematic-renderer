@@ -95,6 +95,7 @@
       <nav>
         <button data-view="status" class="active">状态</button>
         <button data-view="config">配置</button>
+        <button data-view="search">搜索投影</button>
         <button data-view="logs">日志</button>
       </nav>
 
@@ -108,7 +109,7 @@
           <div class="panel metric"><span class="muted">当前任务</span><strong id="currentFile">-</strong></div>
         </div>
         <div class="panel"><h2>机器人账号</h2><div id="accounts">暂无账号</div></div>
-        <div class="panel"><h2>运行详情</h2><pre id="runtimeDetails">等待状态...</pre></div>
+        <div class="panel"><h2>运行详情</h2><div id="runtimeInstallText" class="hint">暂无客户端下载任务</div><progress id="runtimeInstallProgress" max="1" value="0" style="width:100%;height:18px"></progress><pre id="runtimeDetails">等待状态...</pre></div>
       </section>
 
       <section id="config" class="view">
@@ -119,14 +120,15 @@
             <label>监听地址<input id="webBindHost"></label>
             <label>监听端口<input id="webPort" type="number" min="1" max="65535"></label>
             <label>缓存目录<input id="cacheDirectory"></label>
-             <label>缓存上限 GB<input id="cacheMaxGb" type="number" min="1" step="0.1"></label>
+             <label>近一年投影渲染图上限 GB<input id="cacheRecentGb" type="number" min="0" step="0.1"></label>
+             <label>历史投影渲染图上限 GB<input id="cacheHistoricalGb" type="number" min="0" step="0.1"></label>
             <label>宽度<input id="renderWidth" type="number" min="64"></label>
             <label>高度<input id="renderHeight" type="number" min="64"></label>
             <label>群文件上限 KB<input id="maxFileSizeKb" type="number" min="1"></label>
             <label>私聊文件上限 KB<input id="privateMaxFileSizeKb" type="number" min="1"></label>
             <label>渲染超时毫秒<input id="renderTimeoutMillis" type="number" min="1000"></label>
-             <label>空闲关闭毫秒<input id="renderIdleStopMillis" type="number" min="0"></label>
-             <label>并行客户端数<input id="maxConcurrentRenders" type="number" min="1" max="4"></label>
+            <label>空闲关闭毫秒<input id="renderIdleStopMillis" type="number" min="0"></label>
+            <label>并行客户端数<input id="maxConcurrentRenders" type="number" min="1" max="4"></label>
              <label>内存重启阈值 GB<input id="memoryRestartGb" type="number" min="0" step="0.1"><span class="hint">0 表示关闭自动重启</span></label>
           </div>
           <div class="subsection check-grid">
@@ -136,8 +138,9 @@
             <label class="check"><input id="minimizeToTray" type="checkbox"><span>关闭窗口时缩到托盘</span></label>
           </div>
           <div class="form-grid" style="margin-top:12px">
-            <label>拼接方向<select id="cloudMergeLayout"><option value="horizontal">横向</option><option value="vertical">竖向</option></select></label>
+            <label>渲染图发送<select id="cloudMergeLayout"><option value="horizontal">横向拼接</option><option value="vertical">竖向拼接</option><option value="separate">不拼接发送</option></select></label>
             <label>Java 路径<input id="javaPath" placeholder="留空自动检测"></label>
+            <label>Minecraft 26.3 客户端路径<input id="localMinecraftClientPath" placeholder="留空则从官方地址下载"></label>
              <label>最大请求 MB<input id="maxRequestMb" type="number" min="1"></label>
              <label>时间偏差秒<input id="maxClockSkewSeconds" type="number" min="0"></label>
              <label>网页登录用户名<input id="webUsername" autocomplete="username"></label>
@@ -154,9 +157,15 @@
         </div>
 
         <div class="panel">
+          <h2>投影缓存</h2>
+          <p class="hint">可重新扫描缓存并生成投影名称/哈希索引；搜索投影会读取该索引。重建后也可直接发送“发送投影1”；导入缓存 ZIP 时只导入 .litematic 源文件。</p>
+          <div class="row"><input id="cacheArchiveFile" type="file" accept=".zip"><button id="importCacheArchive">导入缓存</button><button id="rebuildCacheIndex">重建搜索索引</button></div>
+        </div>
+
+        <div class="panel">
           <h2>投影信息</h2>
           <div class="form-grid compact">
-            <label>介绍格式<select id="metadataFormat"><option value="full">完整标签版</option><option value="compact">精简版（模式2）</option></select></label>
+            <label>介绍格式<select id="metadataFormat"><option value="full">完整标签版</option><option value="compact">精简版（模式2）</option><option value="image">图片版</option></select></label>
           </div>
           <div class="check-grid">
             <label class="check"><input id="showMetadataProjectionName" type="checkbox"><span>投影名称</span></label>
@@ -190,6 +199,12 @@
         </div>
 
         <div class="panel">
+          <h2>内置 Minecraft 客户端</h2>
+          <p class="hint">可以上传已有的 Minecraft 26.3 客户端 JAR，服务器会保存到 Agent 数据目录并准备运行时；下载或准备过程可在状态页查看进度。</p>
+          <div class="row"><input id="runtimeClientFile" type="file" accept=".jar"><button id="uploadRuntimeClient">导入本地客户端</button></div>
+        </div>
+
+        <div class="panel">
           <div class="row"><button id="saveConfig" class="primary">保存配置</button><span id="saveMessage" class="muted"></span></div>
         </div>
 
@@ -207,8 +222,21 @@
         </div>
       </section>
 
+      <section id="search" class="view">
+        <div class="panel">
+          <h2>机器人功能与指令</h2>
+          <label class="check"><input id="automaticRenderingEnabled" type="checkbox"><span>群内自动识别并渲染投影文件</span></label>
+          <div class="form-grid compact">
+            <label>默认结果数量<input id="projectionSearchResultLimit" type="number" min="1" max="100"></label>
+          </div>
+          <p class="hint">关闭功能后对应指令立即停用，并从官方 QQ 的 / 面板移除；介绍和帮助图片会按启用功能更新。搜索结果范围为 1-100，近半年保存的投影优先占前五位，其余按渲染次数排序。</p>
+          <div id="commandEditor"></div>
+          <div class="row" style="margin-top:12px"><button id="saveSearchConfig" class="primary">保存功能设置</button><button id="syncCommands">同步 QQ 指令面板</button></div>
+        </div>
+      </section>
+
       <section id="logs" class="view">
-        <div class="panel"><div class="row"><h2 style="margin:0; flex:1">日志尾部</h2><button id="refreshLogs">刷新</button></div><pre id="logOutput">暂无日志</pre></div>
+        <div class="panel"><div class="row"><h2 style="margin:0; flex:1">日志尾部</h2><button id="refreshLogs">刷新</button><button id="exportLogs">导出诊断日志</button></div><pre id="logOutput">暂无日志</pre></div>
       </section>
     </main>
   </section>
@@ -244,14 +272,17 @@
           + '<div class="form-grid compact">'
           + '<label>账号名称<input data-field="name" value="' + esc(profile.name || '') + '"></label>'
           + '<label class="check"><input data-field="enabled" type="checkbox"' + checked(profile.enabled) + '><span>启用账号</span></label>'
+          + '<label class="check"><input data-field="autoConnect" type="checkbox"' + checked(profile.autoConnect !== false) + '><span>启动时自动连接</span></label>'
           + '<label>账号类型<select data-field="type" data-account-type><option value="official"' + (onebot ? '' : ' selected') + '>官方 QQ</option><option value="onebot"' + (onebot ? ' selected' : '') + '>OneBot / NekoBot</option></select></label>'
           + '<label>群消息模式<select data-field="groupMessageMode"><option value="received"' + (profile.groupMessageMode === 'received' ? ' selected' : '') + '>接收群文件自动识别（不要求 @）</option><option value="mentionOnly"' + (profile.groupMessageMode === 'mentionOnly' ? ' selected' : '') + '>仅被 @ 时识别</option><option value="any"' + (profile.groupMessageMode === 'any' ? ' selected' : '') + '>都可以（文件或 @）</option></select></label>'
+          + '<label class="check"><input data-field="commandRequireMention" type="checkbox"' + checked(profile.commandRequireMention !== false) + '><span>指令需要 @（关闭后不 @ 也可，文件识别不受影响；官方 / 指令不要求 @）</span></label>'
           + '</div>'
           + '<div class="subsection ' + (onebot ? 'hidden' : '') + '" data-type-fields="official"><h3>官方 QQ</h3><div class="form-grid compact">'
           + '<label>AppID<input data-field="appId" value="' + esc(profile.appId || '') + '"></label>'
           + '<label>AppSecret（留空保持不变）<input data-field="appSecret" type="password" autocomplete="new-password" placeholder="已保存的密钥不会回显"></label>'
           + '<label class="check"><input data-field="sandbox" type="checkbox"' + checked(profile.sandbox) + '><span>沙箱环境</span></label>'
            + '<label>事件意图<input data-field="intents" data-number type="number" min="0" value="' + numberValue(profile.intents, 1174405120) + '"></label>'
+          + '<p class="hint">关闭“获取群内全部消息”时，群 @ 仍由 @ 事件触发；开启时会从全量消息的 mentions 字段识别是否 @ 到本机器人。</p>'
           + '</div></div>'
           + '<div class="subsection ' + (onebot ? '' : 'hidden') + '" data-type-fields="onebot"><h3>OneBot / NekoBot</h3><div class="form-grid compact">'
           + '<label>连接方式<select data-field="transport"><option value="forward"' + (profile.transport === 'forward' ? ' selected' : '') + '>正向连接</option><option value="reverse"' + (profile.transport === 'reverse' ? ' selected' : '') + '>反向监听</option></select></label>'
@@ -268,6 +299,7 @@
           + '<label class="check"><input data-field="replyAndMention" type="checkbox"' + checked(profile.replyAndMention) + '><span>引用原消息并 @ 发送者</span></label>'
           + '<label class="check"><input data-field="showViewTitles" type="checkbox"' + checked(profile.showViewTitles) + '><span>显示视角标题</span></label>'
           + '<label class="check"><input data-field="successNotice" type="checkbox"' + checked(profile.successNotice) + '><span>发送渲染成功提示</span></label>'
+          + '<label>渲染图发送<select data-field="imageSendLayout"><option value="horizontal"' + (profile.imageSendLayout === 'horizontal' ? ' selected' : '') + '>横向拼接</option><option value="vertical"' + (profile.imageSendLayout === 'vertical' ? ' selected' : '') + '>竖向拼接</option><option value="separate"' + (profile.imageSendLayout === 'separate' ? ' selected' : '') + '>不拼接发送</option></select></label>'
           + '<label>发送模式<select data-field="sendMode"><option value="combined"' + (profile.sendMode === 'combined' ? ' selected' : '') + '>联合发送</option><option value="forward"' + (profile.sendMode === 'forward' ? ' selected' : '') + '>合并转发</option></select></label>'
           + '</div><div class="form-grid compact">'
           + '<label>群白名单（每行一个）<textarea data-field="groupWhitelist" data-list>' + esc(listValue(profile.groupWhitelist)) + '</textarea></label>'
@@ -306,6 +338,70 @@
           else profile[field.dataset.field] = field.value;
         });
         return profile;
+      });
+    }
+
+    function defaultCommandDefinitions() {
+      return [
+        { id: 'search', defaultName: '搜索投影', name: '搜索投影', aliases: [] },
+        { id: 'sendProjection', defaultName: '发送投影', name: '发送投影', aliases: [] },
+        { id: 'sendMaterials', defaultName: '导出材料', name: '导出材料', aliases: [] },
+        { id: 'projectionList', defaultName: '投影列表', name: '投影列表', aliases: [] },
+        { id: 'help', defaultName: '帮助', name: '帮助', aliases: [] },
+        { id: 'introduction', defaultName: '介绍投影BOT', name: '介绍投影BOT', aliases: [] },
+        { id: 'moreViews', defaultName: '更多视图', name: '更多视图', aliases: [] },
+        { id: 'projectionView', defaultName: '投影视图', name: '投影视图', aliases: [] },
+        { id: 'mapView', defaultName: '地图视图', name: '地图视图', aliases: [{ name: '地图画模式', enabled: true }] }
+      ];
+    }
+
+    function commandLabel(id) {
+      return ({ search: '搜索投影', sendProjection: '发送投影', sendMaterials: '导出材料', projectionList: '投影列表', help: '帮助', introduction: '机器人介绍', moreViews: '更多视图菜单', projectionView: '详细视图渲染', mapView: '地图配色视图' }[id]) || id;
+    }
+
+    function aliasRow(name = '', enabled = true) {
+      return '<div class="row alias-row" data-alias-row>'
+        + '<input data-alias-name placeholder="输入别名" value="' + esc(name) + '">'
+        + '<label class="check"><input data-alias-enabled type="checkbox"' + checked(enabled) + '><span>启用</span></label>'
+        + '<button type="button" class="small danger" data-command-action="delete-alias">删除</button>'
+        + '</div>';
+    }
+
+    function renderCommandEditor() {
+      const definitions = Array.isArray(state.config.commands) && state.config.commands.length ? state.config.commands : defaultCommandDefinitions();
+      $('commandEditor').innerHTML = definitions.map((definition, index) => {
+        const aliases = Array.isArray(definition.aliases) ? definition.aliases : [];
+        return '<article class="account-card command-card" data-command-index="' + index + '" data-default-name="' + esc(definition.defaultName || '') + '">'
+          + '<div class="card-head"><strong>' + esc(commandLabel(definition.id)) + '</strong><div class="card-actions"><label class="check"><input data-command-enabled type="checkbox"' + checked(definition.enabled !== false) + '><span>启用功能</span></label>'
+          + '<button type="button" class="small" data-command-action="reset-name">重置默认名称</button></div></div>'
+          + '<div class="form-grid compact"><label>主指令名称<input data-command-name value="' + esc(definition.name || definition.defaultName || '') + '"></label>'
+          + '<span class="hint">默认名称：' + esc(definition.defaultName || '') + '。支持直接使用数字，例如“发送投影1”。</span></div>'
+          + '<div class="subsection"><h3>指令别名</h3><div data-alias-list>' + aliases.map(alias => aliasRow(alias && alias.name || '', !alias || alias.enabled !== false)).join('') + '</div>'
+          + '<button type="button" class="small" data-command-action="add-alias">增加别名</button></div></article>';
+      }).join('');
+      $('commandEditor').onclick = event => {
+        const button = event.target.closest('[data-command-action]');
+        if (!button) return;
+        const card = button.closest('.command-card');
+        const action = button.dataset.commandAction;
+        if (action === 'reset-name') card.querySelector('[data-command-name]').value = card.dataset.defaultName;
+        if (action === 'add-alias') card.querySelector('[data-alias-list]').insertAdjacentHTML('beforeend', aliasRow());
+        if (action === 'delete-alias') button.closest('[data-alias-row]').remove();
+      };
+    }
+
+    function readCommands() {
+      const source = Array.isArray(state.config.commands) && state.config.commands.length ? state.config.commands : defaultCommandDefinitions();
+      return [...document.querySelectorAll('.command-card')].map(card => {
+        const index = Number(card.dataset.commandIndex);
+        const definition = { ...(source[index] || {}) };
+        definition.enabled = card.querySelector('[data-command-enabled]').checked;
+        definition.name = card.querySelector('[data-command-name]').value.trim();
+        definition.aliases = [...card.querySelectorAll('[data-alias-row]')].map(row => ({
+          name: row.querySelector('[data-alias-name]').value.trim(),
+          enabled: row.querySelector('[data-alias-enabled]').checked
+        })).filter(alias => alias.name);
+        return definition;
       });
     }
 
@@ -380,18 +476,20 @@
     async function loadConfig() {
       state.config = await api('/api/config');
       const c = state.config;
-      ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','cloudWebSocketUrl','agentId','javaPath','maxClockSkewSeconds','webUsername'].forEach(id => { if ($(id)) $(id).value = c[id] ?? ''; });
+      ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => { if ($(id)) $(id).value = c[id] ?? ''; });
       $('newUsername').value = c.webUsername ?? '';
-      $('cacheMaxGb').value = Math.max(1, Math.round((Number(c.cacheMaxBytes || 10737418240) / 1073741824) * 10) / 10);
+      $('cacheRecentGb').value = Math.max(0, Math.round((Number(c.cacheRecentImageMaxBytes ?? 8589934592) / 1073741824) * 10) / 10);
+      $('cacheHistoricalGb').value = Math.max(0, Math.round((Number(c.cacheHistoricalImageMaxBytes ?? 2147483648) / 1073741824) * 10) / 10);
       $('maxRequestMb').value = Math.max(1, Math.round((Number(c.maxRequestBytes || 134217728) / 1048576) * 10) / 10);
       $('memoryRestartGb').value = Math.max(0, Math.round((Number(c.memoryRestartThresholdBytes || 0) / 1073741824) * 10) / 10);
       $('webSessionHours').value = Math.max(0.083, Math.round((Number(c.webSessionTimeoutMillis || 43200000) / 3600000) * 10) / 10);
       $('webEnabled').checked = !!c.webEnabled;
-      $('metadataFormat').value = c.metadataFormat === 'compact' ? 'compact' : 'full';
+      $('automaticRenderingEnabled').checked = c.automaticRenderingEnabled !== false;
+      $('metadataFormat').value = ['full','compact','image'].includes(c.metadataFormat) ? c.metadataFormat : 'full';
       ['showMetadataProjectionName','showMetadataAuthor','showMetadataCreatedAt','showMetadataBlockStats','showMetadataSize','showMetadataLitematicVersion','showMetadataGameVersion'].forEach(id => { $(id).checked = c[id] !== false; });
       ['localMergeEnabled','cacheKeepProjections','startWithWindows','minimizeToTray','cloudEnabled'].forEach(id => { $(id).checked = !!c[id]; });
-      $('cloudMergeLayout').value = c.cloudMergeLayout === 'vertical' ? 'vertical' : 'horizontal';
-      renderAccountEditor(); renderViewEditor(); renderPackEditor();
+      $('cloudMergeLayout').value = ['horizontal','vertical','separate'].includes(c.cloudMergeLayout) ? c.cloudMergeLayout : 'horizontal';
+        renderAccountEditor(); renderViewEditor(); renderPackEditor(); renderCommandEditor();
       show('notice', !!c.webPasswordChangeNotice);
     }
     async function loadStatus() {
@@ -404,6 +502,12 @@
         $('gpu').textContent = s.gpu || '-';
         $('queue').textContent = (s.queueLength ?? 0) + (s.busy ? '（渲染中）' : '');
         $('currentFile').textContent = s.currentFile || '无';
+        const installProgress = Number(s.installProgress || 0); const attachmentProgress = Number(s.attachmentDownloadProgress || 0);
+        const attachmentActive = !!s.attachmentDownloadActive || !!s.attachmentDownloadError;
+        $('runtimeInstallProgress').value = attachmentActive ? attachmentProgress : installProgress;
+        const downloaded = attachmentActive ? Number(s.attachmentDownloadCompletedBytes || 0) : Number(s.installCompletedBytes || 0), total = attachmentActive ? Number(s.attachmentDownloadTotalBytes || 0) : Number(s.installTotalBytes || 0); const formatBytes = bytes => bytes < 1048576 ? Math.round(bytes / 1024) + ' KB' : (bytes < 1073741824 ? (bytes / 1048576).toFixed(1) + ' MB' : (bytes / 1073741824).toFixed(2) + ' GB');
+        if (attachmentActive) $('runtimeInstallText').textContent = '投影下载' + (s.attachmentDownloadFile ? '：' + s.attachmentDownloadFile : '') + (total ? ' ' + formatBytes(downloaded) + ' / ' + formatBytes(total) + '（' + Math.round(attachmentProgress * 100) + '%）' : '') + (s.attachmentDownloadError ? ' ' + s.attachmentDownloadError : '');
+        else $('runtimeInstallText').textContent = s.installStage ? (s.installStage + (s.installFile ? '：' + s.installFile : '') + (total ? ' ' + formatBytes(downloaded) + ' / ' + formatBytes(total) + '（' + Math.round(installProgress * 100) + '%）' : '')) : '暂无客户端下载任务';
         $('runtimeDetails').textContent = JSON.stringify(s, null, 2);
         renderAccounts(s.accounts || []);
       } catch (error) { $('connection').textContent = '状态读取失败'; }
@@ -417,8 +521,10 @@
     async function saveConfig() {
       try {
         const next = { ...state.config };
-        ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','cloudWebSocketUrl','agentId','javaPath','maxClockSkewSeconds','webUsername'].forEach(id => next[id] = $(id).type === 'number' ? Number($(id).value) : $(id).value.trim());
-        next.cacheMaxBytes = Math.max(1, Number($('cacheMaxGb').value)) * 1073741824;
+        ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => next[id] = $(id).type === 'number' ? Number($(id).value) : $(id).value.trim());
+        next.cacheRecentImageMaxBytes = Math.max(0, Number($('cacheRecentGb').value)) * 1073741824;
+        next.cacheHistoricalImageMaxBytes = Math.max(0, Number($('cacheHistoricalGb').value)) * 1073741824;
+        next.cacheMaxBytes = next.cacheRecentImageMaxBytes + next.cacheHistoricalImageMaxBytes;
         next.maxRequestBytes = Math.max(1, Number($('maxRequestMb').value)) * 1048576;
         next.memoryRestartThresholdBytes = Math.max(0, Number($('memoryRestartGb').value)) * 1073741824;
         next.webSessionTimeoutMillis = Math.max(0.083, Number($('webSessionHours').value)) * 3600000;
@@ -428,11 +534,13 @@
         next.cacheKeepProjections = $('cacheKeepProjections').checked;
         next.startWithWindows = $('startWithWindows').checked;
         next.minimizeToTray = $('minimizeToTray').checked;
-        next.cloudMergeLayout = $('cloudMergeLayout').value === 'vertical' ? 'vertical' : 'horizontal';
-      next.metadataFormat = $('metadataFormat').value === 'compact' ? 'compact' : 'full';
+        next.cloudMergeLayout = ['horizontal','vertical','separate'].includes($('cloudMergeLayout').value) ? $('cloudMergeLayout').value : 'horizontal';
+      next.metadataFormat = ['full','compact','image'].includes($('metadataFormat').value) ? $('metadataFormat').value : 'full';
       ['showMetadataProjectionName','showMetadataAuthor','showMetadataCreatedAt','showMetadataBlockStats','showMetadataSize','showMetadataLitematicVersion','showMetadataGameVersion'].forEach(id => next[id] = $(id).checked);
         next.sharedSecret = $('sharedSecret').value;
         next.botProfiles = readAccounts();
+        next.commands = readCommands();
+        next.automaticRenderingEnabled = $('automaticRenderingEnabled').checked;
         next.views = readViews();
         next.resourcePacks = readPacks();
         const result = await api('/api/config', { method: 'PUT', body: JSON.stringify(next) });
@@ -442,7 +550,7 @@
       } catch (error) { $('saveMessage').textContent = error.message; toast(error.message, true); }
     }
     function newProfile(type) {
-      const profile = { id: randomId('bot'), name: type === 'onebot' ? 'OneBot 账号' : '官方 QQ 账号', type, enabled: false, appId: '', appSecret: '', sandbox: false, intents: 1174405120, groupMessageMode: 'received', transport: 'forward', webSocketUrl: '', accessToken: '', listenHost: '0.0.0.0', listenPort: 39200, path: '/onebot/v11/ws', maxFileSizeKb: 0, privateMaxFileSizeKb: 0, allowPrivateRender: false, groupWhitelistEnabled: false, groupWhitelist: [], groupBlacklistEnabled: false, groupBlacklist: [], sendMode: 'combined', replyAndMention: true, showViewTitles: false, successNotice: true };
+      const profile = { id: randomId('bot'), name: type === 'onebot' ? 'OneBot 账号' : '官方 QQ 账号', type, enabled: false, autoConnect: true, appId: '', appSecret: '', sandbox: false, intents: 1174405120, groupMessageMode: 'received', commandRequireMention: true, transport: 'forward', webSocketUrl: '', accessToken: '', listenHost: '0.0.0.0', listenPort: 39200, path: '/onebot/v11/ws', maxFileSizeKb: 0, privateMaxFileSizeKb: 0, allowPrivateRender: false, groupWhitelistEnabled: false, groupWhitelist: [], groupBlacklistEnabled: false, groupBlacklist: [], sendMode: 'combined', imageSendLayout: 'horizontal', replyAndMention: true, showViewTitles: false, successNotice: true };
       state.config.botProfiles = [...(state.config.botProfiles || []), profile]; renderAccountEditor();
     }
     function newView() {
@@ -453,6 +561,35 @@
       const file = $('packFile').files[0]; if (!file) { toast('请选择 ZIP 资源包', true); return; }
       if (file.size > 256 * 1024 * 1024) { toast('资源包超过 256 MB', true); return; }
       const reader = new FileReader(); reader.onload = async () => { try { const base64 = String(reader.result).split(',', 2)[1] || ''; await api('/api/resource-packs', { method: 'POST', body: JSON.stringify({ filename: file.name, base64 }) }); toast('资源包已上传'); $('packFile').value = ''; await loadConfig(); } catch (error) { toast(error.message, true); } }; reader.readAsDataURL(file);
+    }
+    async function uploadRuntimeClient() {
+      const file = $('runtimeClientFile').files[0]; if (!file) { toast('请选择 Minecraft 26.3 客户端 JAR', true); return; }
+      if (file.size > 300 * 1024 * 1024) { toast('客户端 JAR 超过 300 MB', true); return; }
+      const reader = new FileReader(); reader.onload = async () => { try { const base64 = String(reader.result).split(',', 2)[1] || ''; await api('/api/runtime-client', { method: 'POST', body: JSON.stringify({ filename: file.name, base64 }) }); toast('客户端已导入，正在准备运行时'); $('runtimeClientFile').value = ''; loadStatus(); } catch (error) { toast(error.message, true); } }; reader.readAsDataURL(file);
+    }
+    async function importCacheArchive() {
+      const file = $('cacheArchiveFile').files[0]; if (!file) { toast('请选择缓存 ZIP 压缩包', true); return; }
+      if (file.size > 512 * 1024 * 1024) { toast('缓存压缩包超过 512 MB', true); return; }
+      const button = $('importCacheArchive'); button.disabled = true;
+      const reader = new FileReader(); reader.onload = async () => {
+        try {
+          const base64 = String(reader.result).split(',', 2)[1] || '';
+          const result = await api('/api/cache/import', { method: 'POST', body: JSON.stringify({ filename: file.name, base64 }) });
+          toast(`缓存已导入：新增 ${result.imported} 个，已存在 ${result.existing} 个`);
+          $('cacheArchiveFile').value = '';
+        } catch (error) { toast(error.message, true); }
+        finally { button.disabled = false; }
+      };
+      reader.onerror = () => { button.disabled = false; toast('读取缓存压缩包失败', true); };
+      reader.readAsDataURL(file);
+    }
+    async function rebuildCacheIndex() {
+      const button = $('rebuildCacheIndex'); button.disabled = true;
+      try {
+        const result = await api('/api/cache/reindex', { method: 'POST' });
+        toast(`搜索索引已重建：${result.count} 个有效投影`);
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
     }
     async function changePassword() { try { await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ newPassword: $('newPassword').value, newPasswordAgain: $('newPasswordAgain').value }) }); $('newPassword').value = ''; $('newPasswordAgain').value = ''; toast('密码已修改'); await loadConfig(); } catch (error) { toast(error.message, true); } }
     async function changeUsername() { try { const name = $('newUsername').value.trim(); if (!name) throw new Error('账户名称不能为空'); await api('/api/auth/change-username', { method: 'POST', body: JSON.stringify({ newUsername: name }) }); toast('账户名称已修改'); await loadConfig(); } catch (error) { toast(error.message, true); } }
@@ -472,7 +609,7 @@
      $('themeToggle').onclick = () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
      $('loginThemeToggle').onclick = () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
     document.querySelectorAll('nav button').forEach(button => button.onclick = () => { document.querySelectorAll('nav button').forEach(item => item.classList.remove('active')); document.querySelectorAll('.view').forEach(item => item.classList.remove('active')); button.classList.add('active'); $(button.dataset.view).classList.add('active'); if (button.dataset.view === 'logs') loadLogs(); });
-    $('saveConfig').onclick = saveConfig; $('saveConfigTop').onclick = saveConfig; $('addOfficial').onclick = () => newProfile('official'); $('addOneBot').onclick = () => newProfile('onebot'); $('addView').onclick = newView; $('reloadBots').onclick = async () => { try { const result = await api('/api/config', { method: 'PUT', body: JSON.stringify({ ...state.config, botProfiles: readAccounts() }) }); toast(result.restartRequired ? '账号已保存，请重启 Agent' : '账号已重新加载'); await loadConfig(); loadStatus(); } catch (error) { toast(error.message, true); } }; $('uploadPack').onclick = uploadPack; $('changePassword').onclick = changePassword; $('changeUsername').onclick = changeUsername; $('refreshLogs').onclick = loadLogs;
+    $('saveConfig').onclick = saveConfig; $('saveSearchConfig').onclick = saveConfig; $('saveConfigTop').onclick = saveConfig; $('syncCommands').onclick = async () => { try { await api('/api/commands/sync', { method: 'POST', body: '{}' }); toast('已开始同步 QQ 指令面板，结果请查看日志'); } catch (error) { toast(error.message, true); } }; $('addOfficial').onclick = () => newProfile('official'); $('addOneBot').onclick = () => newProfile('onebot'); $('addView').onclick = newView; $('reloadBots').onclick = async () => { try { const result = await api('/api/config', { method: 'PUT', body: JSON.stringify({ ...state.config, botProfiles: readAccounts() }) }); toast(result.restartRequired ? '账号已保存，请重启 Agent' : '账号已重新加载'); await loadConfig(); loadStatus(); } catch (error) { toast(error.message, true); } }; $('uploadPack').onclick = uploadPack; $('uploadRuntimeClient').onclick = uploadRuntimeClient; $('importCacheArchive').onclick = importCacheArchive; $('rebuildCacheIndex').onclick = rebuildCacheIndex; $('changePassword').onclick = changePassword; $('changeUsername').onclick = changeUsername; $('refreshLogs').onclick = loadLogs; $('exportLogs').onclick = () => { window.location.href = '/api/logs/export'; };
     setInterval(() => { if (!$('app').classList.contains('hidden')) loadStatus(); }, 4000);
   </script>
 </body>

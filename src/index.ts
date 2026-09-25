@@ -59,6 +59,8 @@ export interface Config {
   showMetadataLitematicVersion: boolean
   showMetadataGameVersion: boolean
   replyAndMention: boolean
+  imageSendLayout: ImageSendLayout
+  projectionSearchResultLimit: number
   sixFaceOverview: boolean
   sixFaceLayout: SixFaceLayout
   groupSendOptions: GroupSendOption[]
@@ -86,6 +88,14 @@ export interface Config {
 export type SendMode = 'forward' | 'combined'
 export type ReplyAndMentionOverride = 'inherit' | 'enabled' | 'disabled'
 export type SixFaceLayout = 'horizontal' | 'vertical'
+export type ImageSendLayout = 'horizontal' | 'vertical' | 'separate'
+
+export function normalizeImageSendLayout(value: unknown): ImageSendLayout {
+  if (value === 'vertical') return 'vertical'
+  if (value === 'separate' || value === 'horizontal-separate' || value === 'vertical-separate') return 'separate'
+  return 'horizontal'
+}
+
 export type QqBotType = 'official' | 'selfHosted'
 export type OfficialProxyMode = 'disabled' | 'proxy' | 'ssh'
 
@@ -158,6 +168,12 @@ export const Config: Schema<Config> = Schema.intersect([
     showMetadataLitematicVersion: Schema.boolean().default(true).description('投影信息：显示 Litematic 版本。'),
     showMetadataGameVersion: Schema.boolean().default(true).description('投影信息：显示游戏版本和数据版本。'),
     replyAndMention: Schema.boolean().default(false).description('自建 QQ 会引用并 @ 发送者；官方 QQ 仅引用，避免显示 OpenID。'),
+    imageSendLayout: Schema.union([
+      Schema.const('horizontal').description('横向拼接'),
+      Schema.const('vertical').description('竖向拼接'),
+      Schema.const('separate').description('不拼接发送'),
+    ]).role('select').default('horizontal').description('多张渲染图的发送方式；不拼接时按原始视角分别发送。拼接图超过 10MB 时自动逐张发送。'),
+    projectionSearchResultLimit: Schema.natural().min(1).max(100).default(15).description('搜索投影默认显示数量；按缓存调用次数降序、投影名称升序排列。'),
     sixFaceOverview: Schema.boolean().default(true).description('合并转发时生成并附加上、下、东、南、西、北六面正交合成图。'),
     sixFaceLayout: Schema.union([
       Schema.const('horizontal').description('横向 3×2'),
@@ -166,7 +182,7 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('发送设置'),
   Schema.object({
     javaPath: Schema.path({ filters: ['file'] }).default('').description('Java 路径：独立渲染器使用的 Java 可执行文件；推荐 Java 21+，留空自动查找。'),
-    minecraftJarPath: Schema.string().default('').description('可选的 Minecraft 客户端 JAR 或基础资源包；留空使用内置 26.2 原版资源。'),
+    minecraftJarPath: Schema.string().default('').description('可选的 Minecraft 客户端 JAR 或基础资源包；留空使用内置 26.2 原版资源（独立 Java 回退渲染器）。'),
     resourcePackPaths: Schema.array(Schema.string()).role('table').default([]).description('自定义资源包：点击上传材质包添加 ZIP；越靠后优先级越高，可选中后上移或下移。'),
     standaloneRenderTimeout: Schema.natural().min(10000).default(180000).description('独立 Java 渲染超时（毫秒）。'),
     standaloneJavaMaxHeapMb: Schema.natural().min(128).max(32768).step(8).default(200).description('首次独立渲染的最大堆内存（MiB）。'),
@@ -212,7 +228,7 @@ interface Block { x: number, y: number, z: number, name: string }
 interface Bounds { minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number }
 interface ImageResult { title: string, path: string }
 interface RenderedImage { title: string, png: Buffer }
-interface RenderResult { images: ImageResult[], metadata: string, projectionName: string }
+interface RenderResult { images: ImageResult[], metadata: string, projectionName: string, forceSeparateImages?: boolean }
 
 const activeStandaloneJavaProcesses = new Set<ChildProcess>()
 let standaloneRenderQueue = Promise.resolve()
@@ -576,6 +592,7 @@ export function apply(ctx: Context, config: Config) {
 
   const render = async (url: string, filename = 'schematic.litematic', preparedBytes?: Buffer, includeSixFace = false,
                         source?: { group?: string, user?: string }, limitBytes?: number): Promise<RenderResult> => {
+    let forceSeparateImages = false
     const renderSource = source
     const bytes = preparedBytes ?? await download(ctx, url, limitBytes ?? maxFileSizeBytes, config.renderTimeout)
     const parsedMetadata = parseLitematicMetadata(bytes)
@@ -639,6 +656,7 @@ export function apply(ctx: Context, config: Config) {
               if (!gpuAgentHub) throw new Error('GPU Agent v2 服务未启用')
                const result = await enqueueGpuAgentRender(() => gpuAgentHub.render(createGpuRenderRequest(filename, config, renderSource, renderHash), bytes, config.gpuAgentTimeout))
                effectiveToolVersion = result.rendererVersion ?? effectiveToolVersion
+               forceSeparateImages = result.forceSeparateImages === true
               for (const image of result.images) {
                 if (image.id === 'merged' || image.name === 'merged.png') {
                   // Agent 已把正反两图拼为一张：直接作为唯一结果
@@ -733,8 +751,77 @@ export function apply(ctx: Context, config: Config) {
       images,
       metadata,
       projectionName,
+      forceSeparateImages,
     }
   }
+
+  const projectionSearchSessions = new Map<string, { page: ProjectionSearchPage, expiresAt: number }>()
+  const projectionSearchKey = (session: Session) => `${session.platform}|${session.guildId ?? ''}|${session.userId ?? ''}|${session.isDirect ? 'direct' : 'group'}`
+  const projectionSearchAllowed = (session: Session) => canRenderInSession(session, config.allowPrivateRender)
+    && isGroupAllowed(config, session.guildId)
+  const sendProjectionSearchPage = async (session: Session, page: ProjectionSearchPage) => {
+    if (!page.entries.length) {
+      await session.send('没有找到符合关键词的已缓存投影。')
+      return
+    }
+    const sheet = await createProjectionSearchSheet(page, cacheDirectory)
+    projectionSearchSessions.set(projectionSearchKey(session), { page, expiresAt: Date.now() + 10 * 60 * 1000 })
+    try {
+      await session.send(config.qqBotType === 'official' ? h.image(pathToFileURL(sheet).href) : h.image(sheet))
+    } finally {
+      await fs.rm(sheet, { force: true })
+    }
+  }
+
+  ctx.middleware(async (session, next) => {
+    const content = (session.content ?? '').trim()
+    const searchMatch = /^[/！!]?搜索投影\s+(.+?)\s*$/.exec(content)
+    const sendMatch = /^[/！!]?发送投影\s*(\d+)(?:\s+(.+?))?\s*$/.exec(content)
+    if (searchMatch || sendMatch) {
+      if (!projectionSearchAllowed(session)) return next()
+      try {
+        if (searchMatch) {
+          await sendProjectionSearchPage(session, await searchCachedProjections(cacheDirectory, searchMatch[1], config.projectionSearchResultLimit))
+          return
+        }
+        const index = Number(sendMatch![1])
+        const keyword = sendMatch![2]?.trim() ?? ''
+        const key = projectionSearchKey(session)
+        const saved = projectionSearchSessions.get(key)
+        if (saved && saved.expiresAt < Date.now()) projectionSearchSessions.delete(key)
+        const page = keyword
+          ? await searchCachedProjections(cacheDirectory, keyword, config.projectionSearchResultLimit)
+          : projectionSearchSessions.get(key)?.page
+        if (!page) {
+          await session.send('请先发送“搜索投影 关键词”，或使用“发送投影1 关键词”。')
+          return
+        }
+        if (!Number.isInteger(index) || index < 1 || index > page.entries.length) {
+          await session.send(`投影序号无效，可选范围为 1-${page.entries.length}。`)
+          return
+        }
+        const entry = page.entries[index - 1]
+        const schematic = await fs.readFile(entry.projectionPath)
+        const metadata = formatLitematicMetadata(parseLitematicMetadata(schematic), basename(entry.projectionPath), {
+          showProjectionName: config.showMetadataProjectionName,
+          showAuthor: config.showMetadataAuthor,
+          showCreatedAt: config.showMetadataCreatedAt,
+          showBlockStats: config.showMetadataBlockStats,
+          showSize: config.showMetadataSize,
+          showLitematicVersion: config.showMetadataLitematicVersion,
+          showGameVersion: config.showMetadataGameVersion,
+        })
+        const options = resolveSendOptions(config, session.guildId)
+        await sendImages(session, entry.images, metadata, options, entry.projectionName, message => logger.warn(message))
+        await session.send(h('file', { src: pathToFileURL(entry.projectionPath).href, name: basename(entry.projectionPath) }))
+        await recordProjectionSearchUse(entry.directory)
+      } catch (error) {
+        await session.send(`投影搜索失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+      return
+    }
+    return next()
+  })
 
   ctx.middleware(async (session, next) => {
     if (!canRenderInSession(session, config.allowPrivateRender)) return next()
@@ -770,7 +857,9 @@ export function apply(ctx: Context, config: Config) {
       const sendOptions = resolveSendOptions(config, session.guildId)
       const result = await render(url, fileName(file) ?? 'schematic.litematic', undefined, sendOptions.sixFaceOverview,
         { group: session.guildId ?? undefined, user: session.userId ?? undefined }, limitBytes)
-      await sendImages(session, result.images, result.metadata, sendOptions, result.projectionName)
+      await sendImages(session, result.images, result.metadata,
+        result.forceSeparateImages ? { ...sendOptions, imageSendLayout: 'separate' } : sendOptions,
+        result.projectionName, message => logger.warn(message))
     } catch (error) {
       logger.warn(error)
       await session.send([...replyElements(session, config.qqBotType), h('text', { content: formatRenderError(error, config) })])
@@ -791,7 +880,9 @@ export function apply(ctx: Context, config: Config) {
       try {
         const sendOptions = resolveSendOptions(config, session.guildId)
         const result = await render(url, 'schematic.litematic', undefined, sendOptions.sixFaceOverview, undefined, limitBytes)
-        await sendImages(session, result.images, result.metadata, sendOptions, result.projectionName)
+        await sendImages(session, result.images, result.metadata,
+          result.forceSeparateImages ? { ...sendOptions, imageSendLayout: 'separate' } : sendOptions,
+          result.projectionName, message => logger.warn(message))
       } catch (error) {
         return formatRenderError(error, config)
         // @ts-expect-error unreachable legacy error text is retained for compatibility
@@ -859,6 +950,151 @@ export async function saveUploadedResourcePack(filename: unknown, base64: unknow
 
 interface CacheMetadata {
   [key: string]: unknown
+}
+
+interface ProjectionSearchEntry {
+  fileHash: string
+  projectionName: string
+  cacheCalls: number
+  directory: string
+  projectionPath: string
+  images: ImageResult[]
+}
+
+interface ProjectionSearchPage {
+  keyword: string
+  entries: ProjectionSearchEntry[]
+}
+
+async function searchCachedProjections(cacheDirectory: string, keyword: string, limit: number): Promise<ProjectionSearchPage> {
+  const query = keyword.trim().toLocaleLowerCase()
+  if (!query) throw new Error('搜索关键词不能为空。')
+  const resultLimit = Math.max(1, Math.min(100, Math.floor(limit || 15)))
+  const index = await readJson<any>(join(cacheDirectory, 'index.json5'))
+  const hashes = new Set<string>()
+  const orderedHashes: string[] = []
+  if (Array.isArray(index)) for (const item of index) {
+    const hash = typeof item?.哈希值 === 'string' ? item.哈希值.toLowerCase() : ''
+    if (/^[0-9a-f]{64}$/.test(hash) && !hashes.has(hash)) { hashes.add(hash); orderedHashes.push(hash) }
+  }
+  if (!orderedHashes.length) {
+    const entries = await fs.readdir(cacheDirectory, { withFileTypes: true }).catch(() => [])
+    for (const item of entries) if (item.isDirectory() && /^[0-9a-f]{64}$/i.test(item.name)) orderedHashes.push(item.name.toLowerCase())
+  }
+  const results: ProjectionSearchEntry[] = []
+  for (const hash of orderedHashes) {
+    const directory = join(cacheDirectory, hash)
+    const about = await readJson<any>(join(directory, 'about.json5'))
+    if (!about || typeof about !== 'object') continue
+    const storedName = typeof about.存储投影文件名 === 'string' ? about.存储投影文件名 : ''
+    const requestedName = typeof about.投影文件名 === 'string' ? about.投影文件名 : storedName
+    const projectionName = projectionNameFromFilename(requestedName || storedName || 'schematic.litematic')
+    if (!projectionName.toLocaleLowerCase().includes(query)) continue
+    const resolvedDirectory = resolve(directory)
+    const candidatePath = resolve(resolvedDirectory, storedName || `${projectionName}.litematic`)
+    const projectionPath = dirname(candidatePath).toLocaleLowerCase() === resolvedDirectory.toLocaleLowerCase()
+      ? candidatePath
+      : join(resolvedDirectory, `${projectionName}.litematic`)
+    if (!(await exists(projectionPath))) continue
+    const images: ImageResult[] = []
+    for (const name of ['isometric.png', 'isometric-reverse.png', 'six-faces.png']) {
+      const path = join(directory, name)
+      if (await exists(path)) images.push({ title: name.replace(/\.png$/i, ''), path })
+    }
+    if (!images.length) continue
+    results.push({ fileHash: hash, projectionName, cacheCalls: Math.max(0, Number(about.缓存调用次数) || 0), directory, projectionPath, images })
+  }
+  results.sort((left, right) => right.cacheCalls - left.cacheCalls
+    || left.projectionName.localeCompare(right.projectionName, 'zh-Hans-CN')
+    || left.fileHash.localeCompare(right.fileHash))
+  return { keyword: keyword.trim(), entries: results.slice(0, resultLimit) }
+}
+
+async function createProjectionSearchSheet(page: ProjectionSearchPage, cacheDirectory: string) {
+  if (!page.entries.length) throw new Error('没有可显示的投影搜索结果。')
+  const columns = Math.min(3, page.entries.length)
+  const rows = Math.ceil(page.entries.length / columns)
+  const cellWidth = 360
+  const thumbnailWidth = 332
+  const thumbnailHeight = 224
+  const labelHeight = 42
+  const gap = 12
+  const margin = 16
+  const titleHeight = 30
+  const output = new PNG({
+    width: margin * 2 + columns * cellWidth + (columns - 1) * gap,
+    height: titleHeight + margin + rows * (thumbnailHeight + labelHeight) + (rows - 1) * gap + margin,
+  })
+  fillPng(output, 255, 255, 255, 255)
+  for (let index = 0; index < page.entries.length; index++) {
+    const entry = page.entries[index]
+    const source = PNG.sync.read(await fs.readFile(entry.images[0].path))
+    const column = index % columns
+    const row = Math.floor(index / columns)
+    const x = margin + column * (cellWidth + gap)
+    const y = titleHeight + margin + row * (thumbnailHeight + labelHeight + gap)
+    fillRect(output, x, y, cellWidth, thumbnailHeight + labelHeight, 245, 247, 250, 255)
+    fillRect(output, x + 14, y + 10, cellWidth - 28, thumbnailHeight - 20, 0, 0, 0, 255)
+    const scale = Math.min(thumbnailWidth / source.width, thumbnailHeight / source.height)
+    const width = Math.max(1, Math.round(source.width * scale))
+    const height = Math.max(1, Math.round(source.height * scale))
+    drawScaledPng(output, { image: source, x: x + Math.floor((cellWidth - width) / 2), y: y + Math.floor((thumbnailHeight - height) / 2), width, height })
+    drawSearchBadge(output, x + 20, y + 18, index + 1)
+  }
+  const path = join(cacheDirectory, `.projection-search-${randomUUID()}.png`)
+  await fs.writeFile(path, PNG.sync.write(output))
+  return path
+}
+
+function fillPng(image: PNG, red: number, green: number, blue: number, alpha: number) {
+  for (let offset = 0; offset < image.data.length; offset += 4) {
+    image.data[offset] = red; image.data[offset + 1] = green; image.data[offset + 2] = blue; image.data[offset + 3] = alpha
+  }
+}
+
+function fillRect(image: PNG, x: number, y: number, width: number, height: number, red: number, green: number, blue: number, alpha: number) {
+  for (let row = Math.max(0, y); row < Math.min(image.height, y + height); row++) for (let column = Math.max(0, x); column < Math.min(image.width, x + width); column++) {
+    const offset = (row * image.width + column) * 4
+    image.data[offset] = red; image.data[offset + 1] = green; image.data[offset + 2] = blue; image.data[offset + 3] = alpha
+  }
+}
+
+const SEARCH_DIGITS = [
+  ['11110', '10001', '10011', '10101', '11001', '10001', '11110'],
+  ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
+  ['11110', '00001', '00001', '01110', '10000', '10000', '11111'],
+  ['11110', '00001', '00001', '01110', '00001', '00001', '11110'],
+  ['10010', '10010', '10010', '11111', '00010', '00010', '00010'],
+  ['11111', '10000', '10000', '11110', '00001', '00001', '11110'],
+  ['01110', '10000', '10000', '11110', '10001', '10001', '01110'],
+  ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
+  ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
+  ['01110', '10001', '10001', '01111', '00001', '00001', '01110'],
+]
+
+function drawSearchBadge(image: PNG, x: number, y: number, value: number) {
+  fillRect(image, x, y, 44, 34, 27, 111, 208, 255)
+  const text = String(value)
+  const scale = 3
+  const width = text.length * 5 * scale + (text.length - 1) * scale
+  let cursor = x + Math.floor((44 - width) / 2)
+  for (const character of text) {
+    const glyph = SEARCH_DIGITS[Number(character)]
+    for (let row = 0; row < glyph.length; row++) for (let column = 0; column < glyph[row].length; column++) if (glyph[row][column] === '1') {
+      fillRect(image, cursor + column * scale, y + 4 + row * scale, scale, scale, 255, 255, 255, 255)
+    }
+    cursor += 6 * scale
+  }
+}
+
+async function recordProjectionSearchUse(directory: string) {
+  const path = join(directory, 'about.json5')
+  const about = await readJson<any>(path)
+  if (!about) return
+  about.缓存调用次数 = Math.max(0, Number(about.缓存调用次数) || 0) + 1
+  about.最近缓存调用时间 = new Date().toISOString()
+  await writeJsonAtomic(path, about)
+  await touchCacheEntry(directory)
 }
 
 export function hashRenderConfiguration(configuration: unknown) {
@@ -965,6 +1201,13 @@ async function cachedProjectionFilename(directory: string, requested: string) {
 
 async function writeUnifiedCacheMetadata(directory: string, metadata: CacheMetadata) {
   const aboutPath = join(directory, 'about.json5')
+  const aboutExisting = await readJson<any>(aboutPath)
+  const previousCalls = Number.isFinite(Number(aboutExisting?.缓存调用次数)) ? Math.max(0, Number(aboutExisting.缓存调用次数)) : 0
+  metadata = {
+    ...metadata,
+    缓存调用次数: previousCalls + 1,
+    最近缓存调用时间: new Date().toISOString(),
+  }
   await writeJsonAtomic(aboutPath, metadata)
   const hash = typeof metadata.文件哈希 === 'string' ? metadata.文件哈希 : basename(directory)
   const indexPath = join(dirname(directory), 'index.json5')
@@ -1022,7 +1265,7 @@ async function directorySize(directory: string): Promise<number> {
 }
 
 export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number, protectedDirectory?: string) {
-  const entries: Array<{ path: string, size: number, lastUsed: number }> = []
+  const entries: Array<{ path: string, size: number, lastUsed: number, cacheCalls: number, images: Array<{ path: string, size: number }> }> = []
   const cachedEntries = await fs.readdir(cacheDirectory, { withFileTypes: true }).catch((error: any) => {
     if (error?.code === 'ENOENT') return []
     throw error
@@ -1031,8 +1274,14 @@ export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number
     if (!item.isDirectory()) continue
     const directPath = join(cacheDirectory, item.name)
     if (/^[0-9a-f]{64}$/i.test(item.name)) {
-      const [size, stat] = await Promise.all([directorySize(directPath), fs.stat(directPath)])
-      entries.push({ path: directPath, size, lastUsed: stat.mtimeMs })
+      const [size, stat, about, images] = await Promise.all([
+        directorySize(directPath),
+        fs.stat(directPath),
+        readJson<any>(join(directPath, 'about.json5')),
+        cacheImageFiles(directPath),
+      ])
+      entries.push({ path: directPath, size, lastUsed: stat.mtimeMs,
+        cacheCalls: cacheCallCount(about), images })
       continue
     }
     // 旧版 v<plugin> / <agent-version> 缓存不参与查询，但仍纳入容量清理。
@@ -1040,8 +1289,14 @@ export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number
     for (const legacy of legacyEntries) {
       if (!legacy.isDirectory()) continue
       const path = join(directPath, legacy.name)
-      const [size, stat] = await Promise.all([directorySize(path), fs.stat(path)])
-      entries.push({ path, size, lastUsed: stat.mtimeMs })
+      const [size, stat, about, images] = await Promise.all([
+        directorySize(path),
+        fs.stat(path),
+        readJson<any>(join(path, 'about.json5')),
+        cacheImageFiles(path),
+      ])
+      entries.push({ path, size, lastUsed: stat.mtimeMs,
+        cacheCalls: cacheCallCount(about), images })
     }
   }
 
@@ -1049,16 +1304,57 @@ export async function enforceCacheLimit(cacheDirectory: string, maxBytes: number
   let removedBytes = 0
   let removedEntries = 0
   const protectedPath = protectedDirectory && resolve(protectedDirectory)
-  entries.sort((left, right) => left.lastUsed - right.lastUsed)
+  entries.sort((left, right) => left.cacheCalls - right.cacheCalls || left.lastUsed - right.lastUsed)
+  const changed = new Set<string>()
   for (const entry of entries) {
     if (totalBytes <= maxBytes) break
     if (protectedPath && resolve(entry.path) === protectedPath) continue
-    await fs.rm(entry.path, { recursive: true, force: true })
-    totalBytes -= entry.size
-    removedBytes += entry.size
+    entry.images.sort((left, right) => right.size - left.size)
+    for (const image of entry.images) {
+      if (totalBytes <= maxBytes) break
+      await fs.rm(image.path, { force: true })
+      totalBytes -= image.size
+      removedBytes += image.size
+      changed.add(entry.path)
+    }
+  }
+  for (const path of changed) {
+    await refreshCacheImageMetadata(path)
     removedEntries++
   }
+  if (totalBytes > maxBytes && entries.some(entry => entry.images.length > 0)) {
+    // 投影源和 about/index 是持久资料，即使图片已经全部清理，也不能删除它们。
+    // 调用方仍可根据返回值显示“源文件占用剩余容量”的提示。
+  }
   return { totalBytes, removedBytes, removedEntries }
+}
+
+async function cacheImageFiles(directory: string): Promise<Array<{ path: string, size: number }>> {
+  const entries = await fs.readdir(directory, { withFileTypes: true }).catch((error: any) => {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  })
+  const images: Array<{ path: string, size: number }> = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.png')) continue
+    const path = join(directory, entry.name)
+    images.push({ path, size: (await fs.stat(path)).size })
+  }
+  return images
+}
+
+function cacheCallCount(about: any): number {
+  const value = Number(about?.缓存调用次数)
+  return Number.isFinite(value) && value >= 0 ? value : 0
+}
+
+async function refreshCacheImageMetadata(directory: string) {
+  const aboutPath = join(directory, 'about.json5')
+  const about = await readJson<any>(aboutPath)
+  if (!about || typeof about !== 'object') return
+  about.图片 = await cacheImageMetadata(directory)
+  about.最近缓存清理时间 = new Date().toISOString()
+  await writeJsonAtomic(aboutPath, about)
 }
 
 function fileElements(session: Pick<Session, 'elements' | 'content'>) {
@@ -1418,7 +1714,7 @@ async function fileSha256(path: string) {
 
 export function createGpuRenderRequest(filename: string, config: Pick<Config,
   'outputSize' | 'background' | 'transparentBackground'
-  | 'isometricRotation' | 'isometricSlant' | 'isometricFill'>,
+  | 'isometricRotation' | 'isometricSlant' | 'isometricFill' | 'imageSendLayout'>,
   source?: { group?: string, user?: string }, renderConfigSha256?: string): GpuRenderRequest {
   const size = effectiveRenderResolution(config)
   const view = (id: string, name: string, yaw: number): RenderView => ({
@@ -1446,6 +1742,7 @@ export function createGpuRenderRequest(filename: string, config: Pick<Config,
     sourceUser: source?.user,
     pluginVersion: PLUGIN_VERSION,
     renderConfigSha256,
+    imageSendLayout: normalizeImageSendLayout(config.imageSendLayout),
   }
 }
 
@@ -1558,8 +1855,8 @@ export function formatRenderError(error: unknown, config: Pick<Config, 'maxFileS
   if (/minecraft.*resource|resource pack|原版资源|材质包.*不存在/i.test(message)) {
     return 'Minecraft 原版资源包不可用，请检查资源包配置。'
   }
-  if (/Minecraft 26\.2 GPU 渲染端未运行/i.test(message)) {
-    return '请启动 Minecraft 26.2-Fabricjqr GPU 渲染客户端，停在主菜单即可，无需手动进入存档。'
+  if (/Minecraft (?:26\.2|26\.3) GPU 渲染端未运行/i.test(message)) {
+    return '请启动 Minecraft 26.3-Fabric GPU 渲染客户端，停在主菜单即可，无需手动进入存档。'
   }
   return '投影渲染失败，请检查渲染器配置或导出诊断文件。'
 }
@@ -1575,12 +1872,13 @@ export interface ResolvedSendOptions {
   qqBotType: QqBotType
   sendMode: SendMode
   replyAndMention: boolean
+  imageSendLayout: ImageSendLayout
   showViewTitles: boolean
   sixFaceOverview: boolean
 }
 
 type SendConfig = Pick<Config, 'sendAsForward' | 'replyAndMention' | 'groupSendOptions'>
-  & Partial<Pick<Config, 'qqBotType' | 'showViewTitles' | 'sixFaceOverview'>>
+  & Partial<Pick<Config, 'qqBotType' | 'showViewTitles' | 'imageSendLayout' | 'sixFaceOverview'>>
 
 export function resolveSendOptions(config: SendConfig, groupId?: string): ResolvedSendOptions {
   const override = groupId
@@ -1597,12 +1895,15 @@ export function resolveSendOptions(config: SendConfig, groupId?: string): Resolv
     qqBotType,
     sendMode,
     replyAndMention,
+    imageSendLayout: normalizeImageSendLayout(config.imageSendLayout),
     showViewTitles: config.showViewTitles ?? false,
     sixFaceOverview: (qqBotType === 'official' || sendMode === 'forward') && (config.sixFaceOverview ?? true),
   }
 }
 
-export async function sendImages(session: Session, images: ImageResult[], metadata: string, options: ResolvedSendOptions, projectionName = 'schematic') {
+export async function sendImages(session: Session, images: ImageResult[], metadata: string, options: ResolvedSendOptions,
+  projectionName = 'schematic', warn?: (message: string) => void) {
+  const imageSendLayout = normalizeImageSendLayout(options.imageSendLayout)
   const messages = images.map(({ title, path }) => h('message', { userId: session.selfId, nickname: '投影渲染' }, [
     ...(options.showViewTitles ? [h('text', { content: title })] : []), h.image(path),
   ]))
@@ -1615,13 +1916,27 @@ export async function sendImages(session: Session, images: ImageResult[], metada
     ? `${projectionName} 已渲染成功，结果如上`
     : `${projectionName} 已渲染成功`
   if (options.qqBotType === 'official') {
-    const overviewPath = await composeQqOverview(images)
-    const message = [
-      ...(options.replyAndMention && session.messageId ? [h('quote', { id: session.messageId })] : []),
-      h.image(pathToFileURL(overviewPath).href),
-      ...(metadata ? [h('text', { content: `\n${metadata}` })] : []),
-    ]
-    await session.send(message)
+    if (imageSendLayout === 'horizontal' || imageSendLayout === 'vertical') {
+      const overviewPath = await composeQqOverview(images, imageSendLayout)
+      const overviewSize = (await fs.stat(overviewPath)).size
+      if (overviewSize <= 10 * 1024 * 1024) {
+        const message = [
+          ...(options.replyAndMention && session.messageId ? [h('quote', { id: session.messageId })] : []),
+          h.image(pathToFileURL(overviewPath).href),
+          ...(metadata ? [h('text', { content: `\n${metadata}` })] : []),
+        ]
+        await session.send(message)
+        return
+      }
+      warn?.(`官方 QQ 合成图超过 10MB（${overviewSize} 字节），改为逐张发送。`)
+    }
+    for (const [index, image] of images.entries()) {
+      await session.send([
+        ...(index === 0 && options.replyAndMention && session.messageId ? [h('quote', { id: session.messageId })] : []),
+        h.image(pathToFileURL(resolve(image.path)).href),
+        ...(index === images.length - 1 && metadata ? [h('text', { content: `\n${metadata}` })] : []),
+      ])
+    }
     return
   }
   if (options.sendMode === 'forward') {
@@ -1639,34 +1954,34 @@ export async function sendImages(session: Session, images: ImageResult[], metada
   await session.send([...reply, ...combined, h('text', { content: footer })])
 }
 
-export async function composeQqOverview(images: ImageResult[]) {
+export async function composeQqOverview(images: ImageResult[], layout: 'horizontal' | 'vertical' = 'horizontal') {
   if (!images.length) throw new Error('没有可合并的渲染图片')
   const sources = await Promise.all(images.map(async image => PNG.sync.read(await fs.readFile(resolve(image.path)))))
-  const width = Math.max(...sources.map(image => image.width))
-  const gap = Math.max(4, Math.round(width * 0.01))
+  const gap = Math.max(4, Math.round(Math.max(...sources.map(image => Math.max(image.width, image.height))) * 0.01))
   const placements: Array<{ image: PNG, x: number, y: number, width: number, height: number }> = []
-  let y = 0
-  const top = sources.slice(0, Math.min(2, sources.length))
-  const topWidth = top.length === 1 ? width : Math.floor((width - gap) / 2)
-  const topHeights = top.map(image => Math.max(1, Math.round(image.height * topWidth / image.width)))
-  const topHeight = Math.max(...topHeights)
-  for (let index = 0; index < top.length; index++) {
-    placements.push({
-      image: top[index],
-      x: index * (topWidth + gap),
-      y: Math.floor((topHeight - topHeights[index]) / 2),
-      width: topWidth,
-      height: topHeights[index],
-    })
+  const vertical = layout === 'vertical'
+  const scale = vertical
+    ? Math.max(...sources.map(image => image.width))
+    : Math.max(...sources.map(image => image.height))
+  let canvasWidth = vertical ? scale : 0
+  let canvasHeight = vertical ? 0 : scale
+  for (const image of sources) {
+    const width = vertical ? scale : Math.max(1, Math.round(image.width * scale / image.height))
+    const height = vertical ? Math.max(1, Math.round(image.height * scale / image.width)) : scale
+    if (vertical) canvasHeight += height
+    else canvasWidth += width
   }
-  y += topHeight
-  for (const image of sources.slice(2)) {
-    y += gap
-    const height = Math.max(1, Math.round(image.height * width / image.width))
-    placements.push({ image, x: 0, y, width, height })
-    y += height
+  const spacing = gap * Math.max(0, sources.length - 1)
+  if (vertical) canvasHeight += spacing
+  else canvasWidth += spacing
+  let offset = 0
+  for (const image of sources) {
+    const width = vertical ? scale : Math.max(1, Math.round(image.width * scale / image.height))
+    const height = vertical ? Math.max(1, Math.round(image.height * scale / image.width)) : scale
+    placements.push({ image, x: vertical ? Math.floor((canvasWidth - width) / 2) : offset, y: vertical ? offset : Math.floor((canvasHeight - height) / 2), width, height })
+    offset += (vertical ? height : width) + gap
   }
-  const output = new PNG({ width, height: y })
+  const output = new PNG({ width: canvasWidth, height: canvasHeight })
   for (const placement of placements) drawScaledPng(output, placement)
   const outputPath = resolve(dirname(images[0].path), 'qq-overview.png')
   await fs.writeFile(outputPath, PNG.sync.write(output))
@@ -1733,6 +2048,7 @@ class NbtReader {
 }
 
 const MINECRAFT_DATA_VERSIONS = new Map<number, string>([
+  [5023, '26.3'],
   [4903, '26.2'],
   [4790, '26.1.2'],
   [4671, '1.21.11'],

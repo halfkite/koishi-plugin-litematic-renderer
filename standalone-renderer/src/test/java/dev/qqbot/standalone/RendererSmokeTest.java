@@ -110,8 +110,29 @@ public final class RendererSmokeTest {
                 Files.deleteIfExists(sixFaceOutput);
                 Files.deleteIfExists(verticalOutput);
             }
+
+            Litematic beaconSchematic = new Litematic(
+                List.of(new Litematic.Block(0, 0, 0, state("minecraft:beacon", Map.of()))),
+                List.of(), List.of(), new Litematic.Bounds(0, 0, 0, 0, 0, 0));
+            SoftwareRenderer beaconRenderer = new SoftwareRenderer(beaconSchematic, models, entityModels);
+            SoftwareRenderer.BakedMesh beaconMesh = beaconRenderer.bakeMesh();
+            float maximumBeamY = 0.0f;
+            for (int index = 1; index < beaconMesh.translucentPositions().length; index += 3) {
+                maximumBeamY = Math.max(maximumBeamY, beaconMesh.translucentPositions()[index]);
+            }
+            require(maximumBeamY >= 17.0f, "beacon beam geometry was not added above the beacon");
+            Path beaconOutput = Files.createTempFile("litematic-beacon-smoke-", ".png");
+            try {
+                beaconRenderer.render(new SoftwareRenderer.Settings(256, 1, 135, 36, 0.78, "#000000", true),
+                    135, beaconOutput);
+                BufferedImage beaconImage = javax.imageio.ImageIO.read(beaconOutput.toFile());
+                require(beaconImage != null && opaquePixels(beaconImage) > 100,
+                    "beacon render did not create visible pixels");
+            } finally {
+                Files.deleteIfExists(beaconOutput);
+            }
         }
-        System.out.println("Renderer smoke test passed: heads and banners");
+        System.out.println("Renderer smoke test passed: heads, banners, and beacon beam");
     }
 
     private static void requireWhitePixel(BufferedImage image, int x, int y, String label) {

@@ -27,6 +27,7 @@ final class SoftwareRenderer {
     private record Projected(double x, double y, double depth, double u, double v) {}
     private record Camera(double yaw, double pitch, double scale, double centerX, double centerY, int size) {}
     private record PendingQuad(Quad quad, double x, double y, double z, int tint, boolean fullBright, double depth) {}
+    private record BeamSegment(int x, int z, int minY, int maxY, int color) {}
     private record OrthographicView(String[] glyph, double yaw, double pitch) {}
 
     private static final List<OrthographicView> SIX_FACES = List.of(
@@ -73,7 +74,10 @@ final class SoftwareRenderer {
     private final EntityModelResolver entityModels;
     private final Map<Position, Litematic.BlockState> blocks = new HashMap<>();
     private final Map<Position, Litematic.BlockEntity> blockEntities = new HashMap<>();
-    private final Vec3 light = new Vec3(-0.35, 0.86, -0.38).normalized();
+    private final Map<Integer, BufferedImage> beamTextures = new HashMap<>();
+    private final Vec3 light = new Vec3(0.0, 1.0, 0.0);
+
+    private static final int MIN_BEACON_BEAM_HEIGHT = 16;
 
     SoftwareRenderer(Litematic schematic, ModelResolver models, EntityModelResolver entityModels) {
         this.schematic = schematic;
@@ -130,6 +134,8 @@ final class SoftwareRenderer {
                     quad, entity.x(), entity.y(), entity.z(), 0xffffff, 1.0f);
             }
         }
+        appendBeaconBeams(translucentPositions, translucentUvs, translucentTextures, translucentTints,
+            translucentShades);
         return new BakedMesh(
             opaquePositions.toArray(), opaqueUvs.toArray(), opaqueTextures.toArray(new BufferedImage[0]),
             opaqueTints.toArray(), opaqueShades.toArray(),
@@ -177,6 +183,12 @@ final class SoftwareRenderer {
             Projected[][] projected = new Projected[quads][];
             for (int quad = 0; quad < quads; quad++) {
                 projected[quad] = projectQuad(mesh.translucentPositions(), quad, camera);
+                for (int vertex = 0; vertex < 4; vertex++) {
+                    Projected point = projected[quad][vertex];
+                    int uv = quad * 8 + vertex * 2;
+                    projected[quad][vertex] = new Projected(point.x(), point.y(), point.depth(),
+                        mesh.translucentUvs()[uv], mesh.translucentUvs()[uv + 1]);
+                }
                 depths[quad] = (projected[quad][0].depth() + projected[quad][1].depth()
                     + projected[quad][2].depth() + projected[quad][3].depth()) / 4.0;
             }
@@ -331,6 +343,8 @@ final class SoftwareRenderer {
             }
         }
 
+        appendBeaconPendingQuads(translucent, camera);
+
         translucent.sort(Comparator.comparingDouble(PendingQuad::depth));
         for (PendingQuad pending : translucent) {
             drawQuad(pending.quad(), pending.x(), pending.y(), pending.z(), pending.tint(), pending.fullBright(),
@@ -415,6 +429,149 @@ final class SoftwareRenderer {
         // 命令行入口已在解析时把 fill 钳制到 [0.1, 0.98]；这里放宽以支持预览的连续缩放
         double scale = size * Math.max(0.05, Math.min(8.0, settings.fill())) / span;
         return new Camera(yaw, pitch, scale, (minX + maxX) / 2, (minY + maxY) / 2, size);
+    }
+
+    private double effectiveMaxY(Litematic.Bounds bounds) {
+        double maxY = bounds.maxY() + 1.0;
+        for (Litematic.Block block : schematic.blocks()) {
+            if (isBeacon(block.state())) {
+                maxY = Math.max(maxY, block.y() + 1.0 + MIN_BEACON_BEAM_HEIGHT);
+            }
+        }
+        return maxY;
+    }
+
+    /** Adds the same bounded beam geometry used by both the direct and baked software paths. */
+    private void appendBeaconBeams(FloatArray positions, FloatArray uvs, List<BufferedImage> textures,
+                                   IntArray tints, FloatArray shades) {
+        for (BeamSegment segment : beaconSegments()) {
+            BufferedImage texture = beamTextures.computeIfAbsent(segment.color(), this::createBeamTexture);
+            double x0 = segment.x() + 0.39;
+            double x1 = segment.x() + 0.61;
+            double z0 = segment.z() + 0.39;
+            double z1 = segment.z() + 0.61;
+            double y0 = segment.minY();
+            double y1 = segment.maxY();
+            appendQuad(positions, uvs, textures, tints, shades,
+                beamQuad(new Vec3(x0, y0, z0), new Vec3(x1, y1, z0), texture), 0, 0, 0, 0xffffff, 1.0f);
+            appendQuad(positions, uvs, textures, tints, shades,
+                beamQuad(new Vec3(x1, y0, z0), new Vec3(x1, y1, z1), texture), 0, 0, 0, 0xffffff, 1.0f);
+            appendQuad(positions, uvs, textures, tints, shades,
+                beamQuad(new Vec3(x1, y0, z1), new Vec3(x0, y1, z1), texture), 0, 0, 0, 0xffffff, 1.0f);
+            appendQuad(positions, uvs, textures, tints, shades,
+                beamQuad(new Vec3(x0, y0, z1), new Vec3(x0, y1, z0), texture), 0, 0, 0, 0xffffff, 1.0f);
+        }
+    }
+
+    private void appendBeaconPendingQuads(List<PendingQuad> pending, Camera camera) {
+        for (BeamSegment segment : beaconSegments()) {
+            BufferedImage texture = beamTextures.computeIfAbsent(segment.color(), this::createBeamTexture);
+            double x0 = segment.x() + 0.39;
+            double x1 = segment.x() + 0.61;
+            double z0 = segment.z() + 0.39;
+            double z1 = segment.z() + 0.61;
+            Quad[] quads = {
+                beamQuad(new Vec3(x0, segment.minY(), z0), new Vec3(x1, segment.maxY(), z0), texture),
+                beamQuad(new Vec3(x1, segment.minY(), z0), new Vec3(x1, segment.maxY(), z1), texture),
+                beamQuad(new Vec3(x1, segment.minY(), z1), new Vec3(x0, segment.maxY(), z1), texture),
+                beamQuad(new Vec3(x0, segment.minY(), z1), new Vec3(x0, segment.maxY(), z0), texture)
+            };
+            for (Quad quad : quads) {
+                pending.add(new PendingQuad(quad, 0, 0, 0, 0xffffff, true,
+                    quadDepth(quad, 0, 0, 0, camera)));
+            }
+        }
+    }
+
+    private Quad beamQuad(Vec3 bottom, Vec3 top, BufferedImage texture) {
+        return new Quad(new Vertex[]{
+            new Vertex(bottom, 0, 16),
+            new Vertex(new Vec3(top.x(), bottom.y(), top.z()), 16, 16),
+            new Vertex(top, 16, 0),
+            new Vertex(new Vec3(bottom.x(), top.y(), bottom.z()), 0, 0)
+        }, texture, null, -1, false);
+    }
+
+    private BufferedImage createBeamTexture(int color) {
+        BufferedImage texture = new BufferedImage(32, 32, BufferedImage.TYPE_INT_ARGB);
+        int rgb = color & 0xffffff;
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) {
+            double edge = Math.sin(Math.PI * (x + 0.5) / 32.0);
+            int alpha = (int) Math.round(75 * edge * edge);
+            texture.setRGB(x, y, alpha << 24 | rgb);
+        }
+        return texture;
+    }
+
+    private List<BeamSegment> beaconSegments() {
+        List<BeamSegment> result = new ArrayList<>();
+        int upperBound = (int) Math.ceil(effectiveMaxY(schematic.bounds()));
+        for (Litematic.Block beacon : schematic.blocks()) {
+            if (!isBeacon(beacon.state())) continue;
+            int start = beacon.y() + 1;
+            int end = Math.max(upperBound, start + MIN_BEACON_BEAM_HEIGHT);
+            int segmentStart = start;
+            int currentColor = 0xffffff;
+            for (int y = start; y < end; y++) {
+                Litematic.BlockState state = blocks.get(new Position(beacon.x(), y, beacon.z()));
+                if (state == null || isBeamPassThrough(state)) continue;
+                int glassColor = beamGlassColor(state);
+                if (glassColor >= 0) {
+                    if (glassColor != currentColor && y > segmentStart) {
+                        result.add(new BeamSegment(beacon.x(), beacon.z(), segmentStart, y, currentColor));
+                        segmentStart = y;
+                    }
+                    currentColor = glassColor;
+                    continue;
+                }
+                end = y;
+                break;
+            }
+            if (end > segmentStart) result.add(new BeamSegment(beacon.x(), beacon.z(), segmentStart, end, currentColor));
+        }
+        return result;
+    }
+
+    private static boolean isBeacon(Litematic.BlockState state) {
+        return "beacon".equals(blockPath(state));
+    }
+
+    private static boolean isBeamPassThrough(Litematic.BlockState state) {
+        String path = blockPath(state);
+        return path.equals("air") || path.equals("cave_air") || path.equals("void_air")
+            || path.equals("glass") || path.equals("glass_pane")
+            || path.equals("water") || path.equals("bubble_column");
+    }
+
+    private static int beamGlassColor(Litematic.BlockState state) {
+        String path = blockPath(state);
+        if (!path.endsWith("_stained_glass") && !path.endsWith("_stained_glass_pane")) return -1;
+        String name = path.replace("_stained_glass_pane", "").replace("_stained_glass", "");
+        return switch (name) {
+            case "white" -> 0xf9fffe;
+            case "orange" -> 0xf9801d;
+            case "magenta" -> 0xc74ebd;
+            case "light_blue" -> 0x3ab3da;
+            case "yellow" -> 0xfed83d;
+            case "lime" -> 0x80c71f;
+            case "pink" -> 0xf38baa;
+            case "gray" -> 0x474f52;
+            case "light_gray" -> 0x9d9d97;
+            case "cyan" -> 0x169c9c;
+            case "purple" -> 0x8932b8;
+            case "blue" -> 0x3c44aa;
+            case "brown" -> 0x835432;
+            case "green" -> 0x5e7c16;
+            case "red" -> 0xb02e26;
+            case "black" -> 0x1d1d21;
+            default -> -1;
+        };
+    }
+
+    private static String blockPath(Litematic.BlockState state) {
+        String name = state.name();
+        int separator = name.indexOf(':');
+        return separator < 0 ? name : name.substring(separator + 1);
     }
 
     private static Projected project(Vec3 point, double u, double v, Camera camera) {

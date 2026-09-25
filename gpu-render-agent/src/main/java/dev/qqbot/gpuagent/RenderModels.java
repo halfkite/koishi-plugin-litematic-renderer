@@ -30,12 +30,15 @@ final class RenderModels {
     }
 
     record Request(int version, String id, String filename, List<View> views, String resourcePackProfile,
-                   String pluginVersion, String renderConfigSha256) {
+                   String pluginVersion, String renderConfigSha256, String imageSendLayout) {
         Request(int version, String id, String filename, List<View> views, String resourcePackProfile) {
-            this(version, id, filename, views, resourcePackProfile, "0", null);
+            this(version, id, filename, views, resourcePackProfile, "0", null, null);
         }
         Request(int version, String id, String filename, List<View> views, String resourcePackProfile, String pluginVersion) {
-            this(version, id, filename, views, resourcePackProfile, pluginVersion, null);
+            this(version, id, filename, views, resourcePackProfile, pluginVersion, null, null);
+        }
+        Request(int version, String id, String filename, List<View> views, String resourcePackProfile, String pluginVersion, String renderConfigSha256) {
+            this(version, id, filename, views, resourcePackProfile, pluginVersion, renderConfigSha256, null);
         }
     }
 

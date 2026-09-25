@@ -1,6 +1,6 @@
 package com.yiyihehe.quickcraft.mixin;
 
-import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import com.yiyihehe.quickcraft.render.QuickCraftPreviewRenderPipeline;
 import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
@@ -14,7 +14,7 @@ public abstract class RenderTypePreviewMixin {
             method = "prepare",
             at = @At(
                     value = "FIELD",
-                    target = "Lnet/minecraft/client/renderer/rendertype/RenderSetup;pipeline:Lcom/mojang/blaze3d/pipeline/RenderPipeline;"
+                    target = "Lnet/minecraft/client/renderer/rendertype/RenderSetup;pipeline:Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;"
             )
     )
     private RenderPipeline quickcraft$usePreviewPipeline(RenderSetup setup) {

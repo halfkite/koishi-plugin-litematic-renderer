@@ -2,10 +2,13 @@ package dev.qqbot.gpuagent;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -24,7 +27,7 @@ final class LitematicMetadata {
 
     private LitematicMetadata() {}
 
-    record Values(String author, String createdAt, Long totalBlocks, Long totalVolume,
+    record Values(String author, String createdAt, Long createdAtMillis, Long totalBlocks, Long totalVolume,
                   int[] size, Long litematicVersion, Long minecraftDataVersion,
                   String minecraftVersion) {}
 
@@ -34,7 +37,7 @@ final class LitematicMetadata {
             values = parse(data);
         } catch (Exception error) {
             // 元数据只用于消息展示，损坏或非标准元数据不能阻断已经成功的渲染。
-            values = new Values("未知", "未知", null, null, null, null, null, null);
+            values = new Values("未知", "未知", null, null, null, null, null, null, null);
         }
         String projectionName = projectionName(filename);
         if ("compact".equalsIgnoreCase(config.metadataFormat)) return formatCompact(projectionName, values, config);
@@ -42,7 +45,7 @@ final class LitematicMetadata {
         if (config.showMetadataProjectionName) lines.add("投影名称：" + projectionName);
         if (config.showMetadataAuthor) lines.add("保存者游戏 ID：" + values.author());
         if (config.showMetadataCreatedAt) lines.add("创建时间：" + values.createdAt());
-        if (config.showMetadataBlockStats) lines.add("方块数/体积：" + number(values.totalBlocks()) + "/" + number(values.totalVolume()));
+        if (config.showMetadataBlockStats) lines.add("方块数体积：" + number(values.totalBlocks()) + "/" + number(values.totalVolume()));
         if (config.showMetadataSize) lines.add("尺寸：" + size(values.size()));
         if (config.showMetadataLitematicVersion) lines.add("Litematic 版本：" + number(values.litematicVersion()));
         if (config.showMetadataGameVersion) {
@@ -93,6 +96,43 @@ final class LitematicMetadata {
         }
     }
 
+    static Values parse(Path path) throws IOException {
+        return parse(Files.readAllBytes(path));
+    }
+
+    static Long createdAtMillis(Long value) {
+        if (value == null || value <= 0) return null;
+        long milliseconds = value < 10_000_000_000L ? value * 1000L : value;
+        try { Instant.ofEpochMilli(milliseconds); return milliseconds; }
+        catch (RuntimeException ignored) { return null; }
+    }
+
+    static void validateNbtRoot(Path path) throws IOException {
+        try (InputStream input = new BufferedInputStream(Files.newInputStream(path))) {
+            validateNbtRoot(input);
+        }
+    }
+
+    static void validateNbtRoot(byte[] data) throws IOException {
+        if (data == null || data.length < 3) throw new IOException("投影文件不完整或已损坏：缺少 NBT 根标签");
+        validateNbtRoot(new ByteArrayInputStream(data));
+    }
+
+    private static void validateNbtRoot(InputStream input) throws IOException {
+        input.mark(2);
+        int first = input.read();
+        int second = input.read();
+        input.reset();
+        InputStream decoded = first == 0x1f && second == 0x8b ? new GZIPInputStream(input) : input;
+        try (DataInputStream nbt = new DataInputStream(decoded)) {
+            if (nbt.readUnsignedByte() != 10) throw new IOException("投影文件不是有效的 Litematic NBT：根标签不是 Compound");
+            int nameLength = nbt.readUnsignedShort();
+            if (nbt.readNBytes(nameLength).length != nameLength) {
+                throw new IOException("投影文件不完整或已损坏：NBT 根标签名称不完整");
+            }
+        }
+    }
+
     private static InputStream open(byte[] data) throws IOException {
         if (data.length >= 2 && (data[0] & 0xff) == 0x1f && (data[1] & 0xff) == 0x8b) {
             return new GZIPInputStream(new ByteArrayInputStream(data));
@@ -127,7 +167,7 @@ final class LitematicMetadata {
 
     private static Map<Long, String> minecraftDataVersions() {
         Map<Long, String> values = new HashMap<>();
-        values.put(4903L, "26.2"); values.put(4790L, "26.1.2"); values.put(4671L, "1.21.11");
+        values.put(5023L, "26.3"); values.put(4903L, "26.2"); values.put(4790L, "26.1.2"); values.put(4671L, "1.21.11");
         values.put(4557L, "1.21.10"); values.put(4555L, "1.21.9"); values.put(4440L, "1.21.8");
         values.put(4438L, "1.21.7"); values.put(4435L, "1.21.6"); values.put(4325L, "1.21.5");
         values.put(4189L, "1.21.4"); values.put(4082L, "1.21.3"); values.put(4080L, "1.21.2");
@@ -149,6 +189,7 @@ final class LitematicMetadata {
             readString();
             String author = "未知";
             String createdAt = "未知";
+            Long createdAtMillis = null;
             Long totalBlocks = null, totalVolume = null, litematicVersion = null, dataVersion = null;
             int[] size = null;
             Map<String, Long> enclosingSize = new HashMap<>();
@@ -161,7 +202,9 @@ final class LitematicMetadata {
                     case "Metadata" -> {
                         MetadataValues metadata = readMetadata(type);
                         if (metadata != null) {
-                            author = metadata.author(); createdAt = createdAt(metadata.createdAt());
+                            author = metadata.author();
+                            createdAtMillis = LitematicMetadata.createdAtMillis(metadata.createdAt());
+                            createdAt = createdAt(createdAtMillis);
                             totalBlocks = metadata.totalBlocks(); totalVolume = metadata.totalVolume();
                             enclosingSize = metadata.enclosingSize();
                         }
@@ -177,7 +220,7 @@ final class LitematicMetadata {
             } else if (!regionBounds.isEmpty()) {
                 size = boundsSize(regionBounds);
             }
-            return new Values(author, createdAt, totalBlocks, totalVolume, size, litematicVersion, dataVersion,
+            return new Values(author, createdAt, createdAtMillis, totalBlocks, totalVolume, size, litematicVersion, dataVersion,
                     dataVersion == null ? null : MINECRAFT_DATA_VERSIONS.get(dataVersion));
         }
 
