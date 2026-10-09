@@ -28,7 +28,11 @@ final class RenderService implements AutoCloseable {
     private final RuntimeManager runtime;
     private final AgentConfig config;
     private final CacheStore cacheStore;
-    private final java.util.concurrent.ConcurrentHashMap<String, Object> cacheLocks = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final class CacheLock {
+        final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
+        int users;
+    }
+    private final java.util.concurrent.ConcurrentHashMap<String, CacheLock> cacheLocks = new java.util.concurrent.ConcurrentHashMap<>();
     private final LinkedBlockingQueue<QueuedTask> tasks = new LinkedBlockingQueue<>();
     private final List<Thread> workers = new ArrayList<>();
     private final java.util.concurrent.ConcurrentHashMap<QueuedTask, RunningTask> runningTasks = new java.util.concurrent.ConcurrentHashMap<>();
@@ -50,6 +54,11 @@ final class RenderService implements AutoCloseable {
         return thread;
     });
     private final AtomicLong idleGeneration = new AtomicLong();
+    private final ScheduledExecutorService timeoutTimer = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread thread = new Thread(r, "render-timeout-watch");
+        thread.setDaemon(true);
+        return thread;
+    });
     private Consumer<String> log = ignored -> {};
 
     private static final class QueuedTask {
@@ -130,6 +139,11 @@ final class RenderService implements AutoCloseable {
                                                           String source, String historyLocation, RenderModels.TaskMeta meta,
                                                           boolean auxiliary) {
         CompletableFuture<RenderModels.Result> rejected = new CompletableFuture<>();
+        if (timeout == null || timeout.isNegative() || timeout.isZero()
+                || timeout.compareTo(Duration.ofMillis(Integer.MAX_VALUE)) > 0) {
+            rejected.completeExceptionally(new RenderFailure("INVALID_TIMEOUT", "渲染超时必须为正数"));
+            return rejected;
+        }
         if (closed.get()) {
             rejected.completeExceptionally(new RenderFailure("CLOSED", "渲染服务已关闭"));
             return rejected;
@@ -215,21 +229,43 @@ final class RenderService implements AutoCloseable {
             runningTasks.put(task, running);
             long start = System.nanoTime();
             boolean success = false;
+            boolean timedOut = false;
+            RenderTaskTimeout guard = null;
             try {
-                task.future.complete(render(task, running, slot, epochAtStart));
+                guard = new RenderTaskTimeout(timeoutTimer, task.timeout);
+                RenderModels.Result result = render(task, running, slot, epochAtStart, guard);
+                guard.close();
+                if (guard.expired()) {
+                    result.close();
+                    throw guard.failure();
+                }
+                if (!task.future.complete(result)) result.close();
                 success = true;
             }
             catch (Throwable throwable) {
+                timedOut = guard != null && guard.expired() || throwable instanceof RenderFailure failure && "TIMEOUT".equals(failure.code);
+                if (guard != null) guard.close();
+                // Recovery must not inherit the timeout interruption: it waits for the child to exit.
+                if (timedOut || cancelEpoch != epochAtStart) {
+                    Thread.interrupted();
+                    try { runtime.recoverUnresponsive(slot, task.request.filename() + "：" + (timedOut ? "渲染超时取消" : "手动取消")); }
+                    catch (Throwable recoveryError) { log.accept("回收客户端失败：" + recoveryError.getMessage()); }
+                }
                 if (cancelEpoch != epochAtStart) task.future.completeExceptionally(new RenderFailure("CANCELLED", "任务已手动终止"));
+                else if (timedOut) {
+                    log.accept(task.request.filename() + "：" + guard.failure().getMessage());
+                    task.future.completeExceptionally(guard.failure());
+                }
                 else task.future.completeExceptionally(throwable);
             }
             finally {
+                if (guard != null) guard.close();
                 runningTasks.remove(task);
                 queueLength.updateAndGet(value -> Math.max(0, value - 1));
                 retainedRequestBytes.addAndGet(-task.schematic.length);
                 inFlightTasks.decrementAndGet();
                 long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
-                String status = success ? "成功" : (cancelEpoch != epochAtStart ? "已终止" : "失败");
+                String status = success ? "成功" : (cancelEpoch != epochAtStart ? "已终止" : timedOut ? "超时取消" : "失败");
                 Path location = task.historyLocation != null ? Path.of(task.historyLocation)
                         : running.outputDir != null ? running.outputDir : null;
                 Consumer<RenderModels.TaskHistory> listener = historyListener;
@@ -316,17 +352,24 @@ final class RenderService implements AutoCloseable {
         if (cacheStore.invalidateImages(fileHash)) log.accept("已删除配置失效的投影图片缓存 " + fileHash + "，将重新渲染");
     }
 
-    private RenderModels.Result render(QueuedTask queued, RunningTask running, int slot, long epochAtStart) throws Exception {
+    private RenderModels.Result render(QueuedTask queued, RunningTask running, int slot, long epochAtStart,
+                                      RenderTaskTimeout guard) throws Exception {
         RenderModels.Request request = queued.request;
         byte[] schematic = queued.schematic;
-        Duration timeout = queued.timeout;
         validate(request, schematic);
         String fileHash = cacheStore.hash(schematic);
         String packFingerprint = cacheStore.resourcePackFingerprint();
-        Object cacheLock = cacheLocks.computeIfAbsent(fileHash, ignored -> new Object());
+        CacheLock cacheLock = cacheLocks.compute(fileHash, (key, current) -> {
+            CacheLock lock = current == null ? new CacheLock() : current;
+            lock.users++;
+            return lock;
+        });
+        boolean locked = false;
         Path taskDirectory = null;
         try {
-            synchronized (cacheLock) {
+            locked = cacheLock.lock.tryLock(guard.remaining().toNanos(), TimeUnit.NANOSECONDS);
+            if (!locked) throw guard.failure();
+            {
                 CacheStore.CacheHit cached = queued.auxiliary ? null
                         : cacheStore.lookup(request, schematic, Main.VERSION, packFingerprint);
                 if (cached != null) {
@@ -336,13 +379,15 @@ final class RenderService implements AutoCloseable {
                 }
 
                 if (queued.auxiliary) {
+                    cacheStore.importProjection(schematic, request.filename());
                     List<RenderModels.Image> extra = auxiliaryHit(request, fileHash, packFingerprint);
                     if (!extra.isEmpty()) return new RenderModels.Result(request.id(), extra, 0, true, "cache");
                 } else {
                     cacheStore.invalidateImages(fileHash);
                 }
 
-                runtime.ensureRunning(slot, timeout);
+                runtime.ensureRunning(slot, guard.remaining());
+                guard.check();
                 String id = UUID.randomUUID().toString();
                 Path task = root.resolve(id);
                 taskDirectory = task;
@@ -380,8 +425,11 @@ final class RenderService implements AutoCloseable {
                 Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
                 log.accept("已提交 GPU 渲染任务 " + request.filename() + "，视角数 " + request.views().size() + "（客户端 " + (slot + 1) + "）");
 
-                long deadline = System.nanoTime() + timeout.toNanos();
-                while (System.nanoTime() < deadline) {
+                long startedNanos = System.nanoTime();
+                long stallMillis = Math.max(1_000L, Long.getLong("gpu.render.stallTimeoutMillis", 120_000L));
+                RuntimeProgressWatch progressWatch = new RuntimeProgressWatch(
+                        TimeUnit.MILLISECONDS.toNanos(stallMillis), startedNanos);
+                while (!guard.expired()) {
                     if (cancelEpoch != epochAtStart) {
                         Files.deleteIfExists(target);
                         throw new RenderFailure("CANCELLED", "任务已手动终止");
@@ -403,35 +451,45 @@ final class RenderService implements AutoCloseable {
                             }
                             images.add(new RenderModels.Image(image.id(), image.name(), image.width(), image.height(), path));
                         }
+                        guard.check();
                         List<RenderModels.Image> cachedImages = queued.auxiliary
-                                ? saveAuxiliary(request, images, fileHash, packFingerprint)
-                                : cacheStore.save(request, images, schematic, running.meta,
+                                ? saveAuxiliary(request, requireCompleteImages(request, images), fileHash, packFingerprint)
+                                : cacheStore.save(request, requireCompleteImages(request, images), schematic, running.meta,
                                         running.source, Main.VERSION, packFingerprint, result.elapsedMillis(), result.gpu());
                         running.outputDir = folder.toAbsolutePath().normalize();
-                        return new RenderModels.Result(request.id(), cachedImages, result.elapsedMillis(), result.cacheHit(), result.gpu());
+                        return cacheStore.result(request, cachedImages, result.elapsedMillis(), result.cacheHit(), result.gpu());
                     }
                     if (!runtime.isAlive(slot)) throw new RenderFailure("RUNTIME_CRASH", "Minecraft GPU 运行时已退出");
+                    if (progressWatch.stalled(statusSnapshot, System.nanoTime())) {
+                        throw new RenderFailure("RUNTIME_STALLED", "GPU 渲染进度连续 " + (stallMillis / 1000)
+                                + " 秒未推进（" + running.stage + "），正在回收卡住的客户端");
+                    }
                     Thread.sleep(100);
                 }
                 Files.deleteIfExists(target);
-                throw new RenderFailure("TIMEOUT", "GPU 渲染超过 " + timeout.toSeconds() + " 秒");
+                throw guard.failure();
             }
         } catch (RenderFailure failure) {
+            if ("RUNTIME_STALLED".equals(failure.code)) {
+                runtime.recoverUnresponsive(slot, request.filename() + "：" + failure.getMessage());
+            }
             if (("RUNTIME_CRASH".equals(failure.code) || "SCHEMATIC_INVALID".equals(failure.code))
                     && !isMapArtRequest(request)) {
                 log.accept("Minecraft GPU 运行时异常退出，自动回退独立渲染器：" + failure.getMessage());
-                return renderWithStandaloneFallback(queued, running, fileHash, schematic, packFingerprint);
+                guard.check();
+                return renderWithStandaloneFallback(queued, running, fileHash, schematic, packFingerprint, guard);
             }
             throw failure;
         } finally {
             if (taskDirectory != null) deleteTreeQuietly(taskDirectory);
-            cacheLocks.remove(fileHash, cacheLock);
+            if (locked) cacheLock.lock.unlock();
+            cacheLocks.computeIfPresent(fileHash, (key, current) -> --current.users == 0 ? null : current);
         }
     }
 
     private RenderModels.Result renderWithStandaloneFallback(QueuedTask queued, RunningTask running,
                                                                String fileHash, byte[] schematic,
-                                                               String packFingerprint) throws Exception {
+                                                               String packFingerprint, RenderTaskTimeout guard) throws Exception {
         Path temporary = Files.createTempDirectory(root, "software-fallback-");
         long started = System.nanoTime();
         try {
@@ -448,6 +506,7 @@ final class RenderService implements AutoCloseable {
             try (PreviewEngine engine = PreviewEngine.load(input, runtime.minecraftClientJar(), packs)) {
                 List<RenderModels.Image> images = new ArrayList<>();
                 for (RenderModels.View view : queued.request.views()) {
+                    guard.check();
                     int renderWidth = Math.multiplyExact(view.width(), view.supersampling());
                     int renderHeight = Math.multiplyExact(view.height(), view.supersampling());
                     int renderSize = Math.max(renderWidth, renderHeight);
@@ -462,12 +521,13 @@ final class RenderService implements AutoCloseable {
                     images.add(new RenderModels.Image(view.id(), view.id() + ".png", view.width(), view.height(), imagePath));
                 }
                 long elapsed = (System.nanoTime() - started) / 1_000_000L;
+                guard.check();
                 List<RenderModels.Image> cached = queued.auxiliary
                         ? saveAuxiliary(queued.request, images, fileHash, packFingerprint)
                         : cacheStore.save(queued.request, images, schematic, running.meta,
                                 "独立渲染器回退", Main.VERSION, packFingerprint, elapsed, "software-fallback");
                 running.outputDir = cacheStore.directory().resolve(fileHash).toAbsolutePath().normalize();
-                return new RenderModels.Result(queued.request.id(), cached, elapsed, false, "software-fallback");
+                return cacheStore.result(queued.request, cached, elapsed, false, "software-fallback");
             }
         } finally {
             deleteTreeQuietly(temporary);
@@ -476,6 +536,10 @@ final class RenderService implements AutoCloseable {
 
     private List<RenderModels.Image> auxiliaryHit(RenderModels.Request request, String hash, String packFingerprint)
             throws IOException {
+        if (!cacheStore.shouldCacheImages(hash)) {
+            cacheStore.invalidateImages(hash);
+            return List.of();
+        }
         List<RenderModels.Image> images = new ArrayList<>();
         for (RenderModels.View view : request.views()) {
             Path path = auxiliaryPath(hash, view, request, packFingerprint);
@@ -486,31 +550,47 @@ final class RenderService implements AutoCloseable {
                     decoded.getWidth(), decoded.getHeight(), path));
             decoded.flush();
         }
+        cacheStore.recordUsage(cacheStore.directory().resolve(hash));
         return images;
     }
 
     private List<RenderModels.Image> saveAuxiliary(RenderModels.Request request, List<RenderModels.Image> images,
                                                    String hash, String packFingerprint) throws IOException {
         List<RenderModels.Image> saved = new ArrayList<>();
-        for (RenderModels.Image image : images) {
-            RenderModels.View view = request.views().stream().filter(candidate -> candidate.id().equals(image.id()))
-                    .findFirst().orElseThrow(() -> new IOException("额外视图 ID 不匹配"));
-            Path target = auxiliaryPath(hash, view, request, packFingerprint);
-            Files.createDirectories(target.getParent());
-            Path temporary = target.resolveSibling(target.getFileName() + ".tmp");
-            Files.copy(image.path(), temporary, StandardCopyOption.REPLACE_EXISTING);
-            try { Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
-            catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
-                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+        cacheStore.recordUsage(cacheStore.directory().resolve(hash));
+        boolean persist = cacheStore.shouldCacheImages(hash);
+        Path transientDirectory = persist ? null : cacheStore.createTransientDirectory();
+        try {
+            for (RenderModels.Image image : images) {
+                RenderModels.View view = request.views().stream().filter(candidate -> candidate.id().equals(image.id()))
+                        .findFirst().orElseThrow(() -> new IOException("额外视图 ID 不匹配"));
+                Path target = persist ? auxiliaryPath(hash, view, request, packFingerprint) : transientDirectory.resolve(view.id() + ".png");
+                Files.createDirectories(target.getParent());
+                Path temporary = target.resolveSibling(target.getFileName() + ".tmp");
+                Files.copy(image.path(), temporary, StandardCopyOption.REPLACE_EXISTING);
+                try { Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
+                catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+                    Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+                }
+                saved.add(new RenderModels.Image(image.id(), target.getFileName().toString(), image.width(), image.height(), target));
             }
-            saved.add(new RenderModels.Image(image.id(), target.getFileName().toString(), image.width(), image.height(), target));
+            return saved;
+        } catch (IOException | RuntimeException | Error failure) {
+            RenderModels.deleteTemporaryDirectory(transientDirectory);
+            throw failure;
         }
-        return saved;
     }
 
     private Path auxiliaryPath(String hash, RenderModels.View view, RenderModels.Request request, String packFingerprint) {
         String fingerprint = cacheStore.configurationFingerprint(request, Main.VERSION, packFingerprint);
         return cacheStore.directory().resolve(hash).resolve("extra-" + view.id() + "-" + fingerprint + ".png");
+    }
+
+    private static List<RenderModels.Image> requireCompleteImages(RenderModels.Request request, List<RenderModels.Image> images) throws RenderFailure {
+        if (images.size() != request.views().size() || !images.stream().map(RenderModels.Image::id).collect(java.util.stream.Collectors.toSet())
+                .equals(request.views().stream().map(RenderModels.View::id).collect(java.util.stream.Collectors.toSet())))
+            throw new RenderFailure("INVALID_IMAGE", "GPU 返回的图片不完整");
+        return images;
     }
 
     private static boolean isMapArtRequest(RenderModels.Request request) {
@@ -579,6 +659,7 @@ final class RenderService implements AutoCloseable {
 
     @Override public void close() {
         closed.set(true);
+        timeoutTimer.shutdownNow();
         idleTimer.shutdownNow();
         List<QueuedTask> pending = new ArrayList<>();
         tasks.drainTo(pending);

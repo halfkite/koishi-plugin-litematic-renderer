@@ -170,12 +170,12 @@ final class HelpCardRenderer {
         }
         if (!config.commandNames("projectionList").isEmpty())
             lines.add("/" + name(config, "projectionList") + "：导出全部缓存投影的 CSV 清单。");
+        if (!config.commandNames("convertProjectionVersion").isEmpty())
+            lines.add("/" + name(config, "convertProjectionVersion") + "123 [6/7]：转换缓存投影格式，默认 6。");
         if (!config.commandNames("moreViews").isEmpty())
-            lines.add("/" + name(config, "moreViews") + "123：显示已启用的详细视图按钮。");
+            lines.add("/" + name(config, "moreViews") + "123：显示详细视图按钮，含地图视图。");
         if (!config.commandNames("projectionView").isEmpty())
             lines.add("/" + name(config, "projectionView") + "123 正视图：生成指定的正轴、六面等视图。");
-        if (!config.commandNames("mapView").isEmpty())
-            lines.add("/" + name(config, "mapView") + "123：生成 Minecraft 地图配色视图。");
         if (!config.commandNames("introduction").isEmpty())
             lines.add("/" + name(config, "introduction") + "：查看机器人介绍。");
         if (!config.commandNames("help").isEmpty())
@@ -186,8 +186,8 @@ final class HelpCardRenderer {
     }
 
     private static String intro(AgentConfig config) {
-        boolean hasCommands = List.of("search", "sendProjection", "sendMaterials", "projectionList", "help",
-                        "introduction", "moreViews", "projectionView", "mapView").stream()
+        boolean hasCommands = List.of("search", "sendProjection", "sendMaterials", "projectionList", "convertProjectionVersion", "help",
+                        "introduction", "moreViews", "projectionView").stream()
                 .anyMatch(id -> !config.commandNames(id).isEmpty());
         if (hasCommands) return "已启用指令可从 / 面板选择，也可 @机器人后输入。";
         return config.automaticRenderingEnabled ? "群内发送投影文件即可自动生成渲染图。" : "当前没有启用机器人功能。";

@@ -71,6 +71,7 @@ final class HttpV1Server implements AutoCloseable {
             String requestId = payload.get("id").getAsString();
             var request = new RenderModels.Request(2, requestId, text(payload, "filename", "schematic.litematic"), views, null);
             var result = renderer.submit(request, schematic, Duration.ofMillis(config.renderTimeoutMillis), "HTTP", null).join();
+            try (result) {
             JsonObject response = new JsonObject();
             response.addProperty("version", 1);
             response.addProperty("id", requestId);
@@ -83,6 +84,7 @@ final class HttpV1Server implements AutoCloseable {
             }
             response.add("images", images);
             reply(exchange, 200, response);
+            }
         } catch (SecurityException error) {
             reply(exchange, 401, error(error.getMessage()));
         } catch (Throwable error) {

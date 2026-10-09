@@ -13,12 +13,14 @@ class OfficialSlashCommandPanelsTest {
         List<String> names = items.stream().map(item -> item.get("name").getAsString()).toList();
 
         assertTrue(names.containsAll(List.of("搜索投影",
-                "发送投影", "导出材料", "投影列表", "帮助", "介绍投影BOT")));
+                "发送投影", "导出材料", "投影列表", "转换投影版本", "帮助", "介绍投影BOT")));
         assertFalse(names.stream().anyMatch(name -> name.startsWith("渲染搜索")));
         assertFalse(names.contains("发送投影1"));
         assertFalse(names.contains("投影搜索"));
         assertFalse(names.contains("发送材料"));
         assertFalse(names.contains("材料"));
+        assertFalse(names.contains("地图视图"));
+        assertTrue(names.contains("更多视图"));
         assertTrue(items.stream().allMatch(item -> OfficialSlashCommandPanels.displayWidth(item.get("name").getAsString()) <= 14));
         assertTrue(items.stream().allMatch(item -> OfficialSlashCommandPanels.displayWidth(item.get("desc").getAsString()) <= 30));
     }

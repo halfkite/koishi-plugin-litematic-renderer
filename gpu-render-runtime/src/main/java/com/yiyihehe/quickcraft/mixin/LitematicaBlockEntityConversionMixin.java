@@ -7,6 +7,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import com.yiyihehe.quickcraft.litematica.ContainerDataSanitizer;
+import com.yiyihehe.quickcraft.litematica.RenderReadScope;
 
 @Mixin(targets = "fi.dy.masa.litematica.schematic.conversion.SchematicConversionMaps", remap = false)
 public abstract class LitematicaBlockEntityConversionMixin {
@@ -14,9 +15,10 @@ public abstract class LitematicaBlockEntityConversionMixin {
             at = @At("HEAD"), cancellable = true, remap = false)
     private static void gpuRuntime$skipContainerContents(CompoundData data, int dataVersion,
                                                                  CallbackInfoReturnable<CompoundData> callback) {
-        if (!Boolean.getBoolean("gpu.render.agent") || data == null) return;
+        if (!RenderReadScope.active() || data == null) return;
         // Keep block appearance and custom names, but discard bulky inventory and processing data.
         if (ContainerDataSanitizer.stripInventory(data)) {
+            RenderReadScope.containerSkipped();
             callback.setReturnValue(data);
         }
     }

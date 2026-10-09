@@ -41,6 +41,7 @@ public final class PreviewEngine implements AutoCloseable {
      * @param resourcePacks 按低到高优先级排列的资源包，可为空
      */
     public static PreviewEngine load(Path litematic, Path minecraftJar, List<Path> resourcePacks) throws IOException {
+        RenderCancellation.check();
         if (!Files.isRegularFile(litematic)) throw new IOException("投影文件不存在: " + litematic);
         if (!Files.isRegularFile(minecraftJar)) throw new IOException("Minecraft 客户端 jar 不存在: " + minecraftJar);
         ResourcePacks resources = new ResourcePacks(minecraftJar, resourcePacks == null ? List.of() : resourcePacks);
@@ -67,6 +68,7 @@ public final class PreviewEngine implements AutoCloseable {
      * @param zoom         相对默认取景的缩放倍数，1.0 即默认取景
      */
     public BufferedImage renderFrame(double yawDegrees, double pitchDegrees, double zoom, int size) {
+        RenderCancellation.check();
         double fill = Math.max(0.05, Math.min(8.0, DEFAULT_FILL * zoom));
         long key = cacheKey(yawDegrees, pitchDegrees, fill, size);
         synchronized (frameCache) {

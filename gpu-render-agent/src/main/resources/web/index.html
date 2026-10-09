@@ -122,11 +122,16 @@
             <label>缓存目录<input id="cacheDirectory"></label>
              <label>近一年投影渲染图上限 GB<input id="cacheRecentGb" type="number" min="0" step="0.1"></label>
              <label>历史投影渲染图上限 GB<input id="cacheHistoricalGb" type="number" min="0" step="0.1"></label>
+             <label>图片缓存：投影大小大于 MB<input id="cacheImageMb" type="number" min="0" step="0.1"></label>
+             <label>或缓存调用次数大于<input id="cacheImageCalls" type="number" min="0" step="1"></label>
             <label>宽度<input id="renderWidth" type="number" min="64"></label>
             <label>高度<input id="renderHeight" type="number" min="64"></label>
             <label>群文件上限 KB<input id="maxFileSizeKb" type="number" min="1"></label>
             <label>私聊文件上限 KB<input id="privateMaxFileSizeKb" type="number" min="1"></label>
-            <label>渲染超时毫秒<input id="renderTimeoutMillis" type="number" min="1000"></label>
+            <label>渲染超时秒<input id="renderTimeoutSeconds" type="number" min="1" max="2147483" step="0.001"></label>
+            <label class="check"><input id="userRenderLimitEnabled" type="checkbox"><span>启用单人 CD</span></label>
+            <label>单人 CD 统计秒数<input id="userRenderWindowSeconds" type="number" min="1" max="86400" step="1"></label>
+            <label>统计时间内允许投影文件数<input id="userRenderMaxFiles" type="number" min="1" max="10000" step="1"></label>
             <label>空闲关闭毫秒<input id="renderIdleStopMillis" type="number" min="0"></label>
             <label>并行客户端数<input id="maxConcurrentRenders" type="number" min="1" max="4"></label>
              <label>内存重启阈值 GB<input id="memoryRestartGb" type="number" min="0" step="0.1"><span class="hint">0 表示关闭自动重启</span></label>
@@ -229,7 +234,7 @@
           <div class="form-grid compact">
             <label>默认结果数量<input id="projectionSearchResultLimit" type="number" min="1" max="100"></label>
           </div>
-          <p class="hint">关闭功能后对应指令立即停用，并从官方 QQ 的 / 面板移除；介绍和帮助图片会按启用功能更新。搜索结果范围为 1-100，近半年保存的投影优先占前五位，其余按渲染次数排序。</p>
+          <p class="hint">关闭功能后对应指令立即停用，并从官方 QQ 的 / 面板移除；勾选“渲染图后显示可点击功能”可把按钮放到渲染结果操作卡片中，并自定义按钮文字。搜索结果范围为 1-100，近半年保存的投影优先占前五位，其余按渲染次数排序。</p>
           <div id="commandEditor"></div>
           <div class="row" style="margin-top:12px"><button id="saveSearchConfig" class="primary">保存功能设置</button><button id="syncCommands">同步 QQ 指令面板</button></div>
         </div>
@@ -343,20 +348,25 @@
 
     function defaultCommandDefinitions() {
       return [
-        { id: 'search', defaultName: '搜索投影', name: '搜索投影', aliases: [] },
-        { id: 'sendProjection', defaultName: '发送投影', name: '发送投影', aliases: [] },
-        { id: 'sendMaterials', defaultName: '导出材料', name: '导出材料', aliases: [] },
-        { id: 'projectionList', defaultName: '投影列表', name: '投影列表', aliases: [] },
-        { id: 'help', defaultName: '帮助', name: '帮助', aliases: [] },
-        { id: 'introduction', defaultName: '介绍投影BOT', name: '介绍投影BOT', aliases: [] },
-        { id: 'moreViews', defaultName: '更多视图', name: '更多视图', aliases: [] },
-        { id: 'projectionView', defaultName: '投影视图', name: '投影视图', aliases: [] },
-        { id: 'mapView', defaultName: '地图视图', name: '地图视图', aliases: [{ name: '地图画模式', enabled: true }] }
+        { id: 'search', defaultName: '搜索投影', name: '搜索投影', aliases: [], showInRenderActions: false, renderActionLabel: '搜索投影' },
+        { id: 'sendProjection', defaultName: '发送投影', name: '发送投影', aliases: [], showInRenderActions: false, renderActionLabel: '发送投影' },
+        { id: 'sendMaterials', defaultName: '导出材料', name: '导出材料', aliases: [], showInRenderActions: true, renderActionLabel: '导出材料' },
+        { id: 'projectionList', defaultName: '投影列表', name: '投影列表', aliases: [], showInRenderActions: false, renderActionLabel: '投影列表' },
+        { id: 'convertProjectionVersion', defaultName: '转换投影版本', name: '转换投影版本', aliases: [], showInRenderActions: true, renderActionLabel: '转换为V6' },
+        { id: 'help', defaultName: '帮助', name: '帮助', aliases: [], showInRenderActions: false, renderActionLabel: '帮助' },
+        { id: 'introduction', defaultName: '介绍投影BOT', name: '介绍投影BOT', aliases: [], showInRenderActions: false, renderActionLabel: '机器人介绍' },
+        { id: 'moreViews', defaultName: '更多视图', name: '更多视图', aliases: [], showInRenderActions: true, renderActionLabel: '更多视图' },
+        { id: 'projectionView', defaultName: '投影视图', name: '投影视图', aliases: [], showInRenderActions: false, renderActionLabel: '正轴视图' },
+        { id: 'mapView', defaultName: '地图视图', name: '地图视图', aliases: [{ name: '地图画模式', enabled: true }], showInRenderActions: false, renderActionLabel: '地图视图' }
       ];
     }
 
     function commandLabel(id) {
-      return ({ search: '搜索投影', sendProjection: '发送投影', sendMaterials: '导出材料', projectionList: '投影列表', help: '帮助', introduction: '机器人介绍', moreViews: '更多视图菜单', projectionView: '详细视图渲染', mapView: '地图配色视图' }[id]) || id;
+      return ({ search: '搜索投影', sendProjection: '发送投影', sendMaterials: '导出材料', projectionList: '投影列表', convertProjectionVersion: '转换投影版本', help: '帮助', introduction: '机器人介绍', moreViews: '更多视图菜单', projectionView: '详细视图渲染', mapView: '更多视图中的地图配色视图' }[id]) || id;
+    }
+
+    function defaultRenderActionLabel(id, name) {
+      return ({ sendMaterials: '导出材料', moreViews: '更多视图', convertProjectionVersion: '转换为V6', projectionView: '正轴视图', mapView: '地图视图' }[id]) || name || '';
     }
 
     function aliasRow(name = '', enabled = true) {
@@ -371,11 +381,13 @@
       const definitions = Array.isArray(state.config.commands) && state.config.commands.length ? state.config.commands : defaultCommandDefinitions();
       $('commandEditor').innerHTML = definitions.map((definition, index) => {
         const aliases = Array.isArray(definition.aliases) ? definition.aliases : [];
-        return '<article class="account-card command-card" data-command-index="' + index + '" data-default-name="' + esc(definition.defaultName || '') + '">'
+        return '<article class="account-card command-card" data-command-index="' + index + '" data-default-name="' + esc(definition.defaultName || '') + '" data-default-action-label="' + esc(defaultRenderActionLabel(definition.id, definition.defaultName)) + '">'
           + '<div class="card-head"><strong>' + esc(commandLabel(definition.id)) + '</strong><div class="card-actions"><label class="check"><input data-command-enabled type="checkbox"' + checked(definition.enabled !== false) + '><span>启用功能</span></label>'
-          + '<button type="button" class="small" data-command-action="reset-name">重置默认名称</button></div></div>'
+          + '<button type="button" class="small" data-command-action="reset-name">重置默认名称</button><button type="button" class="small" data-command-action="reset-action-label">重置显示名称</button></div></div>'
           + '<div class="form-grid compact"><label>主指令名称<input data-command-name value="' + esc(definition.name || definition.defaultName || '') + '"></label>'
           + '<span class="hint">默认名称：' + esc(definition.defaultName || '') + '。支持直接使用数字，例如“发送投影1”。</span></div>'
+          + '<div class="form-grid compact"><label class="check"><input data-command-show-action type="checkbox"' + checked(definition.showInRenderActions === true) + '><span>渲染图后显示可点击功能</span></label>'
+          + '<label>可点击显示名称<input data-command-action-label maxlength="20" value="' + esc(definition.renderActionLabel || defaultRenderActionLabel(definition.id, definition.name)) + '"></label></div>'
           + '<div class="subsection"><h3>指令别名</h3><div data-alias-list>' + aliases.map(alias => aliasRow(alias && alias.name || '', !alias || alias.enabled !== false)).join('') + '</div>'
           + '<button type="button" class="small" data-command-action="add-alias">增加别名</button></div></article>';
       }).join('');
@@ -385,6 +397,7 @@
         const card = button.closest('.command-card');
         const action = button.dataset.commandAction;
         if (action === 'reset-name') card.querySelector('[data-command-name]').value = card.dataset.defaultName;
+        if (action === 'reset-action-label') card.querySelector('[data-command-action-label]').value = card.dataset.defaultActionLabel;
         if (action === 'add-alias') card.querySelector('[data-alias-list]').insertAdjacentHTML('beforeend', aliasRow());
         if (action === 'delete-alias') button.closest('[data-alias-row]').remove();
       };
@@ -397,6 +410,8 @@
         const definition = { ...(source[index] || {}) };
         definition.enabled = card.querySelector('[data-command-enabled]').checked;
         definition.name = card.querySelector('[data-command-name]').value.trim();
+        definition.showInRenderActions = card.querySelector('[data-command-show-action]').checked;
+        definition.renderActionLabel = card.querySelector('[data-command-action-label]').value.trim();
         definition.aliases = [...card.querySelectorAll('[data-alias-row]')].map(row => ({
           name: row.querySelector('[data-alias-name]').value.trim(),
           enabled: row.querySelector('[data-alias-enabled]').checked
@@ -476,10 +491,14 @@
     async function loadConfig() {
       state.config = await api('/api/config');
       const c = state.config;
-      ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => { if ($(id)) $(id).value = c[id] ?? ''; });
+      ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','userRenderWindowSeconds','userRenderMaxFiles','renderIdleStopMillis','maxConcurrentRenders','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => { if ($(id)) $(id).value = c[id] ?? ''; });
+      $('renderTimeoutSeconds').value = Number(c.renderTimeoutMillis ?? 240000) / 1000;
+      $('userRenderLimitEnabled').checked = c.userRenderLimitEnabled !== false;
       $('newUsername').value = c.webUsername ?? '';
       $('cacheRecentGb').value = Math.max(0, Math.round((Number(c.cacheRecentImageMaxBytes ?? 8589934592) / 1073741824) * 10) / 10);
       $('cacheHistoricalGb').value = Math.max(0, Math.round((Number(c.cacheHistoricalImageMaxBytes ?? 2147483648) / 1073741824) * 10) / 10);
+      $('cacheImageMb').value = Number(c.cacheImageMinProjectionBytes ?? 2097152) / 1048576;
+      $('cacheImageCalls').value = Number(c.cacheImageMinCalls ?? 30);
       $('maxRequestMb').value = Math.max(1, Math.round((Number(c.maxRequestBytes || 134217728) / 1048576) * 10) / 10);
       $('memoryRestartGb').value = Math.max(0, Math.round((Number(c.memoryRestartThresholdBytes || 0) / 1073741824) * 10) / 10);
       $('webSessionHours').value = Math.max(0.083, Math.round((Number(c.webSessionTimeoutMillis || 43200000) / 3600000) * 10) / 10);
@@ -521,10 +540,14 @@
     async function saveConfig() {
       try {
         const next = { ...state.config };
-        ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','renderTimeoutMillis','renderIdleStopMillis','maxConcurrentRenders','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => next[id] = $(id).type === 'number' ? Number($(id).value) : $(id).value.trim());
+        ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','userRenderWindowSeconds','userRenderMaxFiles','renderIdleStopMillis','maxConcurrentRenders','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => next[id] = $(id).type === 'number' ? Number($(id).value) : $(id).value.trim());
+        next.renderTimeoutMillis = Math.round(Number($('renderTimeoutSeconds').value) * 1000);
+        next.userRenderLimitEnabled = $('userRenderLimitEnabled').checked;
         next.cacheRecentImageMaxBytes = Math.max(0, Number($('cacheRecentGb').value)) * 1073741824;
         next.cacheHistoricalImageMaxBytes = Math.max(0, Number($('cacheHistoricalGb').value)) * 1073741824;
         next.cacheMaxBytes = next.cacheRecentImageMaxBytes + next.cacheHistoricalImageMaxBytes;
+        next.cacheImageMinProjectionBytes = Math.round(Number($('cacheImageMb').value) * 1048576);
+        next.cacheImageMinCalls = Number($('cacheImageCalls').value);
         next.maxRequestBytes = Math.max(1, Number($('maxRequestMb').value)) * 1048576;
         next.memoryRestartThresholdBytes = Math.max(0, Number($('memoryRestartGb').value)) * 1073741824;
         next.webSessionTimeoutMillis = Math.max(0.083, Number($('webSessionHours').value)) * 3600000;

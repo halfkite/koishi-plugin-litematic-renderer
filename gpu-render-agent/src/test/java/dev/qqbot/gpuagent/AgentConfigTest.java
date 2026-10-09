@@ -15,6 +15,8 @@ class AgentConfigTest {
             Files.writeString(file, "{}");
             AgentConfig config = AgentConfig.load(file);
             assertFalse(config.nightVisionEnabled);
+            assertEquals(2097152, config.cacheImageMinProjectionBytes);
+            assertEquals(30, config.cacheImageMinCalls);
             assertEquals(15, config.nightVisionLevel);
             assertFalse(config.localMergeEnabled);
             assertTrue(config.showMetadataProjectionName);
@@ -250,7 +252,7 @@ class AgentConfigTest {
                     """);
             AgentConfig config = AgentConfig.load(file);
             assertEquals(java.util.List.of("导出材料", "物料清单"), config.commandNames("sendMaterials"));
-            assertEquals(4, config.commandAliasMigrationVersion);
+            assertEquals(5, config.commandAliasMigrationVersion);
             assertFalse(Files.readString(file).contains("发送材料"));
             assertEquals(java.util.List.of("导出材料", "物料清单"), AgentConfig.load(file).commandNames("sendMaterials"));
         } finally {
@@ -281,7 +283,7 @@ class AgentConfigTest {
             AgentConfig config = AgentConfig.load(file);
             assertEquals(1, config.commandNames("search").size());
             assertEquals("搜索投影", config.commandNames("search").getFirst());
-            assertEquals(4, config.commandAliasMigrationVersion);
+            assertEquals(5, config.commandAliasMigrationVersion);
         } finally {
             Files.deleteIfExists(file);
         }
@@ -295,12 +297,41 @@ class AgentConfigTest {
                     {"webPassword":"secret","commandAliasMigrationVersion":3,"commands":[{"id":"renderSearch","name":"渲染搜索","aliases":[{"name":"重渲染","enabled":true}]}]}
                     """);
             AgentConfig config = AgentConfig.load(file);
-            assertEquals(4, config.commandAliasMigrationVersion);
+            assertEquals(5, config.commandAliasMigrationVersion);
             assertTrue(config.commandNames("renderSearch").isEmpty());
             assertFalse(Files.readString(file).contains("渲染搜索"));
             assertFalse(Files.readString(file).contains("重渲染"));
         } finally {
             Files.deleteIfExists(file);
         }
+    }
+
+    @Test
+    void migratesExistingRenderButtonsAndAddsPerCommandActionSettings() throws Exception {
+        Path file = Files.createTempFile("litematic-agent-render-action-migration", ".json");
+        try {
+            Files.writeString(file, """
+                    {"webPassword":"secret","commandAliasMigrationVersion":4,"commands":[
+                      {"id":"sendMaterials","name":"导出材料"},
+                      {"id":"moreViews","name":"更多视图"},
+                      {"id":"convertProjectionVersion","name":"转换投影版本"},
+                      {"id":"search","name":"搜索投影"}]}
+                    """);
+
+            AgentConfig config = AgentConfig.load(file);
+            assertEquals(5, config.commandAliasMigrationVersion);
+            assertTrue(command(config, "sendMaterials").showInRenderActions);
+            assertTrue(command(config, "moreViews").showInRenderActions);
+            assertTrue(command(config, "convertProjectionVersion").showInRenderActions);
+            assertFalse(command(config, "search").showInRenderActions);
+            assertEquals("转换为V6", command(config, "convertProjectionVersion").renderActionLabel);
+            assertTrue(Files.readString(file).contains("renderActionLabel"));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    private static AgentConfig.CommandDefinition command(AgentConfig config, String id) {
+        return config.commands.stream().filter(item -> id.equals(item.id)).findFirst().orElseThrow();
     }
 }

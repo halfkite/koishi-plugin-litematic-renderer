@@ -14,7 +14,7 @@ import java.util.function.Consumer;
 
 public final class Main {
     /** 工具版本号：与 build.gradle 和预发布包名保持一致。 */
-    public static final String VERSION = "0.5.2";
+    public static final String VERSION = "0.5.13";
 
     private Main() {}
 
@@ -45,6 +45,10 @@ public final class Main {
             System.err.println("恢复历史资源包失败：" + error.getMessage());
         }
         if (args.length > 0) {
+            if (args.length == 3 && "--audit-block-items".equals(args[0]) && "--output".equals(args[1])) {
+                runBlockItemRegistryAudit(root, config, Path.of(args[2]));
+                return;
+            }
             if (args.length == 1 && ("--web".equals(args[0]) || "--bot".equals(args[0]))) {
                 runHeadless(root, configPath, config, "--web".equals(args[0]));
                 return;
@@ -81,10 +85,36 @@ public final class Main {
             var result = mapArt
                     ? renderer.submitAuxiliary(request, Files.readAllBytes(input), Duration.ofMillis(config.renderTimeoutMillis), "命令行地图画", null).join()
                     : renderer.submit(request, Files.readAllBytes(input), Duration.ofMillis(config.renderTimeoutMillis)).join();
+            try (result) {
             Files.createDirectories(output);
             for (var image : result.images()) Files.copy(image.path(), output.resolve(image.name()), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             System.out.println("Rendered " + result.images().size() + " image(s) in " + result.elapsedMillis() + " ms to " + output);
+            }
         }
+    }
+
+    private static void runBlockItemRegistryAudit(Path root, AgentConfig config, Path requestedOutput) throws Exception {
+        Path output = requestedOutput.toAbsolutePath().normalize();
+        Files.createDirectories(output.getParent());
+        Path temporary = output.resolveSibling(output.getFileName() + ".part-" + UUID.randomUUID());
+        System.setProperty("gpu.render.block-item-map-output", temporary.toString());
+        try (RenderService renderer = new RenderService(root, config)) {
+            renderer.setLog(System.out::println);
+            renderer.runtime().ensureRunning(Duration.ofMinutes(3));
+            long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+            while (!Files.isRegularFile(temporary) && System.nanoTime() < deadline) Thread.sleep(100);
+            if (!Files.isRegularFile(temporary)) throw new IOException("Minecraft 未能导出方块物品注册表");
+        } finally {
+            System.clearProperty("gpu.render.block-item-map-output");
+        }
+        try {
+            Files.move(temporary, output, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+        int count = com.google.gson.JsonParser.parseString(Files.readString(output)).getAsJsonObject()
+                .getAsJsonObject("blocks").size();
+        System.out.println("Minecraft 26.3 方块映射已导出：" + count + " 种方块，文件：" + output);
     }
 
     /** Linux 无桌面模式：渲染、HTTP v1、云端、机器人和 Web 后台共用同一生命周期。 */
@@ -163,6 +193,8 @@ public final class Main {
         System.out.println("      使用本地 GPU 运行时渲染投影");
         System.out.println("  java -jar litematic-gpu-agent-" + VERSION + "-all.jar --map-art FILE.litematic --output DIRECTORY");
         System.out.println("      按 Minecraft 方块地图颜色导出俯视像素图");
+        System.out.println("  java -jar litematic-gpu-agent-" + VERSION + "-all.jar --audit-block-items --output FILE.json");
+        System.out.println("      从 Minecraft 26.3 注册表导出完整方块与物品对应关系");
         System.out.println("  --version       显示版本");
         System.out.println("  --help          显示帮助");
     }

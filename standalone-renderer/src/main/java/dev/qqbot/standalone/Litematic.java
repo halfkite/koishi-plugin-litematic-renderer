@@ -64,6 +64,7 @@ final class Litematic {
         int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
 
         for (Map.Entry<String, Object> regionEntry : regions.entrySet()) {
+            RenderCancellation.check();
             Map<String, Object> region = compound(regionEntry.getValue());
             if (region == null) continue;
             Map<String, Object> position = compound(region.get("Position"));
@@ -118,6 +119,7 @@ final class Litematic {
             int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(Math.max(1, palette.size() - 1)));
             int total = Math.multiplyExact(Math.multiplyExact(sx, sy), sz);
             for (int index = 0; index < total; index++) {
+                if ((index & 4095) == 0) RenderCancellation.check();
                 int paletteIndex = unpack(states, index, bits);
                 if (paletteIndex < 0 || paletteIndex >= palette.size()) continue;
                 BlockState state = palette.get(paletteIndex);

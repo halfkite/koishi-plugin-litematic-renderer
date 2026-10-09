@@ -44,7 +44,23 @@ final class RenderModels {
 
     record Image(String id, String name, int width, int height, Path path) {}
 
-    record Result(String taskId, List<Image> images, long elapsedMillis, boolean cacheHit, String gpu) {}
+    record Result(String taskId, List<Image> images, long elapsedMillis, boolean cacheHit, String gpu,
+                  Path temporaryDirectory) implements AutoCloseable {
+        Result(String taskId, List<Image> images, long elapsedMillis, boolean cacheHit, String gpu) {
+            this(taskId, images, elapsedMillis, cacheHit, gpu, null);
+        }
+
+        @Override public void close() {
+            deleteTemporaryDirectory(temporaryDirectory);
+        }
+    }
+
+    static void deleteTemporaryDirectory(Path directory) {
+        if (directory == null) return;
+        try (var paths = java.nio.file.Files.walk(directory)) {
+            for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) java.nio.file.Files.deleteIfExists(path);
+        } catch (java.io.IOException ignored) { }
+    }
 
     record RuntimeStatus(long timestamp, boolean ready, boolean busy, boolean inWorld,
                          String rendererVersion, String minecraftVersion, String gpu,

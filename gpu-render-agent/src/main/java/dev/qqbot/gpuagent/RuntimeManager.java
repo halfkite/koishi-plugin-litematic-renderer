@@ -14,12 +14,13 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Consumer;
 
 /**
  * Minecraft 渲染客户端池：支持多个隐藏客户端并行渲染（每个槽位独立游戏目录、独立进程与任务队列）。
  * 槽位 0 沿用原有 root/game 目录；其余槽位使用 root/game-2、root/game-3…
- * 并通过 NTFS 目录联接共享槽位 0 的网格缓存（litematica-preview-cache），避免重复建网格。
+ * 各客户端共用配置缓存目录中的内容寻址网格缓存，避免重复建网格。
  */
 final class RuntimeManager implements AutoCloseable {
     private static final long STATUS_MAX_AGE_MILLIS = 5_000L;
@@ -34,6 +35,7 @@ final class RuntimeManager implements AutoCloseable {
         final Path gameDirectory;
         volatile Process process;
         volatile boolean wasRunningForPacks;
+        volatile java.util.concurrent.atomic.AtomicBoolean expectedExit;
 
         Slot(int index) {
             this.index = index;
@@ -144,6 +146,71 @@ final class RuntimeManager implements AutoCloseable {
         throw new IOException("Minecraft GPU 运行时未在限定时间内就绪");
     }
 
+    Path convertProjectionFormat(Path input, int targetVersion, Path output, Duration timeout) throws Exception {
+        if (targetVersion != 6 && targetVersion != 7) throw new IllegalArgumentException("仅支持 Litematic 格式版本 6 或 7");
+        Path source = input.toAbsolutePath().normalize();
+        Path target = output.toAbsolutePath().normalize();
+        if (!Files.isRegularFile(source)) throw new IOException("待转换的投影文件不存在");
+        if (target.getParent() == null || source.equals(target)) throw new IOException("投影转换路径无效");
+        Files.createDirectories(target.getParent());
+        Files.deleteIfExists(target);
+        ensureRunning(0, Duration.ofMinutes(5));
+
+        Path bridge = slotBridgeDirectory(0);
+        Path jobs = bridge.resolve("version-jobs");
+        Path results = bridge.resolve("version-results");
+        Path versionFiles = bridge.resolve("version-files");
+        Files.createDirectories(jobs);
+        Files.createDirectories(results);
+        Files.createDirectories(versionFiles);
+        String id = UUID.randomUUID().toString();
+        Path jobPath = jobs.resolve(id + ".version.json");
+        Path resultPath = results.resolve(id + ".version.result.json");
+        Path runtimeSource = versionFiles.resolve(id + "-source.litematic");
+        Path runtimeTarget = versionFiles.resolve(id + "-converted.litematic");
+        Path temporary = jobPath.resolveSibling(jobPath.getFileName() + ".tmp");
+        try {
+            Files.copy(source, runtimeSource);
+            com.google.gson.JsonObject request = new com.google.gson.JsonObject();
+            request.addProperty("id", id);
+            request.addProperty("input", runtimeSource.toString());
+            request.addProperty("output", runtimeTarget.toString());
+            request.addProperty("targetVersion", targetVersion);
+            Files.writeString(temporary, Protocol.GSON.toJson(request), StandardCharsets.UTF_8);
+            try {
+                Files.move(temporary, jobPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+                Files.move(temporary, jobPath);
+            }
+            long deadline = System.nanoTime() + timeout.toNanos();
+            while (System.nanoTime() < deadline) {
+                if (Files.isRegularFile(resultPath)) {
+                    com.google.gson.JsonObject result = Protocol.GSON.fromJson(
+                            Files.readString(resultPath, StandardCharsets.UTF_8), com.google.gson.JsonObject.class);
+                    if (result == null || !result.has("success")) throw new IOException("运行时返回了无效的投影转换结果");
+                    if (!result.get("success").getAsBoolean()) {
+                        String error = result.has("error") && !result.get("error").isJsonNull()
+                                ? result.get("error").getAsString() : "未知转换错误";
+                        throw new IOException(error);
+                    }
+                    if (!Files.isRegularFile(runtimeTarget) || Files.size(runtimeTarget) == 0)
+                        throw new IOException("运行时报告转换成功，但未生成投影文件");
+                    Files.copy(runtimeTarget, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    return target;
+                }
+                if (!isAlive(0)) throw new IOException("Minecraft GPU 运行时在投影转换期间退出");
+                Thread.sleep(250);
+            }
+            throw new IOException("投影格式转换超时");
+        } finally {
+            Files.deleteIfExists(temporary);
+            Files.deleteIfExists(jobPath);
+            Files.deleteIfExists(resultPath);
+            Files.deleteIfExists(runtimeSource);
+            Files.deleteIfExists(runtimeTarget);
+        }
+    }
+
     private synchronized void start(Slot slot) throws Exception {
         if (slot.process != null) {
             if (slot.process.isAlive()) return;
@@ -171,6 +238,13 @@ final class RuntimeManager implements AutoCloseable {
         command.add("--enable-native-access=ALL-UNNAMED");
         command.add("-Djava.library.path=" + spec.natives());
         command.add("-Dgpu.render.agent=true");
+        CacheStore meshStore = new CacheStore(root.getParent(), config, log, false);
+        command.add("-Dgpu.render.meshCacheDirectory=" + meshStore.directory().resolve(".mesh"));
+        command.add("-Dgpu.render.resourceFingerprint=" + meshStore.resourcePackFingerprint());
+        String blockItemMapOutput = System.getProperty("gpu.render.block-item-map-output");
+        if (blockItemMapOutput != null && !blockItemMapOutput.isBlank()) {
+            command.add("-Dgpu.render.block-item-map-output=" + blockItemMapOutput);
+        }
         command.add("-Dgpu.render.nightVision=" + config.nightVisionEnabled);
         command.add("-Dgpu.render.nightVisionLevel=" + Math.max(1, Math.min(15, config.nightVisionLevel)));
         for (String argument : spec.jvmArguments()) {
@@ -192,12 +266,14 @@ final class RuntimeManager implements AutoCloseable {
             throw new IOException("无法启动 Minecraft 进程（java=" + command.get(0) + "）：" + error.getMessage(), error);
         }
         Process child = slot.process;
+        var expectedExit = new java.util.concurrent.atomic.AtomicBoolean();
+        slot.expectedExit = expectedExit;
         Thread reader = new Thread(() -> readLogs(slot, child), "minecraft-runtime-log-" + slot.index);
         reader.setDaemon(true);
         reader.start();
         child.onExit().thenAccept(process -> {
             int exitCode = process.exitValue();
-            if (exitCode != 0) {
+            if (exitCode != 0 && !expectedExit.get()) {
                 CrashLogger.runtimeExit(root, slot.index, exitCode);
                 log.accept("Minecraft 26.3 GPU 运行时异常退出（客户端 " + (slot.index + 1) + "，退出码 " + exitCode + "）");
             }
@@ -205,26 +281,11 @@ final class RuntimeManager implements AutoCloseable {
         log.accept("Minecraft 26.3 GPU 运行时已启动（隐藏窗口，客户端 " + (slot.index + 1) + "/" + slots.size() + "）");
     }
 
-    /** 为非 0 槽位准备独立游戏目录：mods 里的渲染 jar + 共享网格缓存（目录联接到槽位 0）。 */
+    /** Prepare independent mods; the mesh-cache property supplies a shared path on every platform. */
     private void prepareSlotGameDirectory(Slot slot) throws IOException {
         if (slot.index == 0) return;
         Files.createDirectories(slot.gameDirectory.resolve("mods"));
         installer.copyBundledMods(slot.gameDirectory);
-        Path sharedCache = slots.get(0).gameDirectory.resolve("litematica-preview-cache");
-        Path link = slot.gameDirectory.resolve("litematica-preview-cache");
-        if (Files.exists(link)) return;
-        try {
-            Files.createDirectories(sharedCache);
-            if (isWindows()) {
-                new ProcessBuilder("cmd", "/c", "mklink", "/J", link.toString(), sharedCache.toString())
-                        .redirectErrorStream(true).start().waitFor();
-            } else {
-                Files.createSymbolicLink(link, sharedCache);
-            }
-            log.accept("客户端 " + (slot.index + 1) + " 已共享网格缓存目录");
-        } catch (Throwable error) {
-            log.accept("网格缓存共享失败（客户端 " + (slot.index + 1) + " 将使用独立缓存）：" + error.getMessage());
-        }
     }
 
     static String normalizeJvmArgument(String argument) {
@@ -327,9 +388,80 @@ final class RuntimeManager implements AutoCloseable {
         for (Slot slot : slots) stop(slot);
     }
 
+    synchronized void recoverUnresponsive(int slotIndex, String reason) {
+        Slot slot = slots.get(slotIndex);
+        Process child = slot.process;
+        if (child != null && child.isAlive()) captureStallDiagnostic(slotIndex, child, reason);
+        stop(slot);
+        try {
+            Path runtimeLog = runtimeLogPath(slotIndex);
+            if (Files.isRegularFile(runtimeLog)) {
+                String snapshotName = runtimeLog.getFileName().toString().replace(".log", "-before-recovery.log");
+                Files.copy(runtimeLog, runtimeLog.resolveSibling(snapshotName),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException error) {
+            log.accept("保存重启前客户端日志失败：" + error.getMessage());
+        }
+        try {
+            clearRenderJobs(slotIndex);
+        } catch (IOException error) {
+            log.accept("清理卡住客户端的任务记录失败：" + error.getMessage());
+        }
+        log.accept("客户端 " + (slotIndex + 1) + " 已回收，下一项排队任务将使用新客户端");
+    }
+
+    void clearRenderJobs(int slotIndex) throws IOException {
+        Path bridge = slotBridgeDirectory(slotIndex);
+        for (String directory : List.of("jobs", "processing", "results")) {
+            Path folder = bridge.resolve(directory);
+            if (!Files.isDirectory(folder)) continue;
+            String suffix = "results".equals(directory) ? ".result.json" : ".job.json";
+            try (var files = Files.list(folder)) {
+                for (Path file : files.filter(Files::isRegularFile).toList()) {
+                    String name = file.getFileName().toString();
+                    if (name.endsWith(suffix) || name.endsWith(suffix + ".tmp")) Files.deleteIfExists(file);
+                }
+            }
+        }
+    }
+
+    private Path runtimeLogPath(int slotIndex) {
+        return root.resolve(slotIndex == 0 ? "minecraft-runtime.log" : "minecraft-runtime-" + (slotIndex + 1) + ".log");
+    }
+
+    private void captureStallDiagnostic(int slotIndex, Process child, String reason) {
+        Path diagnostic = root.resolve("runtime-stall.log");
+        try {
+            Files.createDirectories(root);
+            Files.writeString(diagnostic, Instant.now() + " 客户端 " + (slotIndex + 1) + " PID=" + child.pid()
+                    + "\n" + reason + "\n状态：" + currentStatus(slotIndex) + "\n", StandardCharsets.UTF_8);
+            String name = isWindows() ? "jcmd.exe" : "jcmd";
+            Path jcmd = javaExecutable().resolveSibling(name);
+            if (!Files.isRegularFile(jcmd)) jcmd = Path.of(System.getProperty("java.home"), "bin", name);
+            if (Files.isRegularFile(jcmd)) {
+                Process dump = new ProcessBuilder(jcmd.toString(), String.valueOf(child.pid()), "Thread.print", "-l")
+                        .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.appendTo(diagnostic.toFile())).start();
+                if (!dump.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                    dump.destroyForcibly();
+                    Files.writeString(diagnostic, "\n线程堆栈采集超时\n", StandardCharsets.UTF_8, StandardOpenOption.APPEND);
+                }
+            } else {
+                Files.writeString(diagnostic, "当前 Java 未提供 jcmd，无法采集客户端线程堆栈\n",
+                        StandardCharsets.UTF_8, StandardOpenOption.APPEND);
+            }
+            log.accept("渲染卡住诊断已保存：" + diagnostic);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (IOException error) {
+            log.accept("保存渲染卡住诊断失败：" + error.getMessage());
+        }
+    }
+
     private synchronized void stop(Slot slot) {
         Process child = slot.process;
         if (child == null) return;
+        if (slot.expectedExit != null) slot.expectedExit.set(true);
         terminateProcessTree(child);
         // 只有确认 terminateProcessTree 返回后才清空句柄，避免状态先变成“未启动”而旧客户端仍在退出。
         slot.process = null;

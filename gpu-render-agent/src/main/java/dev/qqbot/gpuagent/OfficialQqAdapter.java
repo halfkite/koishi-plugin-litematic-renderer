@@ -512,7 +512,7 @@ final class OfficialQqAdapter implements BotAdapter, WebSocket.Listener {
                 permission.addProperty("type", 2);
                 action.add("permission", permission);
                 action.addProperty("data", item.command());
-                action.addProperty("enter", true);
+                action.addProperty("enter", item.enter());
                 button.add("action", action);
                 buttons.add(button);
             }
@@ -707,7 +707,48 @@ final class OfficialQqAdapter implements BotAdapter, WebSocket.Listener {
         String target = message.direct() ? message.userId() : message.groupId();
         if (target == null || target.isBlank()) throw new IOException("官方 QQ 消息缺少发送目标");
         String base = profile.sandbox ? "https://sandbox.api.sgroup.qq.com" : "https://api.sgroup.qq.com";
-        return post(base + (message.direct() ? "/v2/users/" : "/v2/groups/") + target + "/messages", body);
+        String url = base + (message.direct() ? "/v2/users/" : "/v2/groups/") + target + "/messages";
+        return postWithActiveFallback(body, payload -> post(url, payload), log);
+    }
+
+    @FunctionalInterface
+    interface MessagePoster {
+        JsonObject post(JsonObject body) throws IOException, InterruptedException;
+    }
+
+    static JsonObject postWithActiveFallback(JsonObject body, MessagePoster poster, Consumer<String> log)
+            throws IOException, InterruptedException {
+        try {
+            return poster.post(body);
+        } catch (QqApiException error) {
+            if (error.code != 40034005 || (!body.has("msg_id") && !body.has("event_id"))) throw error;
+            JsonObject active = body.deepCopy();
+            active.remove("msg_id");
+            active.remove("msg_seq");
+            active.remove("event_id");
+            active.remove("message_reference");
+            log.accept("官方 QQ 回复 ID 已过期，改用主动消息发送");
+            return poster.post(active);
+        }
+    }
+
+    static final class QqApiException extends IOException {
+        final int code;
+
+        QqApiException(int status, String body) {
+            super("QQ REST 请求失败 HTTP " + status + "：" + body);
+            int value = 0;
+            try {
+                JsonObject error = Protocol.GSON.fromJson(body, JsonObject.class);
+                for (String key : List.of("err_code", "code")) {
+                    if (error != null && error.has(key) && !error.get(key).isJsonNull()) {
+                        value = error.get(key).getAsInt();
+                        if (value != 0) break;
+                    }
+                }
+            } catch (RuntimeException ignored) { }
+            code = value;
+        }
     }
 
     private JsonObject post(String url, JsonObject body) throws IOException, InterruptedException {
@@ -716,7 +757,8 @@ final class OfficialQqAdapter implements BotAdapter, WebSocket.Listener {
                 .header("Authorization", "QQBot " + accessToken).header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(Protocol.GSON.toJson(body))).build();
         HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IOException("QQ REST 请求失败 HTTP " + response.statusCode() + "：" + response.body());
+        if (response.statusCode() < 200 || response.statusCode() >= 300)
+            throw new QqApiException(response.statusCode(), response.body());
         lastError = "";
         JsonObject value = Protocol.GSON.fromJson(response.body().isBlank() ? "{}" : response.body(), JsonObject.class);
         return value == null ? new JsonObject() : value;

@@ -83,8 +83,12 @@ final class SoftwareRenderer {
         this.schematic = schematic;
         this.models = models;
         this.entityModels = entityModels;
-        for (Litematic.Block block : schematic.blocks()) blocks.put(new Position(block.x(), block.y(), block.z()), block.state());
+        for (Litematic.Block block : schematic.blocks()) {
+            RenderCancellation.check();
+            blocks.put(new Position(block.x(), block.y(), block.z()), block.state());
+        }
         for (Litematic.BlockEntity entity : schematic.blockEntities()) {
+            RenderCancellation.check();
             blockEntities.put(new Position(entity.x(), entity.y(), entity.z()), entity);
         }
     }
@@ -100,6 +104,7 @@ final class SoftwareRenderer {
      * 交互式预览必须走这条路径——对数百万方块的投影，逐帧全量遍历要数十秒。
      */
     BakedMesh bakeMesh() {
+        RenderCancellation.check();
         FloatArray opaquePositions = new FloatArray();
         FloatArray opaqueUvs = new FloatArray();
         List<BufferedImage> opaqueTextures = new ArrayList<>();
@@ -112,6 +117,7 @@ final class SoftwareRenderer {
         FloatArray translucentShades = new FloatArray();
 
         for (Litematic.Block block : schematic.blocks()) {
+            RenderCancellation.check();
             BakedModel model = models.resolve(block.state(), blockEntities.get(new Position(block.x(), block.y(), block.z())));
             for (Quad quad : model.quads()) {
                 if (hiddenByNeighbor(block, quad.cullFace())) continue;
@@ -128,6 +134,7 @@ final class SoftwareRenderer {
             }
         }
         for (Litematic.Entity entity : schematic.entities()) {
+            RenderCancellation.check();
             BakedModel model = entityModels.resolve(entity);
             for (Quad quad : model.quads()) {
                 appendQuad(opaquePositions, opaqueUvs, opaqueTextures, opaqueTints, opaqueShades,
@@ -182,6 +189,7 @@ final class SoftwareRenderer {
             double[] depths = new double[quads];
             Projected[][] projected = new Projected[quads][];
             for (int quad = 0; quad < quads; quad++) {
+                RenderCancellation.check();
                 projected[quad] = projectQuad(mesh.translucentPositions(), quad, camera);
                 for (int vertex = 0; vertex < 4; vertex++) {
                     Projected point = projected[quad][vertex];
@@ -196,6 +204,7 @@ final class SoftwareRenderer {
             for (int quad = 0; quad < quads; quad++) order[quad] = quad;
             Arrays.sort(order, Comparator.comparingDouble(index -> depths[index]));
             for (Integer index : order) {
+                RenderCancellation.check();
                 Projected[] vertices = projected[index];
                 if (allOffScreen(vertices, size)) continue;
                 BufferedImage texture = mesh.translucentTextures()[index];
@@ -216,6 +225,7 @@ final class SoftwareRenderer {
                                 boolean writeDepth) {
         int quads = tints.length;
         for (int quad = 0; quad < quads; quad++) {
+            RenderCancellation.check();
             Projected[] vertices = projectQuad(positions, quad, camera);
             if (allOffScreen(vertices, size)) continue;
             int baseUv = quad * 8;
@@ -606,6 +616,7 @@ final class SoftwareRenderer {
         boolean positive = area > 0;
 
         for (int y = minY; y <= maxY; y++) {
+            RenderCancellation.check();
             double py = y + 0.5;
             for (int x = minX; x <= maxX; x++) {
                 double px = x + 0.5;

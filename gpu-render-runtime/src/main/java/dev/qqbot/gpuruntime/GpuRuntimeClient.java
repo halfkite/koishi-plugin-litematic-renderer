@@ -2,7 +2,10 @@ package dev.qqbot.gpuruntime;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
 import com.yiyihehe.quickcraft.litematica.QuickLitematicaPreview3D;
+import fi.dy.masa.litematica.schematic.LitematicaSchematic;
+import fi.dy.masa.litematica.util.WorldUtils;
 import fi.dy.masa.litematica.world.SchematicWorldHandler;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
@@ -10,12 +13,14 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.gui.screens.worldselection.WorldOpenFlows;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.gamerules.GameRules;
+import net.minecraft.world.item.Items;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.sdl.SDLVideo;
 import org.slf4j.Logger;
@@ -36,6 +41,9 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -47,6 +55,10 @@ public final class GpuRuntimeClient implements ClientModInitializer {
     }
     private static final Logger LOGGER = LoggerFactory.getLogger("litematic-gpu-runtime");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Gson EVENT_GSON = new Gson();
+    private static String lastEventId;
+    private static String lastEventStage;
+    private static long lastEventNanos;
     private static final String RENDER_WORLD = "litematic-gpu-runtime-void";
     private static final long JOB_TIMEOUT_NANOS = java.time.Duration.ofMinutes(15).toNanos();
 
@@ -54,9 +66,14 @@ public final class GpuRuntimeClient implements ClientModInitializer {
     private final Path jobs = root.resolve("jobs");
     private final Path processing = root.resolve("processing");
     private final Path results = root.resolve("results");
+    private final Path versionJobs = root.resolve("version-jobs");
+    private final Path versionProcessing = root.resolve("version-processing");
+    private final Path versionResults = root.resolve("version-results");
+    private final Path versionFiles = root.resolve("version-files");
     private final Path renderWorld = FabricLoader.getInstance().getGameDir().resolve("saves").resolve(RENDER_WORLD);
     private ActiveJob active;
     private volatile boolean mapArtBusy;
+    private volatile boolean versionConversionBusy;
     private boolean openingWorld;
     private boolean windowHidden;
     private boolean clientDefaultsApplied;
@@ -74,11 +91,41 @@ public final class GpuRuntimeClient implements ClientModInitializer {
     @Override public void onInitializeClient() {
         try {
             Files.createDirectories(jobs); Files.createDirectories(processing); Files.createDirectories(results);
+            Files.createDirectories(versionJobs); Files.createDirectories(versionProcessing);
+            Files.createDirectories(versionResults); Files.createDirectories(versionFiles);
             installRenderWorld();
+            dumpBlockItemMapIfRequested();
         } catch (IOException error) { throw new IllegalStateException("Unable to initialize GPU render queue", error); }
         instance = this;
         LOGGER.info("Litematic GPU runtime queue: {}, night vision={}, brightness level={}",
                 root, QuickLitematicaPreview3D.nightVisionEnabled(), QuickLitematicaPreview3D.nightVisionLevel());
+    }
+
+    private void dumpBlockItemMapIfRequested() throws IOException {
+        String configuredPath = System.getProperty("gpu.render.block-item-map-output");
+        if (configuredPath == null || configuredPath.isBlank()) return;
+
+        Map<String, String> blockItems = new TreeMap<>();
+        int blocksWithoutItems = 0;
+        for (var block : BuiltInRegistries.BLOCK) {
+            String blockId = BuiltInRegistries.BLOCK.getKey(block).toString();
+            var item = block.asItem();
+            String itemId = item == Items.AIR ? "" : BuiltInRegistries.ITEM.getKey(item).toString();
+            blockItems.put(blockId, itemId);
+            if (item == Items.AIR) blocksWithoutItems++;
+        }
+        TreeSet<String> itemIds = new TreeSet<>();
+        for (var item : BuiltInRegistries.ITEM) itemIds.add(BuiltInRegistries.ITEM.getKey(item).toString());
+        JsonObject registry = new JsonObject();
+        registry.addProperty("minecraftVersion", "26.3");
+        registry.add("blocks", GSON.toJsonTree(blockItems));
+        registry.add("items", GSON.toJsonTree(itemIds));
+
+        Path output = Path.of(configuredPath).toAbsolutePath().normalize();
+        if (output.getParent() != null) Files.createDirectories(output.getParent());
+        Files.writeString(output, GSON.toJson(registry), java.nio.charset.StandardCharsets.UTF_8);
+        LOGGER.info("Exported Minecraft 26.3 registries: {} blocks ({} without block items), {} items to {}",
+                blockItems.size(), blocksWithoutItems, itemIds.size(), output);
     }
 
     private void tick(Minecraft client) {
@@ -97,6 +144,13 @@ public final class GpuRuntimeClient implements ClientModInitializer {
             if (mapArtBusy) return;
             if (--scanCooldown > 0) return;
             scanCooldown = 10;
+            Path versionJob = nextVersionJob();
+            if (versionJob != null) {
+                if (client.level == null) { openRenderWorld(client); return; }
+                if (client.player == null) return;
+                processVersionJob(versionJob);
+                return;
+            }
             Path queued = nextJob();
             if (queued == null) return;
             if (client.level == null) { openRenderWorld(client); return; }
@@ -214,11 +268,65 @@ public final class GpuRuntimeClient implements ClientModInitializer {
         event("accepted", request.id, 0.0, "building-mesh");
     }
 
+    private void processVersionJob(Path queued) {
+        Path claimed = versionProcessing.resolve(queued.getFileName());
+        VersionConversionJob job = null;
+        versionConversionBusy = true;
+        try {
+            Files.move(queued, claimed, StandardCopyOption.REPLACE_EXISTING);
+            try (Reader reader = Files.newBufferedReader(claimed)) {
+                job = GSON.fromJson(reader, VersionConversionJob.class);
+            }
+            if (job == null || job.id == null || !job.id.matches("[0-9a-fA-F-]{36}")
+                    || job.input == null || job.output == null || (job.targetVersion != 6 && job.targetVersion != 7))
+                throw new IOException("Invalid Litematic version-conversion request");
+
+            Path allowed = versionFiles.toAbsolutePath().normalize();
+            Path input = Path.of(job.input).toAbsolutePath().normalize();
+            Path output = Path.of(job.output).toAbsolutePath().normalize();
+            if (!input.startsWith(allowed) || !output.startsWith(allowed) || input.equals(output))
+                throw new IOException("Litematic conversion paths are outside the allowed directory");
+            if (!Files.isRegularFile(input) || output.getParent() == null)
+                throw new IOException("Litematic conversion input is missing or output path is invalid");
+            Files.createDirectories(output.getParent());
+
+            boolean converted;
+            if (job.targetVersion == 6) {
+                converted = WorldUtils.convertLitematicaSchematicToV6LitematicaSchematic(
+                        input.getParent(), input.getFileName().toString(), output.getParent(),
+                        output.getFileName().toString(), false, true,
+                        text -> LOGGER.info("Litematic V6 export: {}", text));
+            } else {
+                LitematicaSchematic schematic = LitematicaSchematic.createFromFile(
+                        input.getParent(), input.getFileName().toString());
+                converted = schematic != null && schematic.writeToFile(
+                        output.getParent(), output.getFileName().toString(), true, false);
+            }
+            if (!converted || !Files.isRegularFile(output) || Files.size(output) == 0)
+                throw new IOException("Litematica could not export the requested format version");
+            writeVersionResult(new VersionConversionResult(job.id, true, null));
+            LOGGER.info("Converted Litematic schematic to format V{}: {}", job.targetVersion, output.getFileName());
+        } catch (Throwable error) {
+            LOGGER.error("Litematic format conversion failed", error);
+            if (job != null && job.id != null && job.id.matches("[0-9a-fA-F-]{36}"))
+                writeVersionResult(new VersionConversionResult(job.id, false,
+                        error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()));
+        } finally {
+            try { Files.deleteIfExists(claimed); } catch (IOException ignored) { }
+            versionConversionBusy = false;
+        }
+    }
+
     private void advanceActive() {
         ActiveJob job = active;
         if (job.error != null) { failActive(job.error); return; }
         if (System.nanoTime() - job.startedAt > JOB_TIMEOUT_NANOS) { failActive(new RenderException("TIMEOUT", "GPU render job timed out")); return; }
-        if (job.preview.isFailed()) { failActive(new RenderException("SCHEMATIC_INVALID", "Preview state: " + job.preview.stateName())); return; }
+        if (job.preview.isFailed()) {
+            boolean tooLarge = "TOO_LARGE".equals(job.preview.stateName());
+            failActive(new RenderException(tooLarge ? "OUTPUT_TOO_LARGE" : "SCHEMATIC_INVALID",
+                    tooLarge ? "投影网格或动态对象超过渲染安全上限，请拆分投影后重试" : "Preview state: " + job.preview.stateName()));
+            return;
+        }
         if (!job.preview.isReady()) { event("progress", job.request.id, job.preview.progress(), "building-mesh"); return; }
         if (job.exporting) return;
         if (job.viewIndex >= job.request.views.size()) { completeActive(); return; }
@@ -317,15 +425,26 @@ public final class GpuRuntimeClient implements ClientModInitializer {
         queued.sort(Comparator.comparing(path -> path.getFileName().toString())); return queued.isEmpty() ? null : queued.getFirst();
     }
 
+    private Path nextVersionJob() throws IOException {
+        List<Path> queued = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(versionJobs, "*.version.json")) {
+            for (Path path : stream) queued.add(path);
+        }
+        queued.sort(Comparator.comparing(path -> path.getFileName().toString()));
+        return queued.isEmpty() ? null : queued.getFirst();
+    }
+
     private void writeStatus(Minecraft client) {
         try {
             List<String> packs = client.getResourcePackRepository().getSelectedIds().stream().sorted().toList();
             String fingerprint = Integer.toHexString(packs.hashCode());
             double progress = active == null ? 0.0 : active.preview.progress();
-            String stage = mapArtBusy ? "map-art-colors" : active == null ? "idle" : active.exporting ? "rendering" : "building";
+            String stage = versionConversionBusy ? "converting-projection"
+                    : mapArtBusy ? "map-art-colors" : active == null ? "idle" : active.exporting ? "rendering" : "building";
             writeAtomic(root.resolve("status.json"), GSON.toJson(new RenderStatus(System.currentTimeMillis(),
-                    active == null && !mapArtBusy && initialResourcesReady, active != null || mapArtBusy, client.level != null,
-                    "0.1.3", "26.3", gpu, maxTextureSize, fingerprint, progress, stage,
+                    active == null && !mapArtBusy && !versionConversionBusy && initialResourcesReady,
+                    active != null || mapArtBusy || versionConversionBusy, client.level != null,
+                    "0.1.7", "26.3", gpu, maxTextureSize, fingerprint, progress, stage,
                     clientDefaultsApplied, worldDefaultsApplied, worldDefaultsApplied, RENDER_WORLD,
                     QuickLitematicaPreview3D.nightVisionEnabled(), QuickLitematicaPreview3D.nightVisionLevel())));
         } catch (IOException error) { LOGGER.warn("Unable to write GPU runtime status", error); }
@@ -334,6 +453,10 @@ public final class GpuRuntimeClient implements ClientModInitializer {
     private void writeResult(RenderResult result) {
         try { writeAtomic(results.resolve(result.id + ".result.json"), GSON.toJson(result)); }
         catch (IOException error) { LOGGER.error("Unable to write GPU result", error); }
+    }
+    private void writeVersionResult(VersionConversionResult result) {
+        try { writeAtomic(versionResults.resolve(result.id + ".version.result.json"), GSON.toJson(result)); }
+        catch (IOException error) { LOGGER.error("Unable to write Litematic conversion result", error); }
     }
     private static void writeAtomic(Path target, String json) throws IOException { Files.createDirectories(target.getParent()); Path tmp=target.resolveSibling(target.getFileName()+".tmp");Files.writeString(tmp,json);Files.move(tmp,target,StandardCopyOption.REPLACE_EXISTING); }
     private void cleanup(ActiveJob job) { job.preview.close(); try { Files.deleteIfExists(job.jobFile); } catch (IOException ignored) {} }
@@ -348,7 +471,15 @@ public final class GpuRuntimeClient implements ClientModInitializer {
         return Math.max(0.25, Math.min(3.0, Double.isFinite(value) ? value : 1.0));
     }
     private static void resize(Path source, Path target, int width, int height) throws IOException { BufferedImage input=ImageIO.read(source.toFile());BufferedImage output=new BufferedImage(width,height,BufferedImage.TYPE_INT_ARGB);Graphics2D g=output.createGraphics();try{g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,RenderingHints.VALUE_INTERPOLATION_BICUBIC);g.drawImage(input,0,0,width,height,null);}finally{g.dispose();}ImageIO.write(output,"PNG",target.toFile()); }
-    private static void event(String type, String id, double progress, String stage) { System.out.println("GPU_AGENT_JSON:" + GSON.toJson(new RuntimeEvent(type,id,progress,stage))); }
+    private static synchronized void event(String type, String id, double progress, String stage) {
+        long now = System.nanoTime();
+        if ("progress".equals(type) && id.equals(lastEventId) && stage.equals(lastEventStage)
+                && now - lastEventNanos < TimeUnit.SECONDS.toNanos(1)) return;
+        lastEventId = id;
+        lastEventStage = stage;
+        lastEventNanos = now;
+        System.out.println("GPU_AGENT_JSON:" + EVENT_GSON.toJson(new RuntimeEvent(type, id, progress, stage)));
+    }
 
     private record RenderJob(String id, String input, String outputDirectory, List<View> views) {}
     private record View(String id, String name, double yaw, double pitch, Double zoom, Boolean autoFill,
@@ -363,6 +494,8 @@ public final class GpuRuntimeClient implements ClientModInitializer {
                                  boolean spectatorsGenerateChunksDisabled, String renderWorld,
                                  boolean nightVisionEnabled, int nightVisionLevel) {}
     private record RuntimeEvent(String type, String id, double progress, String stage) {}
+    private record VersionConversionJob(String id, String input, String output, int targetVersion) {}
+    private record VersionConversionResult(String id, boolean success, String error) {}
     private static final class ActiveJob { final RenderJob request;final Path jobFile;final Path output;final QuickLitematicaPreview3D.HeadlessPreview preview;final long startedAt;final List<ResultImage> images=new ArrayList<>();final java.util.Set<String> retriedViews=new java.util.HashSet<>();volatile Throwable error;boolean exporting;int viewIndex;ActiveJob(RenderJob r,Path j,Path o,QuickLitematicaPreview3D.HeadlessPreview p,long s){request=r;jobFile=j;output=o;preview=p;startedAt=s;} }
     private static final class RenderException extends Exception { final String code;RenderException(String code,String message){super(message);this.code=code;} }
 }

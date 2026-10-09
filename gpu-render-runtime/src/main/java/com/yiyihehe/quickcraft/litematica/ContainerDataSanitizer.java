@@ -19,6 +19,7 @@ public final class ContainerDataSanitizer {
         if (data == null) return false;
         String id = data.getStringOrDefault("id", "").toLowerCase(Locale.ROOT);
         int separator = id.indexOf(':');
+        if (separator >= 0 && !id.substring(0, separator).equals("minecraft")) return false;
         String path = separator >= 0 ? id.substring(separator + 1) : id;
         if (!CONTAINER_TYPES.contains(path)) return false;
 

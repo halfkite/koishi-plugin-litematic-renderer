@@ -172,7 +172,7 @@ final class CloudConnection implements WebSocket.Listener, AutoCloseable {
 
     private void sendResult(String taskId, RenderModels.Result result, RenderModels.Request request) {
         debug("sendResult 开始,图片数=" + result.images().size());
-        try {
+        try (result) {
             List<RenderModels.Image> images = result.images();
             boolean forceSeparateImages = false;
             // 云端来源：本地视角表中的全部视角都参与拼接，避免新增视角只渲染不回传。

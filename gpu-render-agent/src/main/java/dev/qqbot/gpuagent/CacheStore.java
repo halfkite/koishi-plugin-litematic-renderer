@@ -36,13 +36,18 @@ final class CacheStore {
     private final Consumer<String> log;
 
     CacheStore(Path applicationRoot, AgentConfig config, Consumer<String> log) {
+        this(applicationRoot, config, log, true);
+    }
+
+    CacheStore(Path applicationRoot, AgentConfig config, Consumer<String> log, boolean rebuildIndex) {
         this.config = config;
         this.log = log == null ? ignored -> {} : log;
         this.directory = config.cacheDirectory != null && !config.cacheDirectory.isBlank()
                 ? Path.of(config.cacheDirectory).toAbsolutePath().normalize()
                 : applicationRoot.resolve("litematic-renderer-cache").toAbsolutePath().normalize();
         try {
-            ProjectionCacheIndex.rebuild(directory);
+            if (rebuildIndex) ProjectionCacheIndex.rebuild(directory);
+            if (rebuildIndex) cleanupExpiredTransientResults();
         } catch (IOException error) {
             this.log.accept("生成投影缓存索引失败，将在后续操作重试：" + error.getMessage());
         }
@@ -140,6 +145,10 @@ final class CacheStore {
             if (!Files.isDirectory(entry) || !Files.isRegularFile(aboutPath)) return null;
             JsonObject about = Protocol.GSON.fromJson(Files.readString(aboutPath), JsonObject.class);
             if (about == null || !fileHash.equals(string(about, "文件哈希"))) return null;
+            if (!shouldCacheImages(schematic.length, longValue(about, "缓存调用次数"))) {
+                invalidateImages(fileHash);
+                return null;
+            }
             String expectedSignature = configurationFingerprint(request, toolVersion, packFingerprint);
             String storedSignature = string(about, "出图配置识别数");
             if (storedSignature.isBlank()) storedSignature = string(about, "配置指纹");
@@ -231,22 +240,29 @@ final class CacheStore {
         }
 
         JsonArray imageMetadata = new JsonArray();
+        long calls = previousCallCount(entry) + 1;
+        boolean persistImages = shouldCacheImages(schematic.length, calls);
+        Path imageDirectory = persistImages ? entry : createTransientDirectory();
+        try {
+        if (!persistImages) invalidateImages(fileHash);
         List<RenderModels.Image> cachedImages = new ArrayList<>();
         for (RenderModels.Image image : images) {
             String filename = imageName(image.id());
-            Path target = entry.resolve(filename);
+            Path target = imageDirectory.resolve(filename);
             Path temporary = target.resolveSibling(filename + ".tmp");
             Files.copy(image.path(), temporary, StandardCopyOption.REPLACE_EXISTING);
             moveReplace(temporary, target);
             cachedImages.add(new RenderModels.Image(image.id(), filename, image.width(), image.height(), target));
-            JsonObject item = new JsonObject();
-            item.addProperty("id", image.id());
-            item.addProperty("文件名", filename);
-            item.addProperty("宽", image.width());
-            item.addProperty("高", image.height());
-            item.addProperty("大小", Files.size(target));
-            item.addProperty("SHA-256", sha256(Files.readAllBytes(target)));
-            imageMetadata.add(item);
+            if (persistImages) {
+                JsonObject item = new JsonObject();
+                item.addProperty("id", image.id());
+                item.addProperty("文件名", filename);
+                item.addProperty("宽", image.width());
+                item.addProperty("高", image.height());
+                item.addProperty("大小", Files.size(target));
+                item.addProperty("SHA-256", sha256(Files.readAllBytes(target)));
+                imageMetadata.add(item);
+            }
         }
 
         JsonObject about = new JsonObject();
@@ -273,7 +289,8 @@ final class CacheStore {
         about.add("视角", Protocol.GSON.toJsonTree(normalizedViews(request.views())));
         about.add("视角亮度", brightnessMetadata(request.views()));
         about.add("图片", imageMetadata);
-        about.addProperty("缓存调用次数", previousCallCount(entry) + 1);
+        about.addProperty("缓存调用次数", calls);
+        about.addProperty("图片缓存", persistImages);
         about.addProperty("渲染次数", previousRenderCount(entry) + 1);
         about.addProperty("最近缓存调用时间", Instant.now().toString());
         about.addProperty("来源", nullToDefault(source, "本地"));
@@ -287,6 +304,46 @@ final class CacheStore {
         touch(entry);
         evict(entry);
         return cachedImages;
+        } catch (IOException | RuntimeException | Error failure) {
+            if (!persistImages) RenderModels.deleteTemporaryDirectory(imageDirectory);
+            throw failure;
+        }
+    }
+
+    private void cleanupExpiredTransientResults() throws IOException {
+        Path parent = directory.resolve(".transient");
+        if (!Files.isDirectory(parent)) return;
+        long cutoff = System.currentTimeMillis() - java.time.Duration.ofDays(1).toMillis();
+        try (var entries = Files.list(parent)) {
+            for (Path entry : entries.filter(Files::isDirectory).toList()) {
+                if (entry.getFileName().toString().startsWith("result-") && Files.getLastModifiedTime(entry).toMillis() < cutoff)
+                    RenderModels.deleteTemporaryDirectory(entry);
+            }
+        }
+    }
+
+    boolean shouldCacheImages(long projectionBytes, long calls) {
+        return projectionBytes > config.cacheImageMinProjectionBytes || calls > config.cacheImageMinCalls;
+    }
+
+    boolean shouldCacheImages(String hash) {
+        Path entry = directory.resolve(hash);
+        try {
+            JsonObject about = Protocol.GSON.fromJson(Files.readString(entry.resolve(ABOUT_NAME)), JsonObject.class);
+            return shouldCacheImages(longValue(about, "投影大小"), previousCallCount(entry));
+        } catch (Exception ignored) { return false; }
+    }
+
+    Path createTransientDirectory() throws IOException {
+        Path parent = directory.resolve(".transient");
+        Files.createDirectories(parent);
+        return Files.createTempDirectory(parent, "result-");
+    }
+
+    RenderModels.Result result(RenderModels.Request request, List<RenderModels.Image> images, long elapsed, boolean hit, String gpu) {
+        Path parent = images.isEmpty() ? null : images.getFirst().path().getParent();
+        Path temporary = parent != null && parent.getParent().equals(directory.resolve(".transient")) ? parent : null;
+        return new RenderModels.Result(request.id(), images, elapsed, hit, gpu, temporary);
     }
 
     private long previousCallCount(Path entry) {

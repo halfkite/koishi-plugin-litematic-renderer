@@ -59,6 +59,7 @@ final class BotManager implements AutoCloseable {
     private final Consumer<String> log;
     private final Map<String, BotAdapter> adapters = new ConcurrentHashMap<>();
     private final Map<String, Long> handledMessages = new ConcurrentHashMap<>();
+    private final UserRenderLimiter userRenderLimiter = new UserRenderLimiter();
     private final Map<RenderedMessageKey, QuotedProjection> renderedMessages = new ConcurrentHashMap<>();
     private final Map<ObservedMessageKey, ObservedMessageIndices> observedMessageIndices = new ConcurrentHashMap<>();
     private final List<String> recentLogs = new CopyOnWriteArrayList<>();
@@ -312,6 +313,8 @@ final class BotManager implements AutoCloseable {
         SearchCommand search = parseSearchCommand(rawText);
         ProjectionSendCommand send = parseSendCommand(rawText, config.commandNames("sendProjection"));
         SendCommand materials = parseMaterialsCommand(rawText, config.commandNames("sendMaterials"));
+        ConvertProjectionVersionCommand convertVersion = parseConvertProjectionVersionCommand(
+                rawText, config.commandNames("convertProjectionVersion"));
         ViewCommand viewCommand = parseViewCommand(rawText, config.commandNames("moreViews"),
                 config.commandNames("projectionView"), config.commandNames("mapView"));
         boolean projectionList = parseProjectionListCommand(rawText, config.commandNames("projectionList"));
@@ -332,6 +335,12 @@ final class BotManager implements AutoCloseable {
             log.accept("机器人［" + profileName(message.profileId()) + "］收到帮助请求（@=" + message.mentioned()
                     + "，斜杠指令=" + slashCommand + "）");
             Thread.startVirtualThread(() -> processHelpCommand(adapter, message, slashCommand));
+            return;
+        }
+        if (convertVersion != null) {
+            log.accept("机器人［" + profileName(message.profileId()) + "］收到文字指令：convertProjectionVersion（编号="
+                    + convertVersion.ordinal() + "，目标V" + convertVersion.targetVersion() + "，@=" + message.mentioned() + "）");
+            Thread.startVirtualThread(() -> processConvertProjectionVersionCommand(adapter, message, convertVersion, slashCommand));
             return;
         }
         if (materials != null) {
@@ -418,6 +427,60 @@ final class BotManager implements AutoCloseable {
         }
     }
 
+    private void processConvertProjectionVersionCommand(BotAdapter adapter, BotMessage message,
+                                                        ConvertProjectionVersionCommand command, boolean slashCommand) {
+        AgentConfig.BotProfile profile = profile(message.profileId());
+        if (!authorizeTextCommand(adapter, message, profile, slashCommand)) return;
+        Path sourceFile = null;
+        Path output = null;
+        Path conversionDirectory = null;
+        try {
+            ProjectionSearch.SearchEntry entry = ProjectionSearch.findByOrdinal(
+                    renderer.cacheDirectory(), command.ordinal());
+            if (entry == null || !Files.isRegularFile(entry.projection())) {
+                adapter.sendText(message, "缓存里没有找到编号 " + command.ordinal() + " 的投影文件。");
+                return;
+            }
+            String filename = entry.originalFilename();
+            LitematicMetadata.Values metadata = LitematicMetadata.parse(entry.projection());
+            Long sourceVersion = metadata.litematicVersion();
+            if (sourceVersion == null || sourceVersion < 1 || sourceVersion > 7)
+                throw new IOException("不支持的投影格式版本：" + (sourceVersion == null ? "缺失" : sourceVersion));
+            int targetVersion = command.targetVersion();
+            if (sourceVersion == targetVersion) {
+                adapter.sendText(message, "编号 " + command.ordinal() + " 的投影已经是 Litematic 格式版本 "
+                        + targetVersion + "，无需转换。");
+                return;
+            }
+            Path directory = root.resolve("version-conversions");
+            String id = UUID.randomUUID().toString();
+            String outputName = convertedProjectionFilename(filename, targetVersion);
+            conversionDirectory = directory.resolve(id);
+            Files.createDirectories(conversionDirectory);
+            sourceFile = conversionDirectory.resolve("source.litematic");
+            output = conversionDirectory.resolve(outputName);
+            Files.copy(entry.projection(), sourceFile);
+            renderer.runtime().convertProjectionFormat(sourceFile, targetVersion, output, Duration.ofMinutes(30));
+            adapter.sendFile(message, output);
+            try {
+                adapter.sendText(message, convertedProjectionSuccessMessage(command.ordinal(), filename, targetVersion));
+            } catch (Throwable error) {
+                log.accept("版本转换说明发送失败：" + message(error));
+            }
+            log.accept("机器人［" + profile.name + "］已发送编号 " + command.ordinal()
+                    + " 的转换投影文件：" + outputName);
+        } catch (Throwable error) {
+            Throwable cause = error.getCause() == null ? error : error.getCause();
+            log.accept("机器人［" + profile.name + "］投影版本转换失败：" + message(cause));
+            try { adapter.sendText(message, "投影版本转换失败：" + message(cause)); }
+            catch (Throwable sendError) { log.accept("版本转换错误消息发送失败：" + message(sendError)); }
+        } finally {
+            deleteTemporary(sourceFile, "投影版本转换源文件");
+            deleteTemporary(output, "投影版本转换文件");
+            deleteTemporary(conversionDirectory, "投影版本转换目录");
+        }
+    }
+
     private void processSearchCommand(BotAdapter adapter, BotMessage message, SearchCommand search,
                                       ProjectionSendCommand send, boolean slashCommand) {
         AgentConfig.BotProfile profile = profile(message.profileId());
@@ -485,6 +548,7 @@ final class BotManager implements AutoCloseable {
             RenderModels.Request request = searchRequest(filename);
             RenderModels.Result result = renderer.submit(request, schematic, Duration.ofMillis(config.renderTimeoutMillis),
                     "搜索投影:" + profile.name, null, new RenderModels.TaskMeta(message.groupId(), message.userId())).join();
+            try (result) {
             Path infoImage = createMetadataImage(metadata, result);
             try {
                 List<String> resultIds = adapter.sendResultWithActionsTracked(message, result, metadata, infoImage,
@@ -495,6 +559,7 @@ final class BotManager implements AutoCloseable {
                 rememberRenderedMessages(message, allIds, entry.projection());
             }
             finally { deleteTemporary(infoImage, "投影信息图片"); }
+            }
             log.accept("机器人［" + profile.name + "］已发送投影：" + filename + "（编号 " + entry.ordinal() + "）");
         } catch (Throwable error) {
             String action = search == null ? "发送投影" : "搜索投影";
@@ -504,21 +569,54 @@ final class BotManager implements AutoCloseable {
         }
     }
 
-    private List<BotAction> projectionActions(int ordinal) {
+    List<BotAction> projectionActions(int ordinal) {
         if (ordinal <= 0) return List.of();
+        config.normalizeCommandDefinitions();
         List<BotAction> actions = new ArrayList<>();
-        if (!config.commandNames("sendMaterials").isEmpty())
-            actions.add(new BotAction("导出材料", "/" + commandName("sendMaterials", "导出材料") + ordinal));
-        if (!config.commandNames("moreViews").isEmpty())
-            actions.add(new BotAction("更多视图", "/" + commandName("moreViews", "更多视图") + ordinal));
-        if (!config.commandNames("mapView").isEmpty())
-            actions.add(new BotAction("地图视图", "/" + commandName("mapView", "地图视图") + ordinal));
+        for (String id : List.of("sendMaterials", "moreViews", "convertProjectionVersion", "sendProjection",
+                "projectionView", "mapView", "projectionList", "help", "introduction", "search")) {
+            AgentConfig.CommandDefinition definition = config.commands.stream()
+                    .filter(command -> id.equals(command.id)).findFirst().orElse(null);
+            if (definition == null || !definition.enabled || !definition.showInRenderActions) continue;
+            String command = renderActionCommand(definition, ordinal);
+            if (command == null) continue;
+            String label = definition.renderActionLabel == null || definition.renderActionLabel.isBlank()
+                    ? AgentConfig.defaultRenderActionLabel(id, definition.name) : definition.renderActionLabel;
+            actions.add(new BotAction(label, command, !"search".equals(id)));
+        }
         return List.copyOf(actions);
+    }
+
+    private static String renderActionCommand(AgentConfig.CommandDefinition definition, int ordinal) {
+        String prefix = "/" + definition.name;
+        return switch (definition.id) {
+            case "search" -> prefix + " ";
+            case "sendProjection", "sendMaterials", "moreViews", "mapView" -> prefix + ordinal;
+            case "convertProjectionVersion" -> prefix + ordinal + " 6";
+            case "projectionView" -> prefix + ordinal + " 正轴视图";
+            case "projectionList", "help", "introduction" -> prefix;
+            default -> null;
+        };
+    }
+
+    static String convertedProjectionFilename(String originalFilename, int targetVersion) {
+        String filename = CacheStore.safeProjectionFilename(originalFilename);
+        boolean hasExtension = filename.toLowerCase(java.util.Locale.ROOT).endsWith(".litematic");
+        String extension = hasExtension ? filename.substring(filename.length() - ".litematic".length()) : ".litematic";
+        String stem = hasExtension ? filename.substring(0, filename.length() - ".litematic".length()) : filename;
+        return CacheStore.safeProjectionFilename(stem + "-v" + targetVersion + extension);
+    }
+
+    static String convertedProjectionSuccessMessage(int ordinal, String originalFilename, int targetVersion) {
+        String filename = CacheStore.safeProjectionFilename(originalFilename);
+        String name = filename.replaceFirst("(?i)\\.litematic$", "");
+        return ordinal + "号 " + name + " 已转换为 Litematic 格式 V" + targetVersion
+                + "，V5对应1.13-1.17；V6对应1.18-1.20.4；V7对应1.21+；目标游戏没有的方块仍无法显示";
     }
 
     private String introductionText() {
         List<String> enabledCommands = new ArrayList<>();
-        for (String id : List.of("search", "sendProjection", "sendMaterials", "projectionList", "moreViews", "projectionView", "mapView", "help")) {
+        for (String id : List.of("search", "sendProjection", "sendMaterials", "projectionList", "convertProjectionVersion", "moreViews", "projectionView", "help")) {
             List<String> names = config.commandNames(id);
             if (!names.isEmpty()) enabledCommands.add("/" + names.getFirst());
         }
@@ -618,10 +716,12 @@ final class BotManager implements AutoCloseable {
             RenderModels.Result result = renderer.submitAuxiliary(request, schematic,
                     Duration.ofMillis(config.renderTimeoutMillis), "投影视图:" + profile.name,
                     new RenderModels.TaskMeta(message.groupId(), message.userId())).join();
+            try (result) {
             infoImage = ProjectionInfoCardRenderer.createViewComposite(entry.displayName(), command.ordinal(),
                     mapArt ? "地图视图" : command.viewName(), result.images(), root.resolve("projection-info"));
             List<String> ids = adapter.sendResultTracked(message, result, "", infoImage);
             rememberRenderedMessages(message, ids, entry.projection());
+            }
         } catch (Throwable error) {
             log.accept("投影视图渲染失败：" + message(error));
             try { adapter.sendText(message, "投影视图渲染失败：" + message(error)); }
@@ -858,6 +958,23 @@ final class BotManager implements AutoCloseable {
         return false;
     }
 
+    static ConvertProjectionVersionCommand parseConvertProjectionVersionCommand(String text, List<String> names) {
+        if (text == null || names == null) return null;
+        for (String name : names) {
+            if (name == null || name.isBlank()) continue;
+            java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                    "^[/!]?" + java.util.regex.Pattern.quote(name) + "\\s*(\\d+)(?:\\s+([67]))?\\s*$",
+                    java.util.regex.Pattern.CASE_INSENSITIVE).matcher(text.trim());
+            if (!matcher.matches()) continue;
+            try {
+                int ordinal = Integer.parseInt(matcher.group(1));
+                int targetVersion = matcher.group(2) == null ? 6 : Integer.parseInt(matcher.group(2));
+                return new ConvertProjectionVersionCommand(ordinal, targetVersion);
+            } catch (NumberFormatException ignored) { return null; }
+        }
+        return null;
+    }
+
     private String commandName(String id, String fallback) {
         List<String> names = config.commandNames(id);
         return names.isEmpty() ? fallback : names.getFirst();
@@ -881,7 +998,7 @@ final class BotManager implements AutoCloseable {
     private String configuredCommandCandidate(String text) {
         if (text == null || text.isBlank()) return "";
         String normalized = text.toLowerCase(java.util.Locale.ROOT);
-        for (String id : List.of("search", "sendProjection", "sendMaterials", "projectionList")) {
+        for (String id : List.of("search", "sendProjection", "sendMaterials", "projectionList", "convertProjectionVersion")) {
             for (String name : config.commandNames(id)) {
                 if (name != null && !name.isBlank() && normalized.contains(name.toLowerCase(java.util.Locale.ROOT))) return id;
             }
@@ -1176,10 +1293,24 @@ final class BotManager implements AutoCloseable {
         if (message.direct() && !profile.allowPrivateRender) return;
         if (!message.direct() && !isGroupAllowed(profile, message.groupId())) return;
 
-        BotAttachment source = message.attachments().stream()
-                .filter(item -> item != null && isLitematic(item.name(), item.url()))
-                .findFirst().orElse(null);
-        if (source == null) return;
+        for (BotAttachment source : message.attachments()) {
+            if (source == null || !isLitematic(source.name(), source.url())) continue;
+            UserRenderLimiter.Decision decision = userRenderLimiter.acquire(message.profileId(), message.userId(),
+                    config.userRenderLimitEnabled, config.userRenderWindowSeconds, config.userRenderMaxFiles);
+            if (!decision.allowed()) {
+                String notice = "单人 CD：每 " + config.userRenderWindowSeconds + " 秒最多接收 "
+                        + config.userRenderMaxFiles + " 个投影文件。此文件不下载、不进入渲染队列，请在 "
+                        + decision.retryAfterSeconds() + " 秒后重新发送。";
+                log.accept("机器人［" + profile.name + "］用户 " + message.userId() + "：" + notice);
+                try { adapter.sendText(message, notice); }
+                catch (Throwable error) { log.accept("机器人限流提示发送失败：" + message(error)); }
+                continue;
+            }
+            processAttachment(adapter, message, profile, source);
+        }
+    }
+
+    private void processAttachment(BotAdapter adapter, BotMessage message, AgentConfig.BotProfile profile, BotAttachment source) {
         try {
             BotAttachment resolved = adapter.resolveAttachment(message, source).join();
             if (resolved == null) throw new IOException("附件解析失败");
@@ -1192,6 +1323,7 @@ final class BotManager implements AutoCloseable {
                     views, null, Main.VERSION, null);
             RenderModels.Result result = renderer.submit(request, schematic, Duration.ofMillis(config.renderTimeoutMillis),
                     "机器人:" + profile.name, null, new RenderModels.TaskMeta(message.groupId(), message.userId())).join();
+            try (result) {
             Path projection = cachedProjection(schematic, filename);
             int ordinal = ordinalOf(projection);
             String metadata = metadata(filename, schematic, ordinal);
@@ -1206,11 +1338,14 @@ final class BotManager implements AutoCloseable {
             }
             finally { deleteTemporary(infoImage, "投影信息图片"); }
             log.accept("机器人［" + profile.name + "］已处理投影：" + filename + (result.cacheHit() ? "（缓存命中）" : ""));
+            }
         } catch (Throwable error) {
             Throwable cause = error.getCause() == null ? error : error.getCause();
             updateDownloadProgress(attachmentName(message), 0, 0, false, message(cause));
             log.accept("机器人［" + profile.name + "］投影处理失败：" + message(cause));
-            try { adapter.sendText(message, "投影渲染失败，请检查渲染器配置或导出诊断文件。\n" + message(cause)); }
+            try { adapter.sendText(message, cause instanceof RenderService.RenderFailure failure && "TIMEOUT".equals(failure.code)
+                    ? "投影渲染超时，已取消此任务。\n" + message(cause)
+                    : "投影渲染失败，请检查渲染器配置或导出诊断文件。\n" + message(cause)); }
             catch (Throwable sendError) { log.accept("机器人错误消息发送失败：" + message(sendError)); }
         }
     }
@@ -1386,6 +1521,7 @@ final class BotManager implements AutoCloseable {
     record SearchCommand(String keyword) {}
     record ProjectionSendCommand(Integer ordinal, String exactName) {}
     record SendCommand(int index, String keyword) {}
+    record ConvertProjectionVersionCommand(int ordinal, int targetVersion) {}
     record ViewCommand(String action, int ordinal, String viewName) {}
     private record ConversationKey(String profileId, String groupId, String userId, boolean direct) {
         static ConversationKey of(BotMessage message) {

@@ -17,6 +17,7 @@ final class NbtReader {
     private NbtReader() {}
 
     static Map<String, Object> read(Path path) throws IOException {
+        RenderCancellation.check();
         try (InputStream file = Files.newInputStream(path);
              BufferedInputStream buffered = new BufferedInputStream(file)) {
             buffered.mark(2);
@@ -34,6 +35,7 @@ final class NbtReader {
     }
 
     private static Object value(DataInputStream input, int type) throws IOException {
+        RenderCancellation.check();
         return switch (type) {
             case 0 -> null;
             case 1 -> input.readByte();
@@ -52,12 +54,18 @@ final class NbtReader {
             case 10 -> compound(input);
             case 11 -> {
                 int[] values = new int[input.readInt()];
-                for (int index = 0; index < values.length; index++) values[index] = input.readInt();
+                for (int index = 0; index < values.length; index++) {
+                    if ((index & 4095) == 0) RenderCancellation.check();
+                    values[index] = input.readInt();
+                }
                 yield values;
             }
             case 12 -> {
                 long[] values = new long[input.readInt()];
-                for (int index = 0; index < values.length; index++) values[index] = input.readLong();
+                for (int index = 0; index < values.length; index++) {
+                    if ((index & 4095) == 0) RenderCancellation.check();
+                    values[index] = input.readLong();
+                }
                 yield values;
             }
             default -> throw new IOException("Unsupported NBT tag type: " + type);
@@ -67,6 +75,7 @@ final class NbtReader {
     private static Map<String, Object> compound(DataInputStream input) throws IOException {
         Map<String, Object> result = new LinkedHashMap<>();
         while (true) {
+            RenderCancellation.check();
             int type = input.readUnsignedByte();
             if (type == 0) return result;
             result.put(readString(input), value(input, type));

@@ -97,6 +97,68 @@ class BotManagerCommandTest {
     }
 
     @Test
+    void parsesProjectionVersionConversionByOrdinalAndDefaultsToVersionSix() {
+        assertEquals(new BotManager.ConvertProjectionVersionCommand(1321, 6),
+                BotManager.parseConvertProjectionVersionCommand("/转换投影版本 1321", List.of("转换投影版本")));
+        assertEquals(new BotManager.ConvertProjectionVersionCommand(1321, 7),
+                BotManager.parseConvertProjectionVersionCommand("/转换投影版本1321 7", List.of("转换投影版本")));
+        assertEquals(new BotManager.ConvertProjectionVersionCommand(42, 6),
+                BotManager.parseConvertProjectionVersionCommand("转换版本 42", List.of("转换版本")));
+        assertNull(BotManager.parseConvertProjectionVersionCommand("/转换投影版本", List.of("转换投影版本")));
+        assertNull(BotManager.parseConvertProjectionVersionCommand("/转换投影版本 42 5", List.of("转换投影版本")));
+        assertNull(BotManager.parseConvertProjectionVersionCommand("/版本转换 6", List.of("转换投影版本")));
+    }
+
+    @Test
+    void conversionKeepsTheOriginalNameAndAppendsVersionSuffix() {
+        assertEquals("投影名称-v6.litematic",
+                BotManager.convertedProjectionFilename("投影名称.litematic", 6));
+        assertEquals("原始投影 名称-v7.LITEMATIC",
+                BotManager.convertedProjectionFilename("原始投影 名称.LITEMATIC", 7));
+        assertEquals("3074号 投影名称 已转换为 Litematic 格式 V7，V5对应1.13-1.17；V6对应1.18-1.20.4；V7对应1.21+；目标游戏没有的方块仍无法显示",
+                BotManager.convertedProjectionSuccessMessage(3074, "投影名称.litematic", 7));
+    }
+
+    @Test
+    void renderedResultButtonsAreConfigurableAndPutMapViewInsideMoreViews(@TempDir Path temporaryDirectory) {
+        AgentConfig config = new AgentConfig();
+        BotManager manager = new BotManager(temporaryDirectory, temporaryDirectory.resolve("agent.json"),
+                config, null, null);
+
+        List<BotAction> defaults = manager.projectionActions(42);
+        assertEquals(List.of("导出材料", "更多视图", "转换为V6"),
+                defaults.stream().map(BotAction::label).toList());
+        assertEquals("/转换投影版本42 6", defaults.getLast().command());
+
+        AgentConfig.CommandDefinition convertCommand = config.commands.stream()
+                .filter(command -> "convertProjectionVersion".equals(command.id)).findFirst().orElseThrow();
+        convertCommand.name = "格式转换";
+        assertEquals("/格式转换42 6", manager.projectionActions(42).getLast().command());
+
+        convertCommand.enabled = false;
+        assertEquals(List.of("导出材料", "更多视图"),
+                manager.projectionActions(42).stream().map(BotAction::label).toList());
+        assertTrue(BotManager.ADDITIONAL_VIEW_NAMES.contains("地图视图"));
+    }
+
+    @Test
+    void commandCanAddAConfiguredPrefillActionToRenderedResults(@TempDir Path temporaryDirectory) {
+        AgentConfig config = new AgentConfig();
+        AgentConfig.CommandDefinition search = config.commands.stream()
+                .filter(command -> "search".equals(command.id)).findFirst().orElseThrow();
+        search.showInRenderActions = true;
+        search.renderActionLabel = "搜索更多";
+
+        BotManager manager = new BotManager(temporaryDirectory, temporaryDirectory.resolve("agent.json"),
+                config, null, null);
+        BotAction action = manager.projectionActions(42).getLast();
+
+        assertEquals("搜索更多", action.label());
+        assertEquals("/搜索投影 ", action.command());
+        assertFalse(action.enter());
+    }
+
+    @Test
     void stripsVisibleBotMentionBeforeCommandParsing() {
         assertEquals("搜索投影 刷", BotManager.normalizeCommandText("@Lbot 搜索投影 刷"));
         assertEquals("搜索投影 刷", BotManager.normalizeCommandText("<@!bot-open-id> 搜索投影 刷"));
@@ -153,5 +215,6 @@ class BotManagerCommandTest {
         assertFalse(config.commandNames("sendMaterials").contains("发送材料"));
         assertFalse(config.commandNames("sendMaterials").contains("材料"));
         assertTrue(config.commandNames("projectionList").contains("投影列表"));
+        assertTrue(config.commandNames("convertProjectionVersion").contains("转换投影版本"));
     }
 }

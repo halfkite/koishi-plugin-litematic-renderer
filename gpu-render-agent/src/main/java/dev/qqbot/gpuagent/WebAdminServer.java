@@ -171,11 +171,14 @@ final class WebAdminServer implements AutoCloseable {
         if (updated.maxFileSizeKb < 1 || updated.privateMaxFileSizeKb < 1) throw new IllegalArgumentException("全局文件大小上限必须为正整数 KB");
         if (updated.projectionSearchResultLimit < 1 || updated.projectionSearchResultLimit > 100) throw new IllegalArgumentException("搜索结果数量必须为 1-100");
         if (updated.cacheRecentImageMaxBytes < 0 || updated.cacheHistoricalImageMaxBytes < 0) throw new IllegalArgumentException("近期和历史图片缓存上限不能为负数");
+        if (updated.cacheImageMinProjectionBytes < 0 || updated.cacheImageMinCalls < 0) throw new IllegalArgumentException("图片缓存条件不能为负数");
         updated.cacheMaxBytes = updated.cacheRecentImageMaxBytes + updated.cacheHistoricalImageMaxBytes;
         if (!"compact".equalsIgnoreCase(updated.metadataFormat)
                 && !"image".equalsIgnoreCase(updated.metadataFormat)) updated.metadataFormat = "full";
         if (updated.botProfiles != null) for (AgentConfig.BotProfile profile : updated.botProfiles) if (profile != null) profile.normalize();
         updated.normalizeCommandDefinitions();
+        updated.validateRenderActionSettings();
+        updated.validateRenderLimits();
         OfficialSlashCommandPanels.validateConfiguredNames(updated);
         boolean restartRequired = !java.util.Objects.equals(oldBindHost, updated.webBindHost) || oldPort != updated.webPort
                 || config.webEnabled != updated.webEnabled
@@ -246,12 +249,17 @@ final class WebAdminServer implements AutoCloseable {
         if (!"GET".equals(exchange.getRequestMethod())) { json(exchange, 405, error("method not allowed")); return; }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
-            List<Path> files = List.of(
+            List<Path> files = new ArrayList<>(List.of(
                     root.resolve("agent.log"), root.resolve("agent-gui.log"), root.resolve("agent-gui.log.old"),
                     root.resolve("agent-crash.log"), root.resolve("send-debug.log"), root.resolve("cache-debug.log"),
                     root.resolve("runtime-crash.log"), root.resolve("runtime/launch-diagnostics.txt"),
                     root.resolve("runtime/minecraft-runtime.log"), root.resolve("runtime/minecraft-runtime-2.log"),
-                    root.resolve("runtime/minecraft-runtime-3.log"));
+                    root.resolve("runtime/minecraft-runtime-3.log"), root.resolve("runtime/minecraft-runtime-4.log"),
+                    root.resolve("runtime/runtime-stall.log")));
+            for (int slot = 0; slot < 4; slot++) {
+                String name = slot == 0 ? "minecraft-runtime" : "minecraft-runtime-" + (slot + 1);
+                files.add(root.resolve("runtime/" + name + "-before-recovery.log"));
+            }
             for (Path file : files) addZipFile(zip, file, null);
             if (Files.isRegularFile(configPath)) {
                 JsonObject safe = redactedConfig();

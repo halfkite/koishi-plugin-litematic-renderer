@@ -25,9 +25,10 @@ class HelpCardRendererTest {
         assertFalse(text.contains("/投影搜索"));
         assertFalse(text.contains("/发送材料"));
         assertTrue(text.contains("/投影列表：导出全部缓存投影的 CSV 清单。"));
-        assertTrue(text.contains("/更多视图123："));
+        assertTrue(text.contains("/更多视图123：显示详细视图按钮，含地图视图。"));
         assertTrue(text.contains("/投影视图123 正视图："));
-        assertTrue(text.contains("/地图视图123："));
+        assertTrue(text.contains("/转换投影版本123 [6/7]：转换缓存投影格式，默认 6。"));
+        assertFalse(text.contains("/地图视图"));
         assertTrue(text.contains("/介绍投影BOT："));
         assertTrue(text.contains("/帮助：显示指令帮助。"));
     }

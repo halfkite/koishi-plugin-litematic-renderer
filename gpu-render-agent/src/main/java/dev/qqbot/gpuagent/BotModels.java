@@ -60,7 +60,9 @@ record BotMessage(String profileId, String messageId, String userId, String grou
 record BotStatus(String profileId, String name, String type, boolean enabled, boolean connected,
                  String state, long reconnects, String lastError, long lastEventAt) {}
 
-record BotAction(String label, String command) {}
+record BotAction(String label, String command, boolean enter) {
+    BotAction(String label, String command) { this(label, command, true); }
+}
 
 record AnnouncementGroup(String profileId, String profileName, String type, String groupId,
                          String groupName, boolean connected) {}

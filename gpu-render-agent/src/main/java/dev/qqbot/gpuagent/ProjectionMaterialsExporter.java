@@ -20,10 +20,9 @@ import java.util.zip.ZipOutputStream;
 
 /** Exports projection and aggregated container materials to an Excel workbook. */
 final class ProjectionMaterialsExporter {
-    private static final int COLUMN_COUNT = 10;
+    private static final int COLUMN_COUNT = 9;
     private static final double[] COLUMN_WIDTHS = {
-            14.0, 7.54545454545455, 7.54545454545455, 7.54545454545455, 10.6363636363636,
-            14.0, 9.54545454545454, 11.8181818181818, 7.54545454545455, 7.54545454545455
+            15.625, 18.625, 8.625, 8.625, 8.625, 15.625, 18.625, 8.625, 8.625
     };
 
     private ProjectionMaterialsExporter() {}
@@ -60,36 +59,84 @@ final class ProjectionMaterialsExporter {
         rows.add(row("数据版本", number(metadata == null ? null : metadata.minecraftDataVersion())));
         rows.add(row("投影材料种类", Integer.toString(report.blocks().size())));
         rows.add(row("容器内材料种类", Integer.toString(report.containerItems().size())));
+        List<Integer> mergedValueRows = new ArrayList<>();
+        if (report.waterContainingBlockCount() > 0) {
+            rows.add(row("含水方块数量", waterBlockSummary(report, translations)));
+            mergedValueRows.add(rows.size());
+        }
+        if (report.lavaCauldronCount() > 0) {
+            rows.add(row("含岩浆炼药锅数量", report.lavaCauldronCount() + "（炼药锅）"));
+            mergedValueRows.add(rows.size());
+        }
+        if (!report.nonItemBlocks().isEmpty()) {
+            rows.add(row("未计入材料的无物品方块", nonItemBlockSummary(report.nonItemBlocks(), translations)));
+            mergedValueRows.add(rows.size());
+        }
         rows.add(emptyRow());
+        int sectionHeaderRow = rows.size() + 1;
         rows.add(row("投影材料列表", "", "", "", "", "投影容器列表"));
-        rows.add(row("物品名称", "物品ID", "总数量", "盒数量", "", "容器名称", "容器物品", "容器物品ID", "总数量", "盒数量"));
+        int columnHeaderRow = rows.size() + 1;
+        rows.add(row("物品名称", "物品ID", "总数量", "盒数量", "", "容器物品", "容器物品ID", "总数量", "盒数量"));
 
         int count = Math.max(report.blocks().size(), report.containerItems().size());
         for (int index = 0; index < count; index++) {
             String[] values = emptyRow();
             if (index < report.blocks().size()) {
                 LitematicMaterials.Material block = report.blocks().get(index);
-                values[0] = localizedName(block.id(), true, translations);
-                values[1] = displayItemId(block.id());
-                values[2] = Long.toString(block.count());
-                values[3] = boxCount(block.count());
+                if ("minecraft:iron_chain".equals(block.id())
+                        && report.oldChainBlocks() + report.newChainBlocks() > 0) {
+                    values[0] = "铁链/锁链";
+                    values[1] = "iron_chain/chain";
+                    values[2] = pairedCount(report.newChainBlocks(), report.oldChainBlocks());
+                    values[3] = pairedBoxCount(report.newChainBlocks(), report.oldChainBlocks());
+                } else {
+                    values[0] = localizedName(block.id(), true, translations);
+                    values[1] = displayItemId(block.id());
+                    values[2] = Long.toString(block.count());
+                    values[3] = boxCount(block.count());
+                }
             }
             if (index < report.containerItems().size()) {
                 LitematicMaterials.Material item = report.containerItems().get(index);
-                values[5] = "容器内材料（汇总）";
-                values[6] = localizedName(item.id(), false, translations);
-                values[7] = displayItemId(item.id());
-                values[8] = Long.toString(item.count());
-                values[9] = boxCount(item.count());
+                if ("minecraft:iron_chain".equals(item.id())
+                        && report.oldChainContainerItems() + report.newChainContainerItems() > 0) {
+                    values[5] = "铁链/锁链";
+                    values[6] = "iron_chain/chain";
+                    values[7] = pairedCount(report.newChainContainerItems(), report.oldChainContainerItems());
+                    values[8] = pairedBoxCount(report.newChainContainerItems(), report.oldChainContainerItems());
+                } else {
+                    values[5] = localizedName(item.id(), false, translations);
+                    values[6] = displayItemId(item.id());
+                    values[7] = Long.toString(item.count());
+                    values[8] = boxCount(item.count());
+                }
             }
             rows.add(values);
         }
 
-        writeWorkbook(output, rows);
+        writeWorkbook(output, rows, sectionHeaderRow, columnHeaderRow, mergedValueRows);
         return output;
     }
 
-    private static void writeWorkbook(Path output, List<String[]> rows) throws IOException {
+    private static String waterBlockSummary(LitematicMaterials.Report report, Map<String, String> translations) {
+        List<String> details = new ArrayList<>();
+        for (LitematicMaterials.Material block : report.waterloggedBlocks()) {
+            details.add(localizedName(block.id(), true, translations) + " × " + block.count());
+        }
+        if (report.waterBlockCount() > 0) details.add("水方块 × " + report.waterBlockCount());
+        return report.waterContainingBlockCount() + "（" + String.join("、", details) + "）";
+    }
+
+    private static String nonItemBlockSummary(List<LitematicMaterials.Material> blocks, Map<String, String> translations) {
+        List<String> details = new ArrayList<>();
+        for (LitematicMaterials.Material block : blocks) {
+            details.add(localizedName(block.id(), true, translations) + "（" + block.id() + "）× " + block.count());
+        }
+        return String.join("、", details);
+    }
+
+    private static void writeWorkbook(Path output, List<String[]> rows, int sectionHeaderRow,
+                                      int columnHeaderRow, List<Integer> mergedValueRows) throws IOException {
         try (OutputStream file = Files.newOutputStream(output);
              ZipOutputStream zip = new ZipOutputStream(file, StandardCharsets.UTF_8)) {
             writeEntry(zip, "[Content_Types].xml", """
@@ -124,7 +171,7 @@ final class ProjectionMaterialsExporter {
             writeEntry(zip, "xl/styles.xml", """
                     <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
                     <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-                    <fonts count="2"><font><sz val="11"/><name val="宋体"/><family val="2"/></font><font><b/><sz val="11"/><name val="宋体"/><family val="2"/></font></fonts>
+                    <fonts count="2"><font><sz val="11"/><name val="微软雅黑"/><family val="2"/></font><font><b/><sz val="11"/><name val="微软雅黑"/><family val="2"/></font></fonts>
                     <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
                     <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
                     <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
@@ -136,7 +183,7 @@ final class ProjectionMaterialsExporter {
             StringBuilder sheet = new StringBuilder("""
                     <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
                     <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-                    <dimension ref="A1:J%s"/><sheetViews><sheetView workbookViewId="0"/></sheetViews>
+                    <dimension ref="A1:I%s"/><sheetViews><sheetView workbookViewId="0"/></sheetViews>
                     <sheetFormatPr defaultRowHeight="18" defaultColWidth="9.81818181818182"/><cols>
                     """.formatted(rows.size()));
             for (int index = 0; index < COLUMN_COUNT; index++) {
@@ -152,15 +199,19 @@ final class ProjectionMaterialsExporter {
                     String value = values[column];
                     if (value == null || value.isEmpty()) continue;
                     String reference = columnName(column) + excelRow;
-                    boolean bold = excelRow == 1 || excelRow == 13 || excelRow == 14;
+                    boolean bold = excelRow == 1 || excelRow == sectionHeaderRow || excelRow == columnHeaderRow;
                     sheet.append("<c r=\"").append(reference).append("\" t=\"inlineStr\"")
                             .append(bold ? " s=\"1\"" : "").append("><is><t xml:space=\"preserve\">")
                             .append(escapeXml(value)).append("</t></is></c>");
                 }
                 sheet.append("</row>");
             }
-            sheet.append("</sheetData><mergeCells count=\"1\"><mergeCell ref=\"B1:J1\"/></mergeCells>")
-                    .append("<pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/></worksheet>");
+            List<String> mergedRanges = new ArrayList<>();
+            mergedRanges.add("B1:I1");
+            for (int row : mergedValueRows) mergedRanges.add("B" + row + ":I" + row);
+            sheet.append("</sheetData><mergeCells count=\"").append(mergedRanges.size()).append("\">");
+            for (String range : mergedRanges) sheet.append("<mergeCell ref=\"").append(range).append("\"/>");
+            sheet.append("</mergeCells><pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/></worksheet>");
             writeEntry(zip, "xl/worksheets/sheet1.xml", sheet.toString());
         }
     }
@@ -232,6 +283,14 @@ final class ProjectionMaterialsExporter {
 
     private static String boxCount(long total) {
         return BigDecimal.valueOf(total).divide(BigDecimal.valueOf(1728), 1, RoundingMode.UP).toPlainString();
+    }
+
+    private static String pairedCount(long currentId, long oldId) {
+        return currentId + "/" + oldId;
+    }
+
+    private static String pairedBoxCount(long currentId, long oldId) {
+        return boxCount(currentId) + "/" + boxCount(oldId);
     }
 
     private static String size(int[] dimensions) {

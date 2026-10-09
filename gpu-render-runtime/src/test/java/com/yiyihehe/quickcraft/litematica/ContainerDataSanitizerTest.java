@@ -47,4 +47,11 @@ class ContainerDataSanitizerTest {
         assertFalse(ContainerDataSanitizer.stripInventory(data));
         assertTrue(data.containsLenient("Items"));
     }
+
+    @Test
+    void leavesModdedContainersOnTheirNormalConversionPath() {
+        CompoundData data = new CompoundData().putString("id", "example:furnace").putString("Items", "inventory");
+        assertFalse(ContainerDataSanitizer.stripInventory(data));
+        assertTrue(data.containsLenient("Items"));
+    }
 }

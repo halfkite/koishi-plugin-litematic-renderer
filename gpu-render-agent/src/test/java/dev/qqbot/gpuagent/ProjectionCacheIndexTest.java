@@ -42,11 +42,7 @@ class ProjectionCacheIndexTest {
             assertTrue(ordinal(cache, third) > Math.max(firstOrdinal, secondOrdinal));
             assertNull(ProjectionSearch.findByOrdinal(cache, firstOrdinal));
         } finally {
-            List<Path> paths;
-            try (var walk = Files.walk(cache)) {
-                paths = walk.sorted(java.util.Comparator.reverseOrder()).toList();
-            }
-            for (Path path : paths) Files.deleteIfExists(path);
+            TestDirectoryCleanup.deleteTree(cache);
         }
     }
 

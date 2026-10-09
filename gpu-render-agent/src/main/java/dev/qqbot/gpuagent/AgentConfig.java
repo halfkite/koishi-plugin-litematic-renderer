@@ -23,7 +23,10 @@ public final class AgentConfig {
     public boolean cloudEnabled = false;
     public String listenHost = "127.0.0.1";
     public int listenPort = 39080;
-    public int renderTimeoutMillis = 240_000;
+    public volatile int renderTimeoutMillis = 240_000;
+    public volatile boolean userRenderLimitEnabled = true;
+    public volatile int userRenderWindowSeconds = 60;
+    public volatile int userRenderMaxFiles = 3;
     /** 渲染缓存目录（空 = 数据目录下 cache）；存放投影、渲染图与记录文件。 */
     public String cacheDirectory = "";
     /** 是否在缓存目录保存投影文件本身。 */
@@ -34,6 +37,8 @@ public final class AgentConfig {
     public long cacheRecentImageMaxBytes = 8L * 1024 * 1024 * 1024;
     /** 投影保存时间超过一年的完整渲染图和搜索缩略图容量上限。默认 2GB。 */
     public long cacheHistoricalImageMaxBytes = 2L * 1024 * 1024 * 1024;
+    public long cacheImageMinProjectionBytes = 2L * 1024 * 1024;
+    public long cacheImageMinCalls = 30;
     /** 导出缓存投影时是否保留每个投影的 SHA-256 哈希目录；默认压平目录。 */
     public boolean exportKeepHashDirectories = false;
     /** 渲染分辨率（全局默认宽/高），主界面可改。 */
@@ -117,6 +122,7 @@ public final class AgentConfig {
                 new CommandDefinition("sendProjection", "发送投影"),
                 new CommandDefinition("sendMaterials", "导出材料"),
                 new CommandDefinition("projectionList", "投影列表"),
+                new CommandDefinition("convertProjectionVersion", "转换投影版本"),
                 new CommandDefinition("help", "帮助"),
                 new CommandDefinition("introduction", "介绍投影BOT"),
                 new CommandDefinition("moreViews", "更多视图"),
@@ -133,6 +139,8 @@ public final class AgentConfig {
         public String defaultName = "";
         public String name = "";
         public boolean enabled = true;
+        public boolean showInRenderActions;
+        public String renderActionLabel = "";
         public List<CommandAlias> aliases = new ArrayList<>();
 
         public CommandDefinition() {}
@@ -141,6 +149,8 @@ public final class AgentConfig {
             this.id = id;
             this.defaultName = defaultName;
             this.name = defaultName;
+            this.showInRenderActions = defaultShowInRenderActions(id);
+            this.renderActionLabel = defaultRenderActionLabel(id, defaultName);
         }
 
         void normalize() {
@@ -148,6 +158,9 @@ public final class AgentConfig {
             if (defaultName == null || defaultName.isBlank()) defaultName = name == null ? "" : name.trim();
             if (name == null || name.isBlank()) name = defaultName;
             name = name.trim();
+            if (renderActionLabel == null || renderActionLabel.isBlank())
+                renderActionLabel = defaultRenderActionLabel(id, name);
+            renderActionLabel = renderActionLabel.trim();
             if (aliases == null) aliases = new ArrayList<>();
             List<CommandAlias> clean = new ArrayList<>();
             java.util.HashSet<String> seen = new java.util.HashSet<>();
@@ -160,6 +173,22 @@ public final class AgentConfig {
             }
             aliases = clean;
         }
+    }
+
+    static boolean defaultShowInRenderActions(String id) {
+        return "sendMaterials".equals(id) || "moreViews".equals(id) || "convertProjectionVersion".equals(id);
+    }
+
+    static String defaultRenderActionLabel(String id, String commandName) {
+        return switch (id == null ? "" : id) {
+            case "sendMaterials" -> "导出材料";
+            case "moreViews" -> "更多视图";
+            case "convertProjectionVersion" -> "转换为V6";
+            case "projectionView" -> "正轴视图";
+            case "mapView" -> "地图视图";
+            case "introduction" -> "机器人介绍";
+            default -> commandName == null ? "" : commandName.trim();
+        };
     }
 
     public static final class CommandAlias {
@@ -208,6 +237,17 @@ public final class AgentConfig {
             }
         }
         commands = normalized;
+    }
+
+    void validateRenderActionSettings() {
+        if (commands == null) return;
+        for (CommandDefinition definition : commands) {
+            if (definition == null || !definition.showInRenderActions) continue;
+            if (definition.renderActionLabel == null || definition.renderActionLabel.isBlank())
+                throw new IllegalArgumentException("渲染结果按钮显示名称不能为空：" + definition.name);
+            if (definition.renderActionLabel.codePointCount(0, definition.renderActionLabel.length()) > 20)
+                throw new IllegalArgumentException("渲染结果按钮显示名称不能超过 20 个字符：" + definition.renderActionLabel);
+        }
     }
 
     public List<String> commandNames(String id) {
@@ -357,6 +397,14 @@ public final class AgentConfig {
         }
     }
 
+    void validateRenderLimits() {
+        if (renderTimeoutMillis < 1_000) throw new IllegalArgumentException("渲染超时不能少于 1 秒");
+        if (userRenderWindowSeconds < 1 || userRenderWindowSeconds > 86_400)
+            throw new IllegalArgumentException("单人 CD 统计时间必须为 1-86400 秒");
+        if (userRenderMaxFiles < 1 || userRenderMaxFiles > 10_000)
+            throw new IllegalArgumentException("单人 CD 文件数必须为 1-10000");
+    }
+
     public static AgentConfig load(Path file) throws IOException {
         boolean newFile = !Files.exists(file);
         String json = newFile ? "{}" : Files.readString(file);
@@ -375,10 +423,12 @@ public final class AgentConfig {
         config.cacheRecentImageMaxBytes = Math.max(0, config.cacheRecentImageMaxBytes);
         config.cacheHistoricalImageMaxBytes = Math.max(0, config.cacheHistoricalImageMaxBytes);
         config.cacheMaxBytes = config.cacheRecentImageMaxBytes + config.cacheHistoricalImageMaxBytes;
+        config.cacheImageMinProjectionBytes = Math.max(0, config.cacheImageMinProjectionBytes);
+        config.cacheImageMinCalls = Math.max(0, config.cacheImageMinCalls);
         if (config.resourcePacks == null) config.resourcePacks = new ArrayList<>();
         if (config.botProfiles == null) config.botProfiles = new ArrayList<>();
         for (BotProfile profile : config.botProfiles) if (profile != null) profile.normalize();
-        boolean commandMigration = config.commandAliasMigrationVersion < 4;
+        boolean commandMigration = config.commandAliasMigrationVersion < 5;
         if (config.commandAliasMigrationVersion < 1) {
             config.commandAliasMigrationVersion = 1;
         }
@@ -388,6 +438,10 @@ public final class AgentConfig {
         }
         if (config.commandAliasMigrationVersion < 3) config.commandAliasMigrationVersion = 3;
         if (config.commandAliasMigrationVersion < 4) config.commandAliasMigrationVersion = 4;
+        if (config.commandAliasMigrationVersion < 5) {
+            migrateRenderActionSettings(raw, config);
+            config.commandAliasMigrationVersion = 5;
+        }
         config.normalizeCommandDefinitions();
         if (raw != null && raw.has("mergeRenderImages") && !raw.get("mergeRenderImages").getAsBoolean()
                 && !separateImageSend(config.cloudMergeLayout)) {
@@ -408,6 +462,9 @@ public final class AgentConfig {
         if (config.maxConcurrentRenders > 4) config.maxConcurrentRenders = 4;
         if (config.memoryRestartThresholdBytes < 0) config.memoryRestartThresholdBytes = 0;
         if (config.maxQueuedRequestBytes < 0) config.maxQueuedRequestBytes = 0;
+        if (config.renderTimeoutMillis < 1_000) config.renderTimeoutMillis = 240_000;
+        if (config.userRenderWindowSeconds < 1 || config.userRenderWindowSeconds > 86_400) config.userRenderWindowSeconds = 60;
+        if (config.userRenderMaxFiles < 1 || config.userRenderMaxFiles > 10_000) config.userRenderMaxFiles = 3;
         if (config.nightVisionLevel < 1) config.nightVisionLevel = 1;
         if (config.nightVisionLevel > 15) config.nightVisionLevel = 15;
         config.cloudMergeLayout = normalizeImageSendLayout(config.cloudMergeLayout);
@@ -429,6 +486,29 @@ public final class AgentConfig {
             writeCredentialHint(file, config.webUsername, config.webPassword);
         } else if (commandMigration) config.save(file);
         return config;
+    }
+
+    private static void migrateRenderActionSettings(JsonObject raw, AgentConfig config) {
+        if (config.commands == null) return;
+        for (CommandDefinition definition : config.commands) {
+            if (definition == null) continue;
+            String id = definition.id == null ? "" : definition.id;
+            JsonObject rawDefinition = null;
+            if (raw != null && raw.has("commands") && raw.get("commands").isJsonArray()) {
+                for (var element : raw.getAsJsonArray("commands")) {
+                    if (element != null && element.isJsonObject()) {
+                        var rawId = element.getAsJsonObject().get("id");
+                        if (rawId == null || rawId.isJsonNull() || !id.equals(rawId.getAsString())) continue;
+                        rawDefinition = element.getAsJsonObject();
+                        break;
+                    }
+                }
+            }
+            if (rawDefinition == null || !rawDefinition.has("showInRenderActions"))
+                definition.showInRenderActions = defaultShowInRenderActions(id);
+            if (rawDefinition == null || !rawDefinition.has("renderActionLabel"))
+                definition.renderActionLabel = defaultRenderActionLabel(id, definition.name);
+        }
     }
 
     private void renameLegacySearchCommand() {

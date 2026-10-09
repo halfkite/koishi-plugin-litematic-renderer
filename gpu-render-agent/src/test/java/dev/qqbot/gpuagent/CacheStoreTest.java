@@ -16,6 +16,7 @@ class CacheStoreTest {
         Path temp = Files.createTempDirectory(Path.of("build"), "cache-store-test-");
         try {
         AgentConfig config = new AgentConfig();
+        config.cacheImageMinProjectionBytes = 0;
         config.cacheDirectory = temp.resolve("litematic-renderer-cache").toString();
         CacheStore store = new CacheStore(temp, config, ignored -> {});
         byte[] schematic = "test-schematic".getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -85,6 +86,7 @@ class CacheStoreTest {
         Path temp = Files.createTempDirectory(Path.of("build"), "cache-store-eviction-");
         try {
             AgentConfig config = new AgentConfig();
+            config.cacheImageMinProjectionBytes = 0;
             config.cacheDirectory = temp.resolve("litematic-renderer-cache").toString();
             config.cacheRecentImageMaxBytes = Long.MAX_VALUE;
             config.cacheHistoricalImageMaxBytes = Long.MAX_VALUE;
@@ -110,9 +112,7 @@ class CacheStoreTest {
             assertTrue(Files.isRegularFile(firstEntry.resolve("about.json5")));
             assertFalse(Files.exists(firstEntry.resolve("isometric.png")));
         } finally {
-            try (var files = Files.walk(temp)) {
-                for (Path file : files.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(file);
-            }
+            TestDirectoryCleanup.deleteTree(temp);
         }
     }
 }

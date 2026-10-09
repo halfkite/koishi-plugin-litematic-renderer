@@ -275,8 +275,10 @@ final class PreviewPanel extends JPanel {
                 var view = new RenderModels.View(EXPORT_VIEW_ID, "预览导出", yaw, pitch, gpuZoom, false, 2048, 2048, "#000000", false, 1);
                 var request = new RenderModels.Request(2, UUID.randomUUID().toString(), input.getFileName().toString(), List.of(view), null);
                 var result = renderer.submit(request, bytes, Duration.ofMillis(config.renderTimeoutMillis), "本地", output.toString()).join();
+                try (result) {
                 Files.createDirectories(output);
                 for (var image : result.images()) Files.copy(image.path(), output.resolve(image.name()), StandardCopyOption.REPLACE_EXISTING);
+                }
                 log.accept("预览导出完成：" + output);
                 SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
                         "已导出当前视角到 " + output, "导出成功", JOptionPane.INFORMATION_MESSAGE));

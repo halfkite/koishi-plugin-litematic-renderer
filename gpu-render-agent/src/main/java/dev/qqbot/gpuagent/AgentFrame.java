@@ -653,6 +653,12 @@ final class AgentFrame extends JFrame {
         cacheLimit.add(new JLabel("GB；历史投影图")); cacheLimit.add(cacheHistoricalGb);
         cacheLimit.add(new JLabel("GB；每类优先清理少调用的完整图片，保留投影文件"));
         addSetting(form, c, 3, "缓存容量", cacheLimit);
+        JTextField cacheImageMb = new JTextField(String.valueOf(config.cacheImageMinProjectionBytes / 1048576.0), 5);
+        JTextField cacheImageCalls = new JTextField(String.valueOf(config.cacheImageMinCalls), 5);
+        JPanel imageThresholds = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        imageThresholds.add(new JLabel("投影大于")); imageThresholds.add(cacheImageMb);
+        imageThresholds.add(new JLabel("MB，或调用次数大于")); imageThresholds.add(cacheImageCalls);
+        addSetting(form, c, 13, "图片缓存条件", imageThresholds);
 
         JTextField idleStop = new JTextField(String.valueOf(config.renderIdleStopMillis), 7);
         JTextField concurrentField = new JTextField(String.valueOf(Math.max(1, config.maxConcurrentRenders)), 4);
@@ -660,6 +666,23 @@ final class AgentFrame extends JFrame {
         runtime.add(new JLabel("空闲关闭")); runtime.add(idleStop); runtime.add(new JLabel("毫秒；并行客户端"));
         runtime.add(concurrentField); runtime.add(new JLabel("个"));
         addSetting(form, c, 4, "运行参数", runtime);
+        JTextField renderTimeoutSeconds = new JTextField(String.valueOf(config.renderTimeoutMillis / 1000.0), 6);
+        JCheckBox userLimitEnabled = new JCheckBox("启用单人 CD", config.userRenderLimitEnabled);
+        JTextField userWindowSeconds = new JTextField(String.valueOf(config.userRenderWindowSeconds), 5);
+        JTextField userMaxFiles = new JTextField(String.valueOf(config.userRenderMaxFiles), 4);
+        JPanel limits = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        limits.add(new JLabel("渲染超时")); limits.add(renderTimeoutSeconds); limits.add(new JLabel("秒"));
+        limits.add(userLimitEnabled); limits.add(new JLabel("每")); limits.add(userWindowSeconds);
+        limits.add(new JLabel("秒最多")); limits.add(userMaxFiles); limits.add(new JLabel("个投影文件"));
+        JButton applyLimits = new JButton("保存并应用");
+        applyLimits.addActionListener(event -> {
+            try {
+                saveRenderLimits(renderTimeoutSeconds, userLimitEnabled, userWindowSeconds, userMaxFiles);
+                log("渲染超时和单人 CD 已保存，新任务立即生效，无需重启");
+            } catch (Exception error) { showError(error); }
+        });
+        limits.add(applyLimits);
+        addSetting(form, c, 14, "超时与单人 CD", limits);
 
         JTextField memoryGbField = new JTextField(String.valueOf(config.memoryRestartThresholdBytes / (1024L * 1024 * 1024)), 4);
         JPanel memory = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
@@ -737,7 +760,8 @@ final class AgentFrame extends JFrame {
         });
         JButton saveRender = new JButton("保存渲染设置并重启");
         saveRender.addActionListener(event -> saveRenderSettings(localMerge, mergeLayout, cacheDir, keepProjection, keepHashDirectories,
-                cacheRecentGb, cacheHistoricalGb, idleStop, concurrentField, memoryGbField, localMinecraftClient, maxFileSizeKb, privateMaxFileSizeKb,
+                cacheRecentGb, cacheHistoricalGb, cacheImageMb, cacheImageCalls, idleStop, concurrentField, memoryGbField, localMinecraftClient, maxFileSizeKb, privateMaxFileSizeKb,
+                renderTimeoutSeconds, userLimitEnabled, userWindowSeconds, userMaxFiles,
                 showProjectionName, showAuthor, showCreatedAt, showBlockStats, showSize, showLitematicVersion, showGameVersion, metadataFormat));
         JButton saveSearch = new JButton("仅保存搜索设置");
         saveSearch.addActionListener(event -> saveProjectionSearchSettings(searchLimit));
@@ -750,7 +774,7 @@ final class AgentFrame extends JFrame {
         });
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         buttons.add(importClient); buttons.add(saveRender); buttons.add(saveSearch); buttons.add(saveCommands); buttons.add(syncCommands);
-        c.gridx = 1; c.gridy = 13; c.fill = GridBagConstraints.NONE; form.add(buttons, c);
+        c.gridx = 1; c.gridy = 15; c.fill = GridBagConstraints.NONE; form.add(buttons, c);
         return new JScrollPane(form);
     }
 
@@ -1119,6 +1143,12 @@ final class AgentFrame extends JFrame {
                 files.add(root.resolve("runtime/minecraft-runtime.log"));
                 files.add(root.resolve("runtime/minecraft-runtime-2.log"));
                 files.add(root.resolve("runtime/minecraft-runtime-3.log"));
+                files.add(root.resolve("runtime/minecraft-runtime-4.log"));
+                files.add(root.resolve("runtime/runtime-stall.log"));
+                for (int slot = 0; slot < 4; slot++) {
+                    String name = slot == 0 ? "minecraft-runtime" : "minecraft-runtime-" + (slot + 1);
+                    files.add(root.resolve("runtime/" + name + "-before-recovery.log"));
+                }
                 for (Path file : files) {
                     if (file == null || !Files.isRegularFile(file)) continue;
                     byte[] bytes = Files.readAllBytes(file);
@@ -1286,12 +1316,16 @@ final class AgentFrame extends JFrame {
                                     JComboBox<String> mergeLayout,
                                      JTextField cacheDir, JCheckBox keepProjection, JCheckBox keepHashDirectories,
                                      JTextField cacheRecentGb, JTextField cacheHistoricalGb,
+                                     JTextField cacheImageMb, JTextField cacheImageCalls,
                                      JTextField idleStop, JTextField concurrentField, JTextField memoryGbField,
                                     JTextField localMinecraftClient, JTextField maxFileSizeKb, JTextField privateMaxFileSizeKb,
+                                    JTextField renderTimeoutSeconds, JCheckBox userLimitEnabled,
+                                    JTextField userWindowSeconds, JTextField userMaxFiles,
                                     JCheckBox showProjectionName, JCheckBox showAuthor, JCheckBox showCreatedAt,
                                     JCheckBox showBlockStats, JCheckBox showSize, JCheckBox showLitematicVersion,
                                     JCheckBox showGameVersion, JComboBox<String> metadataFormat) {
         try {
+            AgentConfig limits = readRenderLimits(renderTimeoutSeconds, userLimitEnabled, userWindowSeconds, userMaxFiles);
             config.localMergeEnabled = localMerge.isSelected();
             config.cloudMergeLayout = sendLayoutValue(mergeLayout.getSelectedIndex());
             config.cacheDirectory = cacheDir.getText().trim();
@@ -1300,6 +1334,12 @@ final class AgentFrame extends JFrame {
             config.cacheRecentImageMaxBytes = Math.max(0, Long.parseLong(cacheRecentGb.getText().trim())) * 1024L * 1024 * 1024;
             config.cacheHistoricalImageMaxBytes = Math.max(0, Long.parseLong(cacheHistoricalGb.getText().trim())) * 1024L * 1024 * 1024;
             config.cacheMaxBytes = config.cacheRecentImageMaxBytes + config.cacheHistoricalImageMaxBytes;
+            double imageMb = Double.parseDouble(cacheImageMb.getText().trim());
+            long imageCalls = Long.parseLong(cacheImageCalls.getText().trim());
+            if (!Double.isFinite(imageMb) || imageMb < 0 || imageMb > Long.MAX_VALUE / 1048576.0 || imageCalls < 0)
+                throw new IllegalArgumentException("图片缓存条件必须为非负数");
+            config.cacheImageMinProjectionBytes = (long) (imageMb * 1048576);
+            config.cacheImageMinCalls = imageCalls;
             config.renderIdleStopMillis = Math.max(0, Integer.parseInt(idleStop.getText().trim()));
             config.maxConcurrentRenders = Math.max(1, Math.min(4, Integer.parseInt(concurrentField.getText().trim())));
             config.memoryRestartThresholdBytes = Math.max(0, Long.parseLong(memoryGbField.getText().trim())) * 1024L * 1024 * 1024;
@@ -1321,10 +1361,37 @@ final class AgentFrame extends JFrame {
                 case 2 -> "image";
                 default -> "full";
             };
+            applyRenderLimits(limits);
             config.save(configPath);
             log("本地渲染设置已保存，正在重启 Agent 使缓存目录、并行客户端和拼接设置生效");
             restartApplication(false);
         } catch (Exception error) { showError(error); }
+    }
+
+    private void saveRenderLimits(JTextField timeout, JCheckBox enabled, JTextField seconds, JTextField files) throws java.io.IOException {
+        AgentConfig staged = readRenderLimits(timeout, enabled, seconds, files);
+        staged.save(configPath);
+        applyRenderLimits(staged);
+    }
+
+    private AgentConfig readRenderLimits(JTextField timeout, JCheckBox enabled, JTextField seconds, JTextField files) {
+        AgentConfig staged = Protocol.GSON.fromJson(Protocol.GSON.toJson(config), AgentConfig.class);
+        double millis = Double.parseDouble(timeout.getText().trim()) * 1000;
+        if (!Double.isFinite(millis) || millis < 1000 || millis > Integer.MAX_VALUE)
+            throw new IllegalArgumentException("渲染超时必须为 1-2147483 秒");
+        staged.renderTimeoutMillis = (int) millis;
+        staged.userRenderLimitEnabled = enabled.isSelected();
+        staged.userRenderWindowSeconds = Integer.parseInt(seconds.getText().trim());
+        staged.userRenderMaxFiles = Integer.parseInt(files.getText().trim());
+        staged.validateRenderLimits();
+        return staged;
+    }
+
+    private void applyRenderLimits(AgentConfig staged) {
+        config.renderTimeoutMillis = staged.renderTimeoutMillis;
+        config.userRenderLimitEnabled = staged.userRenderLimitEnabled;
+        config.userRenderWindowSeconds = staged.userRenderWindowSeconds;
+        config.userRenderMaxFiles = staged.userRenderMaxFiles;
     }
 
     private void saveProjectionSearchSettings(JTextField resultLimit) {
@@ -1347,13 +1414,14 @@ final class AgentFrame extends JFrame {
             AgentConfig staged = new AgentConfig();
             staged.commands = editor.values();
             staged.normalizeCommandDefinitions();
+            staged.validateRenderActionSettings();
             OfficialSlashCommandPanels.validateConfiguredNames(staged);
             config.commands = staged.commands;
             config.automaticRenderingEnabled = editor.automaticRenderingEnabled();
             config.save(configPath);
             commands.setText(HelpCardRenderer.text(config));
             bots.syncOfficialCommandPanels();
-            log("机器人功能开关、指令名称和别名已保存；官方 QQ / 指令面板正在同步");
+            log("机器人功能、指令名称、别名和渲染结果按钮设置已保存；官方 QQ / 指令面板正在同步");
             JOptionPane.showMessageDialog(this, "功能设置已保存并立即生效；官方 QQ 的 / 指令面板正在同步。", "配置已应用", JOptionPane.INFORMATION_MESSAGE);
         } catch (Exception error) {
             showError(error);
@@ -1385,6 +1453,8 @@ final class AgentFrame extends JFrame {
                 AgentConfig.CommandDefinition definition = new AgentConfig.CommandDefinition(row.id, row.defaultName);
                 definition.name = row.name.getText().trim();
                 definition.enabled = row.enabled.isSelected();
+                definition.showInRenderActions = row.showInRenderActions.isSelected();
+                definition.renderActionLabel = row.renderActionLabel.getText().trim();
                 for (CommandRow.AliasRow alias : row.aliases) {
                     definition.aliases.add(new AgentConfig.CommandAlias(alias.name.getText().trim(), alias.enabled.isSelected()));
                 }
@@ -1401,11 +1471,12 @@ final class AgentFrame extends JFrame {
                 case "sendProjection" -> "发送投影";
                 case "sendMaterials" -> "导出材料";
                 case "projectionList" -> "投影列表";
+                case "convertProjectionVersion" -> "转换投影版本";
                 case "help" -> "帮助";
                 case "introduction" -> "机器人介绍";
                 case "moreViews" -> "更多视图菜单";
                 case "projectionView" -> "详细视图渲染";
-                case "mapView" -> "地图配色视图";
+                case "mapView" -> "更多视图中的地图视图";
                 default -> id;
             };
         }
@@ -1416,6 +1487,8 @@ final class AgentFrame extends JFrame {
             private final JPanel panel = new JPanel();
             private final JTextField name = new JTextField(14);
             private final JCheckBox enabled = new JCheckBox("启用功能", true);
+            private final JCheckBox showInRenderActions = new JCheckBox("渲染图后显示可点击功能");
+            private final JTextField renderActionLabel = new JTextField(14);
             private final JPanel aliasPanel = new JPanel();
             private final List<AliasRow> aliases = new ArrayList<>();
 
@@ -1427,6 +1500,9 @@ final class AgentFrame extends JFrame {
                 JPanel nameLine = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
                 name.setText(definition.name == null ? defaultName : definition.name);
                 enabled.setSelected(definition.enabled);
+                showInRenderActions.setSelected(definition.showInRenderActions);
+                renderActionLabel.setText(definition.renderActionLabel == null || definition.renderActionLabel.isBlank()
+                        ? AgentConfig.defaultRenderActionLabel(id, definition.name) : definition.renderActionLabel);
                 nameLine.add(enabled);
                 nameLine.add(new JLabel("主指令名称"));
                 nameLine.add(name);
@@ -1435,6 +1511,16 @@ final class AgentFrame extends JFrame {
                 reset.addActionListener(event -> name.setText(defaultName));
                 nameLine.add(reset);
                 panel.add(nameLine);
+
+                JPanel actionLine = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+                actionLine.add(showInRenderActions);
+                actionLine.add(new JLabel("显示名称"));
+                actionLine.add(renderActionLabel);
+                JButton resetActionLabel = new JButton("重置显示名称");
+                resetActionLabel.addActionListener(event -> renderActionLabel.setText(
+                        AgentConfig.defaultRenderActionLabel(id, defaultName)));
+                actionLine.add(resetActionLabel);
+                panel.add(actionLine);
 
                 aliasPanel.setLayout(new BoxLayout(aliasPanel, BoxLayout.Y_AXIS));
                 if (definition.aliases != null) for (AgentConfig.CommandAlias alias : definition.aliases) {
@@ -1503,11 +1589,13 @@ final class AgentFrame extends JFrame {
                     byte[] bytes = Files.readAllBytes(input);
                     var request = new RenderModels.Request(2, UUID.randomUUID().toString(), input.getFileName().toString(), renderViews, null);
                     var result = renderer.submit(request, bytes, Duration.ofMillis(config.renderTimeoutMillis), "本地", output.toString()).join();
-                    Files.createDirectories(output);
-                    for (var image : result.images()) Files.copy(image.path(), output.resolve(image.name()), StandardCopyOption.REPLACE_EXISTING);
-                    if (config.localMergeEnabled && !AgentConfig.separateImageSend(config.cloudMergeLayout) && result.images().size() > 1) {
-                        CloudConnection.MergedPng merged = CloudConnection.mergeImages(result.images(), renderViews.getFirst(), config.cloudMergeLayout);
-                        if (merged != null) Files.write(output.resolve("merged.png"), merged.bytes());
+                    try (result) {
+                        Files.createDirectories(output);
+                        for (var image : result.images()) Files.copy(image.path(), output.resolve(image.name()), StandardCopyOption.REPLACE_EXISTING);
+                        if (config.localMergeEnabled && !AgentConfig.separateImageSend(config.cloudMergeLayout) && result.images().size() > 1) {
+                            CloudConnection.MergedPng merged = CloudConnection.mergeImages(result.images(), renderViews.getFirst(), config.cloudMergeLayout);
+                            if (merged != null) Files.write(output.resolve("merged.png"), merged.bytes());
+                        }
                     }
                     config.outputDirectory = base.toString(); addRecent(config.recentOutputDirectories, base.toString());
                     completed++; log("本地渲染完成：" + input.getFileName() + " -> " + output);

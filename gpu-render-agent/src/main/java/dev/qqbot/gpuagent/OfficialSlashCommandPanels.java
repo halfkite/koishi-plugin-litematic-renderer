@@ -29,11 +29,11 @@ final class OfficialSlashCommandPanels {
         }
         addNames(items, config.commandNames("sendMaterials"), "引用渲染图导出对应材料表");
         addNames(items, config.commandNames("projectionList"), "导出全部缓存投影CSV清单");
+        addNames(items, config.commandNames("convertProjectionVersion"), "按编号转换格式版本，默认 6");
         addNames(items, config.commandNames("help"), "查看机器人使用帮助");
         addNames(items, config.commandNames("introduction"), "查看投影机器人介绍");
         addNames(items, config.commandNames("moreViews"), "按编号打开视图选择");
         addNames(items, config.commandNames("projectionView"), "按编号与视角生成视图");
-        addNames(items, config.commandNames("mapView"), "生成地图配色视图");
         return List.copyOf(items.values());
     }
 
@@ -103,7 +103,7 @@ final class OfficialSlashCommandPanels {
 
     static void validateConfiguredNames(AgentConfig config) {
         Map<String, String> owners = new LinkedHashMap<>();
-        for (String id : List.of("search", "sendProjection", "sendMaterials", "projectionList", "help",
+        for (String id : List.of("search", "sendProjection", "sendMaterials", "projectionList", "convertProjectionVersion", "help",
                 "introduction", "moreViews", "projectionView", "mapView")) {
             for (String name : config.commandNames(id)) {
                 registerName(owners, name, id);
