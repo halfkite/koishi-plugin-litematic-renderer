@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 final class AgentFrame extends JFrame {
     private final Path root;
@@ -69,6 +70,12 @@ final class AgentFrame extends JFrame {
     private TrayIcon trayIcon;
     private final AtomicBoolean shuttingDown = new AtomicBoolean();
     private final AtomicBoolean servicesClosed = new AtomicBoolean();
+    private final AtomicBoolean videoExportRunning = new AtomicBoolean();
+    private final AtomicBoolean videoCancelRequested = new AtomicBoolean();
+    private final AtomicReference<Process> videoEncoderProcess = new AtomicReference<>();
+    private volatile String videoStatus = "";
+    private JButton localRenderButton;
+    private JButton localVideoButton;
 
     AgentFrame(Path root, Path configPath, AgentConfig config) {
         super("Litematic GPU Agent");
@@ -81,7 +88,8 @@ final class AgentFrame extends JFrame {
         this.bots = new BotManager(root, configPath, config, renderer, this::log);
         this.bots.setDownloadProgress(progress -> SwingUtilities.invokeLater(() -> updateAttachmentDownloadProgress(progress)));
         this.web = new WebAdminServer(root, configPath, config, renderer, bots, cloud, this::log);
-        this.watchdog = new MemoryWatchdog(config, renderer, renderer.runtime(), root, this::log);
+        this.watchdog = new MemoryWatchdog(config, renderer, renderer.runtime(), this::log);
+        this.web.setMemoryWatchdog(watchdog);
         this.preview = new PreviewPanel(renderer, renderer.runtime(), config,
                 () -> outputDirectory.getText(), this::log, this::showError,
                 path -> {
@@ -569,9 +577,11 @@ final class AgentFrame extends JFrame {
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
         JButton add = new JButton("添加视角"); add.addActionListener(e -> views.addView());
         JButton remove = new JButton("删除视角"); remove.addActionListener(e -> views.remove(viewTable.getSelectedRow()));
-        JButton render = new JButton("开始渲染"); render.addActionListener(e -> renderLocal(render));
-        JButton cancel = new JButton("终止任务"); cancel.addActionListener(e -> renderer.cancelAll());
-        buttons.add(add); buttons.add(remove); buttons.add(render); buttons.add(cancel); panel.add(buttons, BorderLayout.SOUTH);
+        localRenderButton = new JButton("开始渲染"); localRenderButton.addActionListener(e -> renderLocal(localRenderButton));
+        localVideoButton = new JButton("导出 MP4"); localVideoButton.setToolTipText("将投影以固定缩放环绕一周，导出为无声 H.264 视频");
+        localVideoButton.addActionListener(e -> exportLocalVideos(localVideoButton));
+        JButton cancel = new JButton("终止任务"); cancel.addActionListener(e -> cancelCurrentTasks());
+        buttons.add(add); buttons.add(remove); buttons.add(localRenderButton); buttons.add(localVideoButton); buttons.add(cancel); panel.add(buttons, BorderLayout.SOUTH);
         return panel;
     }
 
@@ -684,10 +694,41 @@ final class AgentFrame extends JFrame {
         limits.add(applyLimits);
         addSetting(form, c, 14, "超时与单人 CD", limits);
 
+        JTextField ffmpegPath = new JTextField(config.ffmpegPath == null ? "" : config.ffmpegPath, 28);
+        JButton chooseFfmpeg = new JButton("选择 FFmpeg");
+        chooseFfmpeg.addActionListener(event -> {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setDialogTitle("选择 FFmpeg 可执行文件");
+            if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION)
+                ffmpegPath.setText(chooser.getSelectedFile().getAbsolutePath());
+        });
+        JPanel ffmpegRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        ffmpegRow.add(ffmpegPath); ffmpegRow.add(chooseFfmpeg);
+        ffmpegRow.add(new JLabel("留空则从系统 PATH 查找"));
+        JTextField videoWidth = new JTextField(String.valueOf(config.videoWidth), 5);
+        JTextField videoHeight = new JTextField(String.valueOf(config.videoHeight), 5);
+        JTextField videoDuration = new JTextField(String.valueOf(config.videoDurationSeconds), 4);
+        JTextField videoFps = new JTextField(String.valueOf(config.videoFramesPerSecond), 4);
+        JPanel videoSettings = new JPanel(new GridLayout(2, 1, 0, 2));
+        videoSettings.add(ffmpegRow);
+        JPanel videoFormatRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        videoFormatRow.add(new JLabel("宽")); videoFormatRow.add(videoWidth);
+        videoFormatRow.add(new JLabel("高")); videoFormatRow.add(videoHeight);
+        videoFormatRow.add(new JLabel("时长(秒)")); videoFormatRow.add(videoDuration);
+        videoFormatRow.add(new JLabel("帧率 FPS")); videoFormatRow.add(videoFps);
+        JButton saveVideoSettings = new JButton("保存 MP4 设置");
+        saveVideoSettings.addActionListener(event -> saveVideoSettings(ffmpegPath, videoWidth, videoHeight, videoDuration, videoFps));
+        videoFormatRow.add(saveVideoSettings);
+        videoSettings.add(videoFormatRow);
+        addSetting(form, c, 15, "MP4 导出", videoSettings);
+
         JTextField memoryGbField = new JTextField(String.valueOf(config.memoryRestartThresholdBytes / (1024L * 1024 * 1024)), 4);
+        JTextField recycleTasksField = new JTextField(String.valueOf(config.runtimeRecycleAfterTasks), 5);
         JPanel memory = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
-        memory.add(memoryGbField); memory.add(new JLabel("GB，0 = 关闭内存自动重启"));
-        addSetting(form, c, 5, "内存阈值", memory);
+        memory.add(memoryGbField); memory.add(new JLabel("GB，Minecraft 进程总内存超限后回收；0=关闭"));
+        memory.add(new JLabel("每客户端处理")); memory.add(recycleTasksField);
+        memory.add(new JLabel("个任务后轮换；0=关闭任务数回收"));
+        addSetting(form, c, 5, "运行时内存管理", memory);
 
         JTextField localMinecraftClient = new JTextField(config.localMinecraftClientPath, 30);
         JPanel localClientPanel = new JPanel(new BorderLayout(4, 0));
@@ -760,7 +801,7 @@ final class AgentFrame extends JFrame {
         });
         JButton saveRender = new JButton("保存渲染设置并重启");
         saveRender.addActionListener(event -> saveRenderSettings(localMerge, mergeLayout, cacheDir, keepProjection, keepHashDirectories,
-                cacheRecentGb, cacheHistoricalGb, cacheImageMb, cacheImageCalls, idleStop, concurrentField, memoryGbField, localMinecraftClient, maxFileSizeKb, privateMaxFileSizeKb,
+                cacheRecentGb, cacheHistoricalGb, cacheImageMb, cacheImageCalls, idleStop, concurrentField, memoryGbField, recycleTasksField, localMinecraftClient, maxFileSizeKb, privateMaxFileSizeKb,
                 renderTimeoutSeconds, userLimitEnabled, userWindowSeconds, userMaxFiles,
                 showProjectionName, showAuthor, showCreatedAt, showBlockStats, showSize, showLitematicVersion, showGameVersion, metadataFormat));
         JButton saveSearch = new JButton("仅保存搜索设置");
@@ -774,7 +815,7 @@ final class AgentFrame extends JFrame {
         });
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         buttons.add(importClient); buttons.add(saveRender); buttons.add(saveSearch); buttons.add(saveCommands); buttons.add(syncCommands);
-        c.gridx = 1; c.gridy = 15; c.fill = GridBagConstraints.NONE; form.add(buttons, c);
+        c.gridx = 1; c.gridy = 16; c.fill = GridBagConstraints.NONE; form.add(buttons, c);
         return new JScrollPane(form);
     }
 
@@ -1317,7 +1358,7 @@ final class AgentFrame extends JFrame {
                                      JTextField cacheDir, JCheckBox keepProjection, JCheckBox keepHashDirectories,
                                      JTextField cacheRecentGb, JTextField cacheHistoricalGb,
                                      JTextField cacheImageMb, JTextField cacheImageCalls,
-                                     JTextField idleStop, JTextField concurrentField, JTextField memoryGbField,
+                                     JTextField idleStop, JTextField concurrentField, JTextField memoryGbField, JTextField recycleTasksField,
                                     JTextField localMinecraftClient, JTextField maxFileSizeKb, JTextField privateMaxFileSizeKb,
                                     JTextField renderTimeoutSeconds, JCheckBox userLimitEnabled,
                                     JTextField userWindowSeconds, JTextField userMaxFiles,
@@ -1343,6 +1384,10 @@ final class AgentFrame extends JFrame {
             config.renderIdleStopMillis = Math.max(0, Integer.parseInt(idleStop.getText().trim()));
             config.maxConcurrentRenders = Math.max(1, Math.min(4, Integer.parseInt(concurrentField.getText().trim())));
             config.memoryRestartThresholdBytes = Math.max(0, Long.parseLong(memoryGbField.getText().trim())) * 1024L * 1024 * 1024;
+            int recycleAfterTasks = Integer.parseInt(recycleTasksField.getText().trim());
+            if (recycleAfterTasks < 0 || recycleAfterTasks > 1_000_000)
+                throw new IllegalArgumentException("每客户端任务数回收范围必须为 0-1000000");
+            config.runtimeRecycleAfterTasks = recycleAfterTasks;
             long newMaxFileSizeKb = Long.parseLong(maxFileSizeKb.getText().trim());
             long newPrivateMaxFileSizeKb = Long.parseLong(privateMaxFileSizeKb.getText().trim());
             if (newMaxFileSizeKb < 1 || newPrivateMaxFileSizeKb < 1) throw new IllegalArgumentException("文件大小上限必须为正整数 KB");
@@ -1567,11 +1612,148 @@ final class AgentFrame extends JFrame {
     }
 
     private void chooseOutput(){JFileChooser f=new JFileChooser();f.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);if(f.showOpenDialog(this)==JFileChooser.APPROVE_OPTION){String chosen=f.getSelectedFile().getAbsolutePath();outputDirectory.setText(chosen);persistOutputDirectory(chosen);}}
-    private void renderLocal(JButton button) {
-        if (viewTable.isEditing()) viewTable.getCellEditor().stopCellEditing();
+
+    private void saveVideoSettings(JTextField ffmpeg, JTextField width, JTextField height,
+                                   JTextField duration, JTextField framesPerSecond) {
+        try {
+            String executable = ffmpeg.getText().trim();
+            if (executable.length() > 4096) throw new IllegalArgumentException("FFmpeg 路径过长");
+            int videoWidth = Integer.parseInt(width.getText().trim());
+            int videoHeight = Integer.parseInt(height.getText().trim());
+            int videoDuration = Integer.parseInt(duration.getText().trim());
+            int videoFps = Integer.parseInt(framesPerSecond.getText().trim());
+            ProjectionVideoExporter.validateSettings(videoWidth, videoHeight, videoDuration, videoFps);
+            config.ffmpegPath = executable;
+            config.videoWidth = videoWidth;
+            config.videoHeight = videoHeight;
+            config.videoDurationSeconds = videoDuration;
+            config.videoFramesPerSecond = videoFps;
+            config.save(configPath);
+            log("MP4 导出设置已保存，新任务立即生效");
+            JOptionPane.showMessageDialog(this, "MP4 导出设置已保存。", "设置已应用", JOptionPane.INFORMATION_MESSAGE);
+        } catch (Exception error) { showError(error); }
+    }
+
+    private void cancelCurrentTasks() {
+        if (videoExportRunning.get()) {
+            videoCancelRequested.set(true);
+            Process process = videoEncoderProcess.get();
+            if (process != null) process.destroyForcibly();
+        }
+        renderer.cancelAll();
+    }
+
+    private List<Path> localProjectionPaths() {
         List<Path> inputs = new ArrayList<>();
         for (int i = 0; i < projectionModel.size(); i++) inputs.add(projectionModel.get(i));
         if (inputs.isEmpty() && !inputFile.getText().isBlank()) inputs.add(Path.of(inputFile.getText().trim()));
+        return inputs;
+    }
+
+    private void exportLocalVideos(JButton button) {
+        List<Path> inputs = localProjectionPaths();
+        if (inputs.isEmpty()) { showError(new RuntimeException("请先点击“导入投影”或拖入 .litematic 文件")); return; }
+        if (renderer.isBusy() || renderer.queueLength() > 0) {
+            showError(new RuntimeException("渲染队列正在工作，请等待当前任务完成后再导出 MP4"));
+            return;
+        }
+        final int width = config.videoWidth;
+        final int height = config.videoHeight;
+        final int duration = config.videoDurationSeconds;
+        final int fps = config.videoFramesPerSecond;
+        final String ffmpeg = config.ffmpegPath == null ? "" : config.ffmpegPath.trim();
+        final String configuredOutput = outputDirectory.getText().trim();
+        final int frameCount;
+        try {
+            ProjectionVideoExporter.validateSettings(width, height, duration, fps);
+            frameCount = ProjectionVideoExporter.frameCount(duration, fps);
+        } catch (Exception error) { showError(error); return; }
+        if (!videoExportRunning.compareAndSet(false, true)) {
+            showError(new RuntimeException("已有 MP4 导出任务正在运行"));
+            return;
+        }
+        videoCancelRequested.set(false);
+        videoStatus = "MP4 导出准备中";
+        button.setEnabled(false);
+        localRenderButton.setEnabled(false);
+        Thread.startVirtualThread(() -> {
+            List<String> failures = new ArrayList<>();
+            List<Path> completedFiles = new ArrayList<>();
+            boolean cancelled = false;
+            for (Path input : inputs) {
+                if (videoCancelRequested.get()) { cancelled = true; break; }
+                try {
+                    if (!Files.isRegularFile(input)) throw new java.io.IOException("文件不存在");
+                    Path base = configuredOutput.isBlank()
+                            ? (input.getParent() == null ? root.resolve("渲染结果") : input.getParent().resolve("渲染结果"))
+                            : Path.of(configuredOutput);
+                    Path outputDirectory = base.resolve(renderFolderName(input.getFileName().toString()));
+                    Files.createDirectories(outputDirectory);
+                    Path videoFile = outputDirectory.resolve(ProjectionVideoExporter.safeOutputFileName(input.getFileName().toString()));
+                    videoStatus = input.getFileName() + "：准备 " + frameCount + " 帧";
+                    List<RenderModels.View> videoViews = ProjectionVideoExporter.orbitViews(width, height, frameCount);
+                    RenderModels.Request request = new RenderModels.Request(2, UUID.randomUUID().toString(),
+                            input.getFileName().toString(), videoViews, null);
+                    byte[] schematic = Files.readAllBytes(input);
+                    long timeoutMillis = Math.max(config.renderTimeoutMillis, 120_000L + frameCount * 3_000L);
+                    try (RenderModels.Result result = renderer.submitTransient(request, schematic,
+                            Duration.ofMillis(timeoutMillis), "本地 MP4", videoFile.toString()).join()) {
+                        if (result.images().size() != frameCount)
+                            throw new java.io.IOException("渲染帧不完整：期望 " + frameCount + " 帧，实际 " + result.images().size() + " 帧");
+                        Path frameDirectory = result.images().getFirst().path().getParent();
+                        for (int frame = 0; frame < frameCount; frame++) {
+                            Path expected = frameDirectory.resolve(String.format(java.util.Locale.ROOT, "frame-%05d.png", frame));
+                            if (!Files.isRegularFile(expected)) throw new java.io.IOException("缺少视频帧 " + (frame + 1) + "/" + frameCount);
+                        }
+                        videoStatus = input.getFileName() + "：开始 MP4 编码";
+                        String executable = ffmpeg.isBlank() ? "ffmpeg" : ffmpeg;
+                        ProjectionVideoExporter.encode(executable, frameDirectory, frameCount, fps, videoFile,
+                                videoCancelRequested::get, videoEncoderProcess::set,
+                                status -> videoStatus = input.getFileName() + "：" + status);
+                    }
+                    completedFiles.add(videoFile);
+                    log("MP4 导出完成：" + input.getFileName() + " -> " + videoFile);
+                    config.outputDirectory = base.toString();
+                    addRecent(config.recentOutputDirectories, base.toString());
+                } catch (Throwable error) {
+                    Throwable cause = error;
+                    while (cause.getCause() != null && cause.getCause() != cause) cause = cause.getCause();
+                    if (videoCancelRequested.get() || cause instanceof java.util.concurrent.CancellationException) {
+                        cancelled = true;
+                        break;
+                    }
+                    failures.add(input.getFileName() + "：" + cause.getMessage());
+                    log("MP4 导出失败：" + input.getFileName() + "，" + cause.getMessage());
+                }
+            }
+            try { config.save(configPath); }
+            catch (Exception error) { log("保存 MP4 输出目录失败：" + error.getMessage()); }
+            int completedCount = completedFiles.size();
+            boolean wasCancelled = cancelled || videoCancelRequested.get();
+            videoEncoderProcess.set(null);
+            videoExportRunning.set(false);
+            videoStatus = "";
+            SwingUtilities.invokeLater(() -> {
+                button.setEnabled(true);
+                localRenderButton.setEnabled(true);
+                if (!failures.isEmpty()) {
+                    showError(new RuntimeException("完成 " + completedCount + " 个，失败 " + failures.size() + " 个"
+                            + (wasCancelled ? "，任务已取消" : "") + "：\n" + String.join("\n", failures)));
+                } else if (wasCancelled) {
+                    JOptionPane.showMessageDialog(this, "已取消 MP4 导出，已完成 " + completedCount + " 个。", "任务已取消", JOptionPane.INFORMATION_MESSAGE);
+                } else if (completedCount > 0) {
+                    JOptionPane.showMessageDialog(this, "MP4 导出完成：\n"
+                            + String.join("\n", completedFiles.stream().map(Path::toString).toList()),
+                            "导出完成", JOptionPane.INFORMATION_MESSAGE);
+                }
+            });
+        });
+    }
+
+    private void renderLocal(JButton button) {
+        if (videoExportRunning.get()) { showError(new RuntimeException("MP4 导出进行中，请等待完成或先终止任务")); return; }
+        if (viewTable.isEditing()) viewTable.getCellEditor().stopCellEditing();
+        List<Path> inputs = localProjectionPaths();
         if (inputs.isEmpty()) { showError(new RuntimeException("请先点击“导入投影”或拖入 .litematic 文件")); return; }
         List<RenderModels.View> renderViews = views.values();
         if (renderViews.isEmpty()) { showError(new RuntimeException("至少需要一个视角")); return; }
@@ -1642,7 +1824,7 @@ final class AgentFrame extends JFrame {
     }
     @SuppressWarnings("unchecked") private void installProjectionDropTarget(Component target){new DropTarget(target,DnDConstants.ACTION_COPY,null){@Override public synchronized void drop(DropTargetDropEvent event){try{event.acceptDrop(DnDConstants.ACTION_COPY);List<java.io.File> files=(List<java.io.File>)event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);importProjectionFiles(files.stream().map(java.io.File::toPath).toList());event.dropComplete(true);}catch(Exception e){event.dropComplete(false);}}};}
     private void installTray(){if(!SystemTray.isSupported())return;try{BufferedImage image=new BufferedImage(16,16,BufferedImage.TYPE_INT_ARGB);Graphics2D g=image.createGraphics();g.setColor(new Color(55,145,90));g.fillRect(2,2,12,12);g.dispose();PopupMenu menu=new PopupMenu();MenuItem show=new MenuItem("打开");show.addActionListener(e->SwingUtilities.invokeLater(()->{setVisible(true);setState(NORMAL);}));MenuItem exit=new MenuItem("退出");exit.addActionListener(e->shutdown());menu.add(show);menu.add(exit);trayIcon=new TrayIcon(image,"Litematic GPU Agent",menu);trayIcon.setImageAutoSize(true);trayIcon.addActionListener(e->setVisible(true));SystemTray.getSystemTray().add(trayIcon);}catch(Exception e){log("托盘初始化失败："+e.getMessage());}}
-    private void refreshStatus(){runtimeStatus.setText("运行时："+(renderer.runtime().isAlive()?(renderer.isBusy()?"渲染中":"已启动"):"未启动")+(config.maxConcurrentRenders>1?"（并行 "+config.maxConcurrentRenders+"）":"")+(renderer.isDraining()?"【等待重启】":""));cloudStatus.setText("队列："+renderer.queueLength()+"（"+String.format(java.util.Locale.ROOT,"%.0f",renderer.retainedRequestBytes()/1024.0/1024.0)+"MB）");long memoryBytes=watchdog.lastReportedTotalBytes();memoryStatus.setText("内存："+(memoryBytes>0?String.format(java.util.Locale.ROOT,"%.1f",memoryBytes/1024.0/1024/1024)+"GB"+(config.memoryRestartThresholdBytes>0?"/"+config.memoryRestartThresholdBytes/(1024L*1024*1024)+"GB":""):"-"));var attachmentDownload=bots.downloadProgress();if(attachmentDownload.active()||!attachmentDownload.error().isBlank())updateAttachmentDownloadProgress(attachmentDownload);else updateRuntimeInstallProgress(renderer.runtime().installProgress());String current=renderer.currentFile();if(current==null){currentTaskLabel.setText("当前渲染：无");}else{var status=renderer.runtime().currentStatus();String stage=status!=null&&status.stage()!=null?status.stage():"";int percent=status!=null?(int)Math.round(status.progress()*100):0;currentTaskLabel.setText("当前渲染["+(renderer.currentSource() == null ? "本地" : renderer.currentSource())+"]："+current+(stage.isEmpty()?"":"（"+stage+(percent>0?" "+percent+"%":"")+"）"));}}
+    private void refreshStatus(){runtimeStatus.setText("运行时："+(renderer.runtime().isAlive()?(renderer.isBusy()?"渲染中":"已启动"):"未启动")+(config.maxConcurrentRenders>1?"（并行 "+config.maxConcurrentRenders+"）":"")+(renderer.isDraining()?"【等待回收】":""));cloudStatus.setText("队列："+renderer.queueLength()+"（"+String.format(java.util.Locale.ROOT,"%.0f",renderer.retainedRequestBytes()/1024.0/1024.0)+"MB）");long agentBytes=watchdog.lastReportedAgentBytes();long runtimeBytes=watchdog.lastReportedRuntimeBytes();String agentText=agentBytes>=0?String.format(java.util.Locale.ROOT,"%.1f",agentBytes/1024.0/1024/1024)+"GB":"-";String runtimeText=runtimeBytes>=0?String.format(java.util.Locale.ROOT,"%.1f",runtimeBytes/1024.0/1024/1024)+"GB":"-";memoryStatus.setText("内存：Agent "+agentText+"；Minecraft "+runtimeText+(config.memoryRestartThresholdBytes>0?" / "+String.format(java.util.Locale.ROOT,"%.1f",config.memoryRestartThresholdBytes/1024.0/1024/1024)+"GB":"")+(config.runtimeRecycleAfterTasks>0?"；每客户端 "+config.runtimeRecycleAfterTasks+" 个任务轮换":""));var attachmentDownload=bots.downloadProgress();if(attachmentDownload.active()||!attachmentDownload.error().isBlank())updateAttachmentDownloadProgress(attachmentDownload);else updateRuntimeInstallProgress(renderer.runtime().installProgress());String current=renderer.currentFile();if(current==null){currentTaskLabel.setText(videoExportRunning.get()?"当前渲染："+(videoStatus.isBlank()?"MP4 导出处理中":videoStatus):"当前渲染：无");}else{var status=renderer.runtime().currentStatus();String stage=status!=null&&status.stage()!=null?status.stage():"";int percent=status!=null?(int)Math.round(status.progress()*100):0;currentTaskLabel.setText("当前渲染["+(renderer.currentSource() == null ? "本地" : renderer.currentSource())+"]："+current+(stage.isEmpty()?"":"（"+stage+(percent>0?" "+percent+"%":"")+"）"));}}
 
     private void updateAttachmentDownloadProgress(BotManager.DownloadProgress value){
         if(value==null)return;
@@ -1731,6 +1913,11 @@ final class AgentFrame extends JFrame {
 
     private void closeServices() {
         if (!servicesClosed.compareAndSet(false, true)) return;
+        if (videoExportRunning.get()) {
+            videoCancelRequested.set(true);
+            Process process = videoEncoderProcess.get();
+            if (process != null) process.destroyForcibly();
+        }
         try { watchdog.close(); } catch (Throwable error) { log("关闭内存看门狗失败：" + error.getMessage()); }
         try { bots.close(); } catch (Throwable error) { log("关闭机器人连接失败：" + error.getMessage()); }
         try { web.close(); } catch (Throwable error) { log("关闭 Web 管理后台失败：" + error.getMessage()); }
@@ -1738,6 +1925,11 @@ final class AgentFrame extends JFrame {
         try { cloud.close(); } catch (Throwable error) { log("关闭云端连接失败：" + error.getMessage()); }
         try { httpServer.close(); } catch (Throwable error) { log("关闭 HTTP 服务失败：" + error.getMessage()); }
         try { renderer.close(); } catch (Throwable error) { log("关闭渲染服务失败：" + error.getMessage()); }
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (videoExportRunning.get() && System.nanoTime() < deadline) {
+            try { Thread.sleep(50); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); break; }
+        }
     }
 
     private void shutdown(){

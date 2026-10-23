@@ -40,6 +40,7 @@ final class WebAdminServer implements AutoCloseable {
     private final BotManager bots;
     private final CloudConnection cloud;
     private final Consumer<String> log;
+    private volatile MemoryWatchdog memoryWatchdog;
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final Map<String, Attempt> attempts = new ConcurrentHashMap<>();
     private final SecureRandom random = new SecureRandom();
@@ -49,6 +50,8 @@ final class WebAdminServer implements AutoCloseable {
         this.root = root; this.configPath = configPath; this.config = config; this.renderer = renderer; this.bots = bots; this.cloud = cloud;
         this.log = log == null ? ignored -> {} : log;
     }
+
+    void setMemoryWatchdog(MemoryWatchdog watchdog) { this.memoryWatchdog = watchdog; }
 
     void start() throws IOException {
         if (server != null || !config.webEnabled) return;
@@ -169,6 +172,9 @@ final class WebAdminServer implements AutoCloseable {
         if (updated.webUsername == null || updated.webUsername.isBlank()) throw new IllegalArgumentException("网页登录用户名不能为空");
         if (updated.webSessionTimeoutMillis < 5 * 60 * 1000L) throw new IllegalArgumentException("会话时长不能少于 5 分钟");
         if (updated.maxFileSizeKb < 1 || updated.privateMaxFileSizeKb < 1) throw new IllegalArgumentException("全局文件大小上限必须为正整数 KB");
+        if (updated.memoryRestartThresholdBytes < 0) throw new IllegalArgumentException("Minecraft 运行时内存阈值不能为负数");
+        if (updated.runtimeRecycleAfterTasks < 0 || updated.runtimeRecycleAfterTasks > 1_000_000)
+            throw new IllegalArgumentException("每客户端任务数回收范围必须为 0-1000000");
         if (updated.projectionSearchResultLimit < 1 || updated.projectionSearchResultLimit > 100) throw new IllegalArgumentException("搜索结果数量必须为 1-100");
         if (updated.cacheRecentImageMaxBytes < 0 || updated.cacheHistoricalImageMaxBytes < 0) throw new IllegalArgumentException("近期和历史图片缓存上限不能为负数");
         if (updated.cacheImageMinProjectionBytes < 0 || updated.cacheImageMinCalls < 0) throw new IllegalArgumentException("图片缓存条件不能为负数");
@@ -179,6 +185,7 @@ final class WebAdminServer implements AutoCloseable {
         updated.normalizeCommandDefinitions();
         updated.validateRenderActionSettings();
         updated.validateRenderLimits();
+        updated.validateVideoSettings();
         OfficialSlashCommandPanels.validateConfiguredNames(updated);
         boolean restartRequired = !java.util.Objects.equals(oldBindHost, updated.webBindHost) || oldPort != updated.webPort
                 || config.webEnabled != updated.webEnabled
@@ -223,6 +230,11 @@ final class WebAdminServer implements AutoCloseable {
         result.addProperty("version", Main.VERSION); result.addProperty("web", "http://" + config.webBindHost + ":" + config.webPort + "/");
         result.addProperty("queueLength", renderer.queueLength()); result.addProperty("queuedRequestBytes", renderer.retainedRequestBytes());
         result.addProperty("queuedRequestLimitBytes", config.maxQueuedRequestBytes); result.addProperty("busy", renderer.isBusy());
+        result.addProperty("memoryRestartThresholdBytes", config.memoryRestartThresholdBytes);
+        result.addProperty("runtimeRecycleAfterTasks", config.runtimeRecycleAfterTasks);
+        MemoryWatchdog watchdog = memoryWatchdog;
+        result.addProperty("agentMemoryBytes", watchdog == null ? -1 : watchdog.lastReportedAgentBytes());
+        result.addProperty("runtimeMemoryBytes", watchdog == null ? -1 : watchdog.lastReportedRuntimeBytes());
         result.addProperty("currentFile", renderer.currentFile() == null ? "" : renderer.currentFile()); result.addProperty("cacheDirectory", renderer.cacheDirectory().toString());
         RenderModels.RuntimeStatus runtime = renderer.runtime().currentStatus();
         if (runtime != null) { result.addProperty("runtimeReady", runtime.ready()); result.addProperty("gpu", runtime.gpu()); result.addProperty("minecraftVersion", runtime.minecraftVersion()); result.addProperty("stage", runtime.stage()); result.addProperty("progress", runtime.progress()); }

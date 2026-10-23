@@ -12,10 +12,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Minecraft 渲染客户端池：支持多个隐藏客户端并行渲染（每个槽位独立游戏目录、独立进程与任务队列）。
@@ -36,6 +38,7 @@ final class RuntimeManager implements AutoCloseable {
         volatile Process process;
         volatile boolean wasRunningForPacks;
         volatile java.util.concurrent.atomic.AtomicBoolean expectedExit;
+        final AtomicInteger completedRenderTasks = new AtomicInteger();
 
         Slot(int index) {
             this.index = index;
@@ -84,12 +87,35 @@ final class RuntimeManager implements AutoCloseable {
 
     /** 所有运行中渲染端进程的 PID（供内存看门狗统计）。 */
     synchronized List<Long> runningProcessPids() {
-        List<Long> pids = new ArrayList<>();
+        LinkedHashSet<Long> pids = new LinkedHashSet<>();
         for (Slot slot : slots) {
             Process process = slot.process;
-            if (process != null && process.isAlive()) pids.add(process.pid());
+            if (process == null || !process.isAlive()) continue;
+            try {
+                ProcessHandle rootHandle = process.toHandle();
+                pids.add(rootHandle.pid());
+                rootHandle.descendants().forEach(descendant -> pids.add(descendant.pid()));
+            } catch (SecurityException ignored) {
+                pids.add(process.pid());
+            }
         }
-        return pids;
+        return List.copyOf(pids);
+    }
+
+    void recordRenderCompleted(int slotIndex) {
+        if (slotIndex < 0 || slotIndex >= slots.size()) return;
+        Slot slot = slots.get(slotIndex);
+        Process process = slot.process;
+        if (process != null && process.isAlive()) slot.completedRenderTasks.incrementAndGet();
+    }
+
+    int maxCompletedRenderTasks() {
+        return slots.stream().mapToInt(slot -> slot.completedRenderTasks.get()).max().orElse(0);
+    }
+
+    boolean recycleDueToTaskCount(int maximumTasks) {
+        return maximumTasks > 0 && slots.stream().anyMatch(slot -> slot.process != null
+                && slot.process.isAlive() && slot.completedRenderTasks.get() >= maximumTasks);
     }
 
     RenderModels.RuntimeStatus currentStatus() {
@@ -217,6 +243,7 @@ final class RuntimeManager implements AutoCloseable {
             // 客户端崩溃后，Java 的主进程可能已退出但其派生进程仍在；启动新客户端前先清理整棵树。
             stop(slot);
         }
+        slot.completedRenderTasks.set(0);
         RuntimeInstaller.LaunchSpec spec = installer.install();
         prepareSlotGameDirectory(slot);
         if (slot.index == 0 && config.resourcePacks != null && !config.resourcePacks.isEmpty()) {
@@ -230,6 +257,7 @@ final class RuntimeManager implements AutoCloseable {
         command.add(javaExecutable().toString());
         command.add("-Xms512m");
         command.add("-Xmx4g");
+        command.add("-XX:+ExitOnOutOfMemoryError");
         // C1 compilation of the 26.3 shader pipeline builder crashes HotSpot on
         // this Java 25 runtime. Keep that one-time pipeline setup interpreted.
         command.add("-XX:TieredStopAtLevel=1");
@@ -459,6 +487,7 @@ final class RuntimeManager implements AutoCloseable {
     }
 
     private synchronized void stop(Slot slot) {
+        slot.completedRenderTasks.set(0);
         Process child = slot.process;
         if (child == null) return;
         if (slot.expectedExit != null) slot.expectedExit.set(true);

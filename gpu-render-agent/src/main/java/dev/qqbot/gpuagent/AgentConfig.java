@@ -44,6 +44,12 @@ public final class AgentConfig {
     /** 渲染分辨率（全局默认宽/高），主界面可改。 */
     public int renderWidth = 2048;
     public int renderHeight = 2048;
+    /** MP4 环绕视频参数；FFmpeg 路径为空时从系统 PATH 查找。 */
+    public String ffmpegPath = "";
+    public int videoWidth = 1280;
+    public int videoHeight = 720;
+    public int videoDurationSeconds = 8;
+    public int videoFramesPerSecond = 24;
     /** 持久化的视角列表。 */
     public List<ViewEntry> views = new ArrayList<>();
     /** 渲染运行时空闲多久后自动关闭（毫秒）；0 = 不自动关闭。 */
@@ -78,8 +84,10 @@ public final class AgentConfig {
     public String metadataFormat = "full";
     /** 搜索投影默认返回的结果数量；近期保存的投影优先，其余按渲染次数排序。 */
     public int projectionSearchResultLimit = 15;
-    /** 内存重启阈值（字节）：工具+渲染端总内存占用超过该值时，手头任务完成后重启 Minecraft 运行时；0 = 关闭。默认 4GB。 */
-    public long memoryRestartThresholdBytes = 4L * 1024 * 1024 * 1024;
+    /** Minecraft 渲染客户端进程树的合计工作集阈值；超限后排空任务并回收客户端；0 = 关闭。默认 4GB。 */
+    public volatile long memoryRestartThresholdBytes = 4L * 1024 * 1024 * 1024;
+    /** 单个 Minecraft 客户端累计完成多少个渲染任务后轮换进程；0 = 关闭。 */
+    public volatile int runtimeRecycleAfterTasks = 50;
     /** 队列中保留的投影数据总量上限；超过后拒绝新任务，避免大量排队文件导致 Agent 爆内存。0 = 不限制。 */
     public long maxQueuedRequestBytes = 512L * 1024 * 1024;
     public long maxRequestBytes = 128L * 1024 * 1024;
@@ -405,6 +413,25 @@ public final class AgentConfig {
             throw new IllegalArgumentException("单人 CD 文件数必须为 1-10000");
     }
 
+    void validateVideoSettings() {
+        ProjectionVideoExporter.validateSettings(videoWidth, videoHeight, videoDurationSeconds, videoFramesPerSecond);
+        if (ffmpegPath != null && ffmpegPath.length() > 4096)
+            throw new IllegalArgumentException("FFmpeg 路径过长");
+    }
+
+    private void normalizeVideoSettings() {
+        if (ffmpegPath == null) ffmpegPath = "";
+        try {
+            validateVideoSettings();
+        } catch (IllegalArgumentException invalid) {
+            ffmpegPath = "";
+            videoWidth = 1280;
+            videoHeight = 720;
+            videoDurationSeconds = 8;
+            videoFramesPerSecond = 24;
+        }
+    }
+
     public static AgentConfig load(Path file) throws IOException {
         boolean newFile = !Files.exists(file);
         String json = newFile ? "{}" : Files.readString(file);
@@ -425,6 +452,7 @@ public final class AgentConfig {
         config.cacheMaxBytes = config.cacheRecentImageMaxBytes + config.cacheHistoricalImageMaxBytes;
         config.cacheImageMinProjectionBytes = Math.max(0, config.cacheImageMinProjectionBytes);
         config.cacheImageMinCalls = Math.max(0, config.cacheImageMinCalls);
+        config.normalizeVideoSettings();
         if (config.resourcePacks == null) config.resourcePacks = new ArrayList<>();
         if (config.botProfiles == null) config.botProfiles = new ArrayList<>();
         for (BotProfile profile : config.botProfiles) if (profile != null) profile.normalize();
@@ -461,6 +489,8 @@ public final class AgentConfig {
         if (config.maxConcurrentRenders < 1) config.maxConcurrentRenders = 1;
         if (config.maxConcurrentRenders > 4) config.maxConcurrentRenders = 4;
         if (config.memoryRestartThresholdBytes < 0) config.memoryRestartThresholdBytes = 0;
+        if (config.runtimeRecycleAfterTasks < 0 || config.runtimeRecycleAfterTasks > 1_000_000)
+            config.runtimeRecycleAfterTasks = 50;
         if (config.maxQueuedRequestBytes < 0) config.maxQueuedRequestBytes = 0;
         if (config.renderTimeoutMillis < 1_000) config.renderTimeoutMillis = 240_000;
         if (config.userRenderWindowSeconds < 1 || config.userRenderWindowSeconds > 86_400) config.userRenderWindowSeconds = 60;
@@ -567,6 +597,7 @@ public final class AgentConfig {
     }
 
     public void save(Path file) throws IOException {
+        validateVideoSettings();
         normalizeCommandDefinitions();
         Files.createDirectories(file.toAbsolutePath().getParent());
         Path temporary = file.resolveSibling(file.getFileName() + ".tmp");

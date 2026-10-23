@@ -8,7 +8,8 @@ record BotAttachment(String name, String url, String fileId, int busid, long siz
 record BotMessage(String profileId, String messageId, String userId, String groupId, String selfId,
                   boolean direct, boolean mentioned, List<BotAttachment> attachments,
                   String rawText, java.util.concurrent.atomic.AtomicInteger passiveReplySequence,
-                  String quotedMessageId, List<String> messageIndices, List<String> quotedMessageAliases) {
+                  String quotedMessageId, List<String> messageIndices, List<String> quotedMessageAliases,
+                  boolean mentionedAll) {
     BotMessage {
         messageIndices = messageIndices == null ? List.of() : List.copyOf(messageIndices);
         java.util.LinkedHashSet<String> aliases = new java.util.LinkedHashSet<>();
@@ -24,34 +25,34 @@ record BotMessage(String profileId, String messageId, String userId, String grou
                java.util.concurrent.atomic.AtomicInteger passiveReplySequence,
                String quotedMessageId, List<String> messageIndices) {
         this(profileId, messageId, userId, groupId, selfId, direct, mentioned, attachments, rawText,
-                passiveReplySequence, quotedMessageId, messageIndices, List.of());
+                passiveReplySequence, quotedMessageId, messageIndices, List.of(), false);
     }
 
     BotMessage(String profileId, String messageId, String userId, String groupId, String selfId,
                boolean direct, boolean mentioned, List<BotAttachment> attachments, String rawText) {
         this(profileId, messageId, userId, groupId, selfId, direct, mentioned, attachments, rawText,
-                new java.util.concurrent.atomic.AtomicInteger(), "", List.of(), List.of());
+                new java.util.concurrent.atomic.AtomicInteger(), "", List.of(), List.of(), false);
     }
 
     BotMessage(String profileId, String messageId, String userId, String groupId, String selfId,
                boolean direct, boolean mentioned, List<BotAttachment> attachments, String rawText,
                String quotedMessageId) {
         this(profileId, messageId, userId, groupId, selfId, direct, mentioned, attachments, rawText,
-                new java.util.concurrent.atomic.AtomicInteger(), quotedMessageId, List.of(), List.of());
+                new java.util.concurrent.atomic.AtomicInteger(), quotedMessageId, List.of(), List.of(), false);
     }
 
     BotMessage(String profileId, String messageId, String userId, String groupId, String selfId,
                boolean direct, boolean mentioned, List<BotAttachment> attachments, String rawText,
                java.util.concurrent.atomic.AtomicInteger passiveReplySequence) {
         this(profileId, messageId, userId, groupId, selfId, direct, mentioned, attachments, rawText,
-                passiveReplySequence, "", List.of(), List.of());
+                passiveReplySequence, "", List.of(), List.of(), false);
     }
 
     BotMessage(String profileId, String messageId, String userId, String groupId, String selfId,
                boolean direct, boolean mentioned, List<BotAttachment> attachments, String rawText,
                String quotedMessageId, List<String> messageIndices) {
         this(profileId, messageId, userId, groupId, selfId, direct, mentioned, attachments, rawText,
-                new java.util.concurrent.atomic.AtomicInteger(), quotedMessageId, messageIndices, List.of());
+                new java.util.concurrent.atomic.AtomicInteger(), quotedMessageId, messageIndices, List.of(), false);
     }
 
     int nextPassiveReplySequence() { return passiveReplySequence.incrementAndGet(); }

@@ -308,6 +308,10 @@ final class BotManager implements AutoCloseable {
         if (adapter instanceof OfficialQqAdapter && !message.direct()
                 && message.groupId() != null && !message.groupId().isBlank())
             announcementGroups.add(message.profileId(), message.groupId());
+        if (shouldIgnoreAtAllMessage(message)) {
+            log.accept("忽略机器人［" + profileName(message.profileId()) + "］收到的 @全体成员消息");
+            return;
+        }
         observeMessageIndices(message);
         String rawText = normalizeCommandText(message.rawText());
         SearchCommand search = parseSearchCommand(rawText);
@@ -387,6 +391,10 @@ final class BotManager implements AutoCloseable {
             }
         }
         Thread.startVirtualThread(() -> process(adapter, message));
+    }
+
+    static boolean shouldIgnoreAtAllMessage(BotMessage message) {
+        return message != null && !message.direct() && message.mentionedAll();
     }
 
     private void processIntroductionCommand(BotAdapter adapter, BotMessage message, boolean slashCommand) {

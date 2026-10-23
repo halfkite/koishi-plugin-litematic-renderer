@@ -30,6 +30,9 @@ import java.util.function.Consumer;
 final class OfficialQqAdapter implements BotAdapter, WebSocket.Listener {
     private static final String TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
     private static final String OPEN_API_BASE = "https://api.bot.qq.com";
+    private static final java.util.regex.Pattern AT_ALL_MARKER = java.util.regex.Pattern.compile(
+            "\\[CQ:at,[^\\]]*\\bqq\\s*=\\s*all(?:,|\\])|<@!?(?:all|everyone)>|<qqbot-at-everyone\\s*/>|(?<![\\p{L}\\p{N}_])@everyone(?![\\p{L}\\p{N}_])",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
     private final AgentConfig.BotProfile profile;
     private final AgentConfig config;
     private final String globalImageSendLayout;
@@ -215,6 +218,7 @@ final class OfficialQqAdapter implements BotAdapter, WebSocket.Listener {
         JsonObject author = object(data, "author");
         if (userId.isBlank() && author != null) userId = first(author, "member_openid", "user_openid", "id");
         boolean mentioned = isMentioned(event, data, selfId);
+        boolean mentionedAll = !direct && isAtAllMessage(data);
         List<BotAttachment> attachments = new ArrayList<>();
         JsonArray values = array(data, "attachments");
         if (values != null) for (JsonElement item : values) if (item != null && item.isJsonObject()) {
@@ -227,7 +231,8 @@ final class OfficialQqAdapter implements BotAdapter, WebSocket.Listener {
         List<String> quotedMessageIds = referencedMessageIds(data);
         receiver.accept(this, new BotMessage(profile.id, messageId, userId, groupId, selfId, direct, mentioned, attachments,
                 rawText, new java.util.concurrent.atomic.AtomicInteger(),
-                quotedMessageIds.isEmpty() ? "" : quotedMessageIds.getFirst(), messageIndexAliases(data), quotedMessageIds));
+                quotedMessageIds.isEmpty() ? "" : quotedMessageIds.getFirst(), messageIndexAliases(data), quotedMessageIds,
+                mentionedAll));
     }
 
     static String referencedMessageId(JsonObject data) {
@@ -296,6 +301,50 @@ final class OfficialQqAdapter implements BotAdapter, WebSocket.Listener {
             if (selfId != null && !selfId.isBlank() && selfId.equals(mentionedId)) return true;
         }
         return false;
+    }
+
+    static boolean isAtAllMessage(JsonObject data) {
+        if (data == null) return false;
+        if (truthy(data, "mention_everyone", "mentionEveryone", "is_at_all", "isAtAll", "at_all", "atAll")) return true;
+        JsonArray mentions = array(data, "mentions");
+        if (mentions != null) for (JsonElement entry : mentions) {
+            if (entry == null || entry.isJsonNull()) continue;
+            if (entry.isJsonPrimitive() && isAtAllValue(entry.getAsString())) return true;
+            if (!entry.isJsonObject()) continue;
+            JsonObject mention = entry.getAsJsonObject();
+            if (truthy(mention, "mention_everyone", "mentionEveryone", "is_at_all", "isAtAll", "everyone")) return true;
+            if (isAtAllValue(first(mention, "qq", "id", "openid", "user_openid", "member_openid", "user_id", "type")))
+                return true;
+        }
+        for (String key : List.of("message", "msg_elements", "msgElements")) {
+            JsonArray segments = array(data, key);
+            if (segments == null) continue;
+            for (JsonElement element : segments) {
+                if (element == null || !element.isJsonObject()) continue;
+                JsonObject segment = element.getAsJsonObject();
+                String type = first(segment, "type", "element_type");
+                JsonObject payload = object(segment, "data");
+                if (payload == null) payload = segment;
+                if (("at".equalsIgnoreCase(type) || "mention_everyone".equalsIgnoreCase(type))
+                        && ("mention_everyone".equalsIgnoreCase(type) || isAtAllTarget(payload))) return true;
+            }
+        }
+        return containsAtAllMarker(first(data, "content", "text"));
+    }
+
+    private static boolean isAtAllValue(String value) {
+        if (value == null) return false;
+        String normalized = value.trim();
+        return "all".equalsIgnoreCase(normalized) || "everyone".equalsIgnoreCase(normalized);
+    }
+
+    private static boolean isAtAllTarget(JsonObject data) {
+        return data != null && isAtAllValue(first(data, "qq", "id", "target", "target_id", "user_id"));
+    }
+
+    private static boolean containsAtAllMarker(String content) {
+        if (content == null || content.isEmpty()) return false;
+        return AT_ALL_MARKER.matcher(content).find();
     }
 
     private static boolean truthy(JsonObject value, String... keys) {

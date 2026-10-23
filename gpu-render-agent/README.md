@@ -1,6 +1,12 @@
-# Litematic GPU Agent 0.5.13
+# Litematic GPU Agent 0.6.0
+
+0.6.0 新增本地 MP4 导出：对投影固定缩放环绕渲染并编码为无声 H.264 视频，默认 8 秒、24 FPS、1280×720。可在“渲染设置”配置分辨率、时长、帧率和 FFmpeg 路径；FFmpeg 可执行文件不随 JAR 打包，路径留空时从系统 PATH 查找。视频帧只在临时任务目录中保存，编码后清理，不写入普通图片缓存；导出期间可查看进度并终止任务。
+
+0.5.15 修复群聊中 @全体成员触发机器人回复或自动渲染的问题。OneBot 使用结构化 `at` 段的 `qq=all` 识别；官方 QQ 使用全体提及字段/标记识别；统一消息入口在指令处理和附件渲染前忽略该类群消息。普通 @机器人和普通文本不受影响。
 
 跨平台可执行 JAR 与 Windows x64 便携 GPU Agent，用于 Minecraft 26.3 / Fabric 0.19.5 投影渲染。
+
+0.5.14 移除运行时自动回收的时间冷却。内存阈值只统计 Minecraft 客户端进程树，不再把 Agent 内存误算进客户端回收条件；桌面和网页分别显示 Agent/Minecraft 内存。默认每个客户端处理 50 个任务后轮换，可在“运行时内存管理”设置修改，设为 0 可关闭任务数轮换。内存触发使用恢复水位重新布防，不设固定等待时间；排空状态与任务领取原子同步，保证运行任务结束后客户端进程树退出，排队任务再继续。内存采样支持 Windows、Linux 和 macOS。
 
 0.5.13 增加可即时应用的“超时与单人 CD”设置。渲染超时默认 240 秒，从领取任务开始计算，覆盖缓存锁等待、客户端启动和渲染；排队等待、机器人下载和结果发送不计入渲染时间。超时后中断任务并回收对应客户端，记录“超时取消”，不清空其他任务。单人 CD 默认开启，每个机器人账号内同一用户每 60 秒最多接收 3 个投影文件，群聊和私聊共用额度；超额文件不解析附件、不下载、不入队，并提示剩余等待秒数。每个文件分别计数，解析或渲染失败也占用额度；重新发送需等待窗口释放。桌面“渲染设置”的“超时与单人 CD”可直接保存并应用，Web 配置也可修改；统计时间或数量修改后，下次接收文件时重置限流记录。配置键为 `renderTimeoutMillis`、`userRenderLimitEnabled`、`userRenderWindowSeconds` 和 `userRenderMaxFiles`；CD 不限制帮助、搜索或材料导出等文字指令。
 
@@ -31,29 +37,29 @@
 JAR 需要目标机器安装 Java 25：
 
 ```text
-java -jar litematic-gpu-agent-0.5.13-all.jar
-java -jar litematic-gpu-agent-0.5.13-all.jar --version
-java -jar litematic-gpu-agent-0.5.13-all.jar --help
-java -jar litematic-gpu-agent-0.5.13-all.jar --web
-java -jar litematic-gpu-agent-0.5.13-all.jar --bot
-java -jar litematic-gpu-agent-0.5.13-all.jar --audit-block-items --output block-items-26.3.json
+java -jar litematic-gpu-agent-0.6.0-all.jar
+java -jar litematic-gpu-agent-0.6.0-all.jar --version
+java -jar litematic-gpu-agent-0.6.0-all.jar --help
+java -jar litematic-gpu-agent-0.6.0-all.jar --web
+java -jar litematic-gpu-agent-0.6.0-all.jar --bot
+java -jar litematic-gpu-agent-0.6.0-all.jar --audit-block-items --output block-items-26.3.json
 ```
 
 也可以直接双击 `start-agent.bat` 启动桌面工具；把 `--web` 或 `--bot` 作为参数传给脚本即可启动对应模式。Linux/macOS 可执行 `./start-agent.sh --web`，脚本会自动查找 Java 和同目录 JAR。
 
-Windows 用户也可以解压 `litematic-gpu-agent-0.5.13-windows-x64.zip` 后直接启动 `Litematic GPU Agent/Litematic GPU Agent.exe`；该包已经内置 Java 25 Runtime，不需要安装 Java。首次渲染时，程序会从官方地址下载 Minecraft 26.3 客户端、资源和 Fabric Loader，并从 Modrinth 下载固定版本的 Fabric API、MaLiLib 与 Litematica，不需要登录账号，也不使用已有游戏目录。下载时桌面顶部和 Web 状态页会显示阶段、文件和进度；如果已有客户端，可在“渲染设置”选择 JAR，或在 Web 配置页上传本地 Minecraft 26.3 客户端。
+Windows 用户也可以解压 `litematic-gpu-agent-0.6.0-windows-x64.zip` 后直接启动 `Litematic GPU Agent/Litematic GPU Agent.exe`；该包已经内置 Java 25 Runtime，不需要安装 Java。首次渲染时，程序会从官方地址下载 Minecraft 26.3 客户端、资源和 Fabric Loader，并从 Modrinth 下载固定版本的 Fabric API、MaLiLib 与 Litematica，不需要登录账号，也不使用已有游戏目录。下载时桌面顶部和 Web 状态页会显示阶段、文件和进度；如果已有客户端，可在“渲染设置”选择 JAR，或在 Web 配置页上传本地 Minecraft 26.3 客户端。
 
 ### Linux Web 后台
 
 Linux 无桌面环境直接运行 `--web`，默认访问 `http://服务器IP:2618/`：
 
 ```text
-java -jar litematic-gpu-agent-0.5.13-all.jar --web
+java -jar litematic-gpu-agent-0.6.0-all.jar --web
 ```
 
 首次启动会在终端和 `web-credentials.txt` 输出随机 12 位数字密码，用户名默认是 `admin`。网页可配置多个官方 QQ 和 OneBot/NekoBot 账号、视角、亮度、拼接、缓存、资源包和云端连接。群消息模式有“接收群文件自动识别（不要求 @）”“仅被 @ 时识别”和“都可以（文件或 @）”三种选择。官方 QQ 与 OneBot 账号会在 Agent 内直接连接，不依赖 Koishi；OneBot 支持正向 WebSocket 与反向 WebSocket。`--bot` 只启动机器人和渲染服务，不启动网页。
 
-桌面 GUI 无参数启动时默认不打开网页。进入“连接设置”，勾选“启用 Web 管理后台”即可直接启动；同一页也可以填写两次新 Web 密码，保存后立即更新密码和 `web-credentials.txt`，留空则保持原密码不变。网页和本地 GUI 的“投影信息”设置共用同一份 `agent.json`，可以分别控制投影名称、保存者游戏 ID、创建时间、方块数/体积、尺寸、Litematic 版本和游戏版本是否发送。图片模式将多视角横向拼接、信息卡放在下方合成一张图；游戏 ID/创建时间、方块数/尺寸、投影版本/游戏版本分别左右对齐显示。桌面 GUI 将分辨率、本地渲染、缓存、文件大小上限、本地客户端和搜索投影集中在“渲染设置”页；Web 后台保留独立的“搜索投影”页面。账号、云端开关、视角、亮度、拼接、投影信息和内存阈值保存后即时应用；资源包会事务式重载。缓存目录、并行客户端数、Java 路径和 Web 监听地址/端口需要重启。
+桌面 GUI 无参数启动时默认不打开网页。进入“连接设置”，勾选“启用 Web 管理后台”即可直接启动；同一页也可以填写两次新 Web 密码，保存后立即更新密码和 `web-credentials.txt`，留空则保持原密码不变。网页和本地 GUI 的“投影信息”设置共用同一份 `agent.json`，可以分别控制投影名称、保存者游戏 ID、创建时间、方块数/体积、尺寸、Litematic 版本和游戏版本是否发送。图片模式将多视角横向拼接、信息卡放在下方合成一张图；游戏 ID/创建时间、方块数/尺寸、投影版本/游戏版本分别左右对齐显示。桌面 GUI 将分辨率、本地渲染、缓存、文件大小上限、本地客户端和搜索投影集中在“渲染设置”页；Web 后台保留独立的“搜索投影”页面。账号、云端开关、视角、亮度、拼接、投影信息、内存阈值和客户端任务轮换数保存后即时应用；资源包会事务式重载。缓存目录、并行客户端数、Java 路径和 Web 监听地址/端口需要重启。
 
 可以创建 `/etc/systemd/system/litematic-gpu-agent.service`：
 
@@ -64,7 +70,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=/opt/litematic-gpu-agent
-ExecStart=/usr/bin/java -jar /opt/litematic-gpu-agent/litematic-gpu-agent-0.5.13-all.jar --web
+ExecStart=/usr/bin/java -jar /opt/litematic-gpu-agent/litematic-gpu-agent-0.6.0-all.jar --web
 Restart=on-failure
 User=litematic
 

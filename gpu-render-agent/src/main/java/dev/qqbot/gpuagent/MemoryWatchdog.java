@@ -1,28 +1,25 @@
 package dev.qqbot.gpuagent;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
-/**
- * 内存看门狗：定期统计「工具进程 + 全部 Minecraft 渲染客户端」的物理内存占用。
- * 超过阈值后进入排空状态（不再领取新任务），手头任务全部完成后只重启 Minecraft 渲染端释放内存。
- * 10 分钟内重启超过 3 次则自动禁用 30 分钟，防止重启循环。
- */
+/** Monitors Agent and Minecraft processes separately and recycles only the isolated renderer processes. */
 final class MemoryWatchdog {
     private static final long CHECK_INTERVAL_SECONDS = 10;
-    private static final int RESTART_LIMIT = 3;
-    private static final long RESTART_WINDOW_MILLIS = 10 * 60_000L;
-    private static final long RESTART_COOLDOWN_MILLIS = 30 * 60_000L;
 
     private final AgentConfig config;
     private final RenderService renderer;
     private final RuntimeManager runtime;
-    private final java.util.function.Consumer<String> log;
+    private final Consumer<String> log;
+    private final ProcessMemorySampler sampler = new ProcessMemorySampler();
+    private final RuntimeMemoryPolicy memoryPolicy = new RuntimeMemoryPolicy();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread thread = new Thread(r, "memory-watchdog");
         thread.setDaemon(true);
@@ -30,11 +27,12 @@ final class MemoryWatchdog {
     });
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean restarting = new AtomicBoolean();
-    private final List<Long> restartTimes = new ArrayList<>();
-    private volatile long lastReportedTotalBytes;
-    private volatile long autoRestartDisabledUntil;
+    private volatile long lastReportedAgentBytes = -1;
+    private volatile long lastReportedRuntimeBytes = -1;
+    private volatile String pendingRestartReason = "内存保护";
+    private volatile boolean agentPressureLogged;
 
-    MemoryWatchdog(AgentConfig config, RenderService renderer, RuntimeManager runtime, Path dataRoot, java.util.function.Consumer<String> log) {
+    MemoryWatchdog(AgentConfig config, RenderService renderer, RuntimeManager runtime, Consumer<String> log) {
         this.config = config;
         this.renderer = renderer;
         this.runtime = runtime;
@@ -43,16 +41,22 @@ final class MemoryWatchdog {
 
     void start() {
         if (closed.get()) return;
-        if (config.memoryRestartThresholdBytes <= 0) {
-            log.accept("内存自动重启已关闭（阈值 = 0）");
-            return;
+        boolean enabled = config.memoryRestartThresholdBytes > 0 || config.runtimeRecycleAfterTasks > 0;
+        if (!enabled) {
+            log.accept("运行时自动回收已关闭（内存阈值和任务数回收均为 0）");
+        } else {
+            log.accept("运行时内存管理已启动：Minecraft 进程内存阈值 "
+                    + (config.memoryRestartThresholdBytes > 0 ? formatBytes(config.memoryRestartThresholdBytes) : "关闭")
+                    + "，每个客户端处理 "
+                    + (config.runtimeRecycleAfterTasks > 0 ? config.runtimeRecycleAfterTasks + " 个任务后轮换" : "不按任务数轮换")
+                    + "；不设时间冷却，当前任务完成后回收客户端并继续队列");
         }
         renderer.setDrainCompleteListener(this::restartProgram);
         scheduler.scheduleWithFixedDelay(this::check, CHECK_INTERVAL_SECONDS, CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
-        log.accept("内存看门狗已启动：阈值 " + formatBytes(config.memoryRestartThresholdBytes) + "，超限将在手头任务完成后重启 Minecraft GPU 运行时");
     }
 
-    long lastReportedTotalBytes() { return lastReportedTotalBytes; }
+    long lastReportedAgentBytes() { return lastReportedAgentBytes; }
+    long lastReportedRuntimeBytes() { return lastReportedRuntimeBytes; }
 
     void close() {
         if (closed.compareAndSet(false, true)) {
@@ -63,87 +67,91 @@ final class MemoryWatchdog {
 
     private void check() {
         try {
-            if (closed.get() || config.memoryRestartThresholdBytes <= 0 || renderer.isDraining()) return;
-            List<Long> pids = new ArrayList<>();
-            pids.add(ProcessHandle.current().pid());
-            pids.addAll(runtime.runningProcessPids());
-            long total = totalWorkingSetBytes(pids);
-            if (total < 0) return;
-            lastReportedTotalBytes = total;
-            if (total <= config.memoryRestartThresholdBytes) return;
-            if (System.currentTimeMillis() < autoRestartDisabledUntil) {
-                log.accept("内存占用 " + formatBytes(total) + " 已超过阈值，但自动重启处于冷却期，请手动重启程序");
+            if (closed.get() || renderer.isDraining()
+                    || config.memoryRestartThresholdBytes <= 0 && config.runtimeRecycleAfterTasks <= 0) return;
+            List<Long> runtimePids = runtime.runningProcessPids();
+            long agentPid = ProcessHandle.current().pid();
+            LinkedHashSet<Long> allPids = new LinkedHashSet<>(runtimePids);
+            allPids.add(agentPid);
+            Map<Long, Long> memory = sampler.sample(new ArrayList<>(allPids));
+            lastReportedAgentBytes = memory.getOrDefault(agentPid, -1L);
+            lastReportedRuntimeBytes = sumKnownBytes(runtimePids, memory);
+
+            long threshold = config.memoryRestartThresholdBytes;
+            if (threshold > 0 && lastReportedAgentBytes > threshold) {
+                if (!agentPressureLogged) {
+                    agentPressureLogged = true;
+                    log.accept("Agent 进程内存 " + formatBytes(lastReportedAgentBytes)
+                            + " 高于运行时阈值；Minecraft 客户端回收不会释放 Agent 内存，请依据诊断日志定位 Agent 保留对象");
+                }
+            } else if (threshold <= 0 || lastReportedAgentBytes >= 0
+                    && lastReportedAgentBytes < threshold - threshold / 4) {
+                agentPressureLogged = false;
+            }
+
+            if (threshold > 0 && memoryPolicy.shouldRecycle(lastReportedRuntimeBytes, threshold, runtime.isAlive())) {
+                requestDrain("Minecraft 客户端进程内存 " + formatBytes(lastReportedRuntimeBytes)
+                        + " 超过阈值 " + formatBytes(threshold));
                 return;
             }
-            log.accept("内存占用 " + formatBytes(total) + " 超过阈值 " + formatBytes(config.memoryRestartThresholdBytes)
-                    + "：停止领取新任务，等待手头 " + runningCountText() + "完成后重启 Minecraft GPU 运行时");
-            renderer.startDraining();
+
+            int taskLimit = config.runtimeRecycleAfterTasks;
+            if (runtime.recycleDueToTaskCount(taskLimit)) {
+                requestDrain("Minecraft 客户端已处理 " + runtime.maxCompletedRenderTasks()
+                        + " 个任务，达到每客户端 " + taskLimit + " 个任务的轮换上限");
+            }
         } catch (Throwable error) {
             log.accept("内存监控异常：" + error.getMessage());
         }
     }
 
-    private String runningCountText() {
-        int running = renderer.runningTaskCount();
-        return running > 0 ? running + " 个任务" : "任务";
+    private synchronized void requestDrain(String reason) {
+        if (closed.get() || restarting.get() || renderer.isDraining()) return;
+        pendingRestartReason = reason;
+        log.accept("运行时回收已触发：" + reason + "；暂停领取新任务，等待当前任务结束");
+        renderer.startDraining();
     }
 
-    /** 用 PowerShell 读取一组进程的物理内存（WorkingSet64）总和；失败返回 -1 表示本轮跳过。 */
-    private static long totalWorkingSetBytes(List<Long> pids) {
-        try {
-            StringBuilder ids = new StringBuilder();
-            for (Long pid : pids) ids.append(pid).append(',');
-            ProcessBuilder builder = new ProcessBuilder("powershell", "-NoProfile", "-Command",
-                    "(Get-Process -Id " + ids.substring(0, ids.length() - 1) + " -ErrorAction SilentlyContinue | "
-                            + "Measure-Object WorkingSet64 -Sum).Sum");
-            builder.redirectErrorStream(true);
-            Process process = builder.start();
-            String output;
-            try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
-                output = reader.readLine();
-            }
-            process.waitFor(15, TimeUnit.SECONDS);
-            if (output == null) return -1;
-            output = output.trim().replaceAll("[^0-9]", "");
-            if (output.isEmpty()) return -1;
-            return Long.parseLong(output);
-        } catch (Throwable ignored) {
-            return -1;
-        }
-    }
-
-    /** 手头任务完成后的运行时重启：不重启 Agent，不丢弃排队任务。 */
     private void restartProgram() {
         if (closed.get() || !restarting.compareAndSet(false, true)) return;
+        long agentBefore = lastReportedAgentBytes;
+        long runtimeBefore = lastReportedRuntimeBytes;
+        String reason = pendingRestartReason;
         try {
-            long now = System.currentTimeMillis();
-            synchronized (restartTimes) {
-                restartTimes.removeIf(timestamp -> now - timestamp > RESTART_WINDOW_MILLIS);
-                if (restartTimes.size() >= RESTART_LIMIT) {
-                    autoRestartDisabledUntil = now + RESTART_COOLDOWN_MILLIS;
-                }
-            }
-            if (now < autoRestartDisabledUntil) {
-                log.accept("检测到短时间内多次内存重启，已暂停自动重启 30 分钟，请检查内存占用异常原因");
-                renderer.restartRuntimeAfterDrain();
-                return;
-            }
-            synchronized (restartTimes) {
-                restartTimes.add(now);
-            }
+            log.accept("开始回收 Minecraft GPU 客户端：" + reason);
             renderer.restartRuntimeAfterDrain();
+            lastReportedRuntimeBytes = 0;
+            log.accept("Minecraft 客户端进程树已退出；回收前 Agent=" + formatOptional(agentBefore)
+                    + "，Minecraft=" + formatOptional(runtimeBefore)
+                    + "。等待中的任务继续由新客户端处理");
         } catch (Throwable error) {
-            log.accept("Minecraft GPU 运行时自动重启失败：" + error + "，将恢复队列；请检查运行时日志");
+            log.accept("Minecraft GPU 客户端回收失败：" + error + "；队列将恢复，继续检查内存");
             try {
                 renderer.restartRuntimeAfterDrain();
-            } catch (Throwable ignored) {
-                log.accept("恢复渲染队列失败，请手动重启 Agent");
+            } catch (Throwable recoveryError) {
+                log.accept("恢复渲染队列失败，请手动重启 Agent：" + recoveryError.getMessage());
             }
         } finally {
             restarting.set(false);
-            // drainCompleteListener 是一次性回调；重新挂载后，下一次内存回收仍能触发运行时重启。
             if (!closed.get()) renderer.setDrainCompleteListener(this::restartProgram);
         }
+    }
+
+    private static long sumKnownBytes(List<Long> processIds, Map<Long, Long> memory) {
+        if (processIds.isEmpty()) return 0;
+        long total = 0;
+        int found = 0;
+        for (long processId : processIds) {
+            Long bytes = memory.get(processId);
+            if (bytes == null) continue;
+            total = Math.addExact(total, bytes);
+            found++;
+        }
+        return found == 0 ? -1 : total;
+    }
+
+    private static String formatOptional(long bytes) {
+        return bytes < 0 ? "不可用" : formatBytes(bytes);
     }
 
     private static String formatBytes(long bytes) {

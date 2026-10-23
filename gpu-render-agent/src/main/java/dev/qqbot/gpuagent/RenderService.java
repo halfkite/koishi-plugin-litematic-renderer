@@ -14,12 +14,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -33,18 +31,12 @@ final class RenderService implements AutoCloseable {
         int users;
     }
     private final java.util.concurrent.ConcurrentHashMap<String, CacheLock> cacheLocks = new java.util.concurrent.ConcurrentHashMap<>();
-    private final LinkedBlockingQueue<QueuedTask> tasks = new LinkedBlockingQueue<>();
+    private final RenderTaskQueue<QueuedTask> tasks = new RenderTaskQueue<>();
     private final List<Thread> workers = new ArrayList<>();
     private final java.util.concurrent.ConcurrentHashMap<QueuedTask, RunningTask> runningTasks = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
     /** 取消代次：cancelAll 递增；任务开始时记录当前代次，渲染循环发现代次变化即中止本任务。 */
     private volatile long cancelEpoch;
-    /** 内存保护排空状态：true 时不再领取新任务，手头任务照常完成。 */
-    private volatile boolean draining;
-    private volatile Runnable drainCompleteListener;
-    private final AtomicInteger queueLength = new AtomicInteger();
-    /** 已经领取但尚未完成的任务数，覆盖从 take() 到 runningTasks.put() 之间的竞态窗口。 */
-    private final AtomicInteger inFlightTasks = new AtomicInteger();
     /** 队列和运行中任务仍持有的投影字节数，防止无限排队保留完整 byte[]。 */
     private final AtomicLong retainedRequestBytes = new AtomicLong();
     private Consumer<RenderModels.TaskHistory> historyListener;
@@ -69,9 +61,11 @@ final class RenderService implements AutoCloseable {
         final String historyLocation;
         final RenderModels.TaskMeta meta;
         final boolean auxiliary;
+        final boolean transientOutput;
         final CompletableFuture<RenderModels.Result> future = new CompletableFuture<>();
 
-        QueuedTask(RenderModels.Request request, byte[] schematic, Duration timeout, String source, String historyLocation, RenderModels.TaskMeta meta, boolean auxiliary) {
+        QueuedTask(RenderModels.Request request, byte[] schematic, Duration timeout, String source, String historyLocation,
+                   RenderModels.TaskMeta meta, boolean auxiliary, boolean transientOutput) {
             this.request = request;
             this.schematic = schematic;
             this.timeout = timeout;
@@ -79,6 +73,7 @@ final class RenderService implements AutoCloseable {
             this.historyLocation = historyLocation;
             this.meta = meta;
             this.auxiliary = auxiliary;
+            this.transientOutput = transientOutput;
         }
     }
 
@@ -127,18 +122,27 @@ final class RenderService implements AutoCloseable {
 
     CompletableFuture<RenderModels.Result> submit(RenderModels.Request request, byte[] schematic, Duration timeout,
                                                   String source, String historyLocation, RenderModels.TaskMeta meta) {
-        return submit(request, schematic, timeout, source, historyLocation, meta, false);
+        return submit(request, schematic, timeout, source, historyLocation, meta, false, false);
     }
 
     CompletableFuture<RenderModels.Result> submitAuxiliary(RenderModels.Request request, byte[] schematic, Duration timeout,
                                                            String source, RenderModels.TaskMeta meta) {
-        return submit(request, schematic, timeout, source, null, meta, true);
+        return submit(request, schematic, timeout, source, null, meta, true, false);
+    }
+
+    CompletableFuture<RenderModels.Result> submitTransient(RenderModels.Request request, byte[] schematic, Duration timeout,
+                                                           String source, String historyLocation) {
+        return submit(request, schematic, timeout, source, historyLocation, null, false, true);
     }
 
     private CompletableFuture<RenderModels.Result> submit(RenderModels.Request request, byte[] schematic, Duration timeout,
                                                           String source, String historyLocation, RenderModels.TaskMeta meta,
-                                                          boolean auxiliary) {
+                                                          boolean auxiliary, boolean transientOutput) {
         CompletableFuture<RenderModels.Result> rejected = new CompletableFuture<>();
+        if (request == null || schematic == null) {
+            rejected.completeExceptionally(new RenderFailure("INVALID_REQUEST", "渲染请求和投影数据不能为空"));
+            return rejected;
+        }
         if (timeout == null || timeout.isNegative() || timeout.isZero()
                 || timeout.compareTo(Duration.ofMillis(Integer.MAX_VALUE)) > 0) {
             rejected.completeExceptionally(new RenderFailure("INVALID_TIMEOUT", "渲染超时必须为正数"));
@@ -148,7 +152,7 @@ final class RenderService implements AutoCloseable {
             rejected.completeExceptionally(new RenderFailure("CLOSED", "渲染服务已关闭"));
             return rejected;
         }
-        if (draining) {
+        if (tasks.isDraining()) {
             rejected.completeExceptionally(new RenderFailure("DRAINING", "渲染端正在释放内存，请稍后重试"));
             return rejected;
         }
@@ -163,10 +167,15 @@ final class RenderService implements AutoCloseable {
             }
             if (retainedRequestBytes.compareAndSet(current, current + requestBytes)) break;
         }
+        QueuedTask task = new QueuedTask(request, schematic, timeout, source, historyLocation, meta, auxiliary, transientOutput);
+        RenderTaskQueue.OfferResult offered = tasks.offer(task);
+        if (offered != RenderTaskQueue.OfferResult.ACCEPTED) {
+            retainedRequestBytes.addAndGet(-requestBytes);
+            rejected.completeExceptionally(new RenderFailure("CLOSED".equals(offered.name()) ? "CLOSED" : "DRAINING",
+                    offered == RenderTaskQueue.OfferResult.CLOSED ? "渲染服务已关闭" : "渲染端正在释放内存，请稍后重试"));
+            return rejected;
+        }
         idleGeneration.incrementAndGet();
-        QueuedTask task = new QueuedTask(request, schematic, timeout, source, historyLocation, meta, auxiliary);
-        queueLength.incrementAndGet();
-        tasks.add(task);
         return task.future;
     }
 
@@ -181,30 +190,21 @@ final class RenderService implements AutoCloseable {
         return runningTasks.values().stream().map(task -> task.stage).filter(stage -> stage != null && !stage.isEmpty())
                 .reduce((left, right) -> left + "、" + right).orElse("");
     }
-    boolean isDraining() { return draining; }
+    boolean isDraining() { return tasks.isDraining(); }
 
     /** 内存看门狗用：进入排空状态（停止领取新任务）。 */
-    void startDraining() { draining = true; maybeNotifyDrainComplete(); }
+    void startDraining() { tasks.startDraining(); }
 
     /** 内存看门狗用：排空后（手头任务全部完成）要执行的回调（触发程序重启）。 */
-    void setDrainCompleteListener(Runnable listener) { this.drainCompleteListener = listener; maybeNotifyDrainComplete(); }
-
-    private void maybeNotifyDrainComplete() {
-        if (draining && inFlightTasks.get() == 0 && drainCompleteListener != null) {
-            Runnable listener = drainCompleteListener;
-            drainCompleteListener = null;
-            Thread.startVirtualThread(listener);
-        }
-    }
+    void setDrainCompleteListener(Runnable listener) { tasks.setDrainCompleteListener(listener); }
 
     /** 终止当前正在渲染的任务并清空排队中的任务。 */
     void cancelAll() {
         cancelEpoch++;
         List<QueuedTask> pending = new ArrayList<>();
-        tasks.drainTo(pending);
+        pending.addAll(tasks.drainQueued());
         for (QueuedTask task : pending) {
             task.future.completeExceptionally(new RenderFailure("CANCELLED", "任务已手动终止"));
-            queueLength.updateAndGet(value -> Math.max(0, value - 1));
             retainedRequestBytes.addAndGet(-task.schematic.length);
         }
         for (Thread worker : workers) if (worker.isAlive()) worker.interrupt();
@@ -216,13 +216,12 @@ final class RenderService implements AutoCloseable {
         while (!closed.get()) {
             QueuedTask task;
             try {
-                while (draining && !closed.get()) Thread.sleep(300);
                 task = tasks.take();
             } catch (InterruptedException interrupted) {
                 if (closed.get()) return;
                 continue;
             }
-            inFlightTasks.incrementAndGet();
+            if (task == null) return;
             long epochAtStart = cancelEpoch;
             int slot = Math.min(workers.indexOf(Thread.currentThread()), runtime.slotCount() - 1);
             RunningTask running = new RunningTask(task.request.filename(), task.source, task.meta, slot);
@@ -259,22 +258,26 @@ final class RenderService implements AutoCloseable {
                 else task.future.completeExceptionally(throwable);
             }
             finally {
-                if (guard != null) guard.close();
-                runningTasks.remove(task);
-                queueLength.updateAndGet(value -> Math.max(0, value - 1));
-                retainedRequestBytes.addAndGet(-task.schematic.length);
-                inFlightTasks.decrementAndGet();
-                long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
-                String status = success ? "成功" : (cancelEpoch != epochAtStart ? "已终止" : timedOut ? "超时取消" : "失败");
-                Path location = task.historyLocation != null ? Path.of(task.historyLocation)
-                        : running.outputDir != null ? running.outputDir : null;
-                Consumer<RenderModels.TaskHistory> listener = historyListener;
-                if (listener != null) {
-                    listener.accept(new RenderModels.TaskHistory(task.request.filename(), task.request.views().size(),
-                            elapsedMillis, status, location == null ? "" : location.toString(), task.source));
+                try {
+                    if (guard != null) guard.close();
+                    runningTasks.remove(task);
+                    retainedRequestBytes.addAndGet(-task.schematic.length);
+                    runtime.recordRenderCompleted(slot);
+                    long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
+                    String status = success ? "成功" : (cancelEpoch != epochAtStart ? "已终止" : timedOut ? "超时取消" : "失败");
+                    Path location = task.historyLocation != null ? Path.of(task.historyLocation)
+                            : running.outputDir != null ? running.outputDir : null;
+                    Consumer<RenderModels.TaskHistory> listener = historyListener;
+                    if (listener != null) try {
+                        listener.accept(new RenderModels.TaskHistory(task.request.filename(), task.request.views().size(),
+                                elapsedMillis, status, location == null ? "" : location.toString(), task.source));
+                    } catch (Throwable listenerError) { log.accept("记录渲染历史失败：" + listenerError.getMessage()); }
+                } catch (RuntimeException cleanupError) {
+                    log.accept("清理渲染任务状态失败：" + cleanupError.getMessage());
+                } finally {
+                    try { tasks.completeTask(); }
+                    finally { scheduleIdleStop(); }
                 }
-                scheduleIdleStop();
-                maybeNotifyDrainComplete();
             }
         }
     }
@@ -283,11 +286,11 @@ final class RenderService implements AutoCloseable {
     private void scheduleIdleStop() {
         int idleMillis = config.renderIdleStopMillis;
         if (closed.get()) return;
-        if (idleMillis <= 0 || !runningTasks.isEmpty() || queueLength.get() > 0) return;
+        if (idleMillis <= 0 || !runningTasks.isEmpty() || queueLength() > 0) return;
         long generation = idleGeneration.get();
         try {
             idleTimer.schedule(() -> {
-                if (idleGeneration.get() != generation || !runningTasks.isEmpty() || queueLength.get() > 0) return;
+                if (idleGeneration.get() != generation || !runningTasks.isEmpty() || queueLength() > 0) return;
                 if (runtime.isAlive()) {
                     log.accept("渲染运行时已空闲 " + (idleMillis / 1000) + " 秒且无新任务，自动关闭 Minecraft");
                     runtime.stop();
@@ -299,8 +302,8 @@ final class RenderService implements AutoCloseable {
     }
 
     boolean isBusy() { return !runningTasks.isEmpty(); }
-    int queueLength() { return queueLength.get(); }
-    int runningTaskCount() { return inFlightTasks.get(); }
+    int queueLength() { return tasks.size(); }
+    int runningTaskCount() { return tasks.inFlightCount(); }
     long retainedRequestBytes() { return retainedRequestBytes.get(); }
     RuntimeManager runtime() { return runtime; }
 
@@ -309,14 +312,13 @@ final class RenderService implements AutoCloseable {
      * RuntimeManager.stop() 返回前会同步回收 Java/Fabric/GLFW 进程，之后队列线程继续领取任务并按需启动新客户端。
      */
     void restartRuntimeAfterDrain() {
-        if (!draining || inFlightTasks.get() != 0) return;
+        if (!tasks.isDraining() || tasks.inFlightCount() != 0) return;
         try {
             log.accept("内存保护：当前任务已完成，正在停止并回收 Minecraft GPU 运行时");
             runtime.stop();
             log.accept("内存保护：Minecraft GPU 运行时已完全退出，继续处理剩余队列");
         } finally {
-            draining = false;
-            maybeNotifyDrainComplete();
+            tasks.resume();
         }
     }
 
@@ -365,12 +367,13 @@ final class RenderService implements AutoCloseable {
             return lock;
         });
         boolean locked = false;
+        boolean retainTaskDirectory = false;
         Path taskDirectory = null;
         try {
             locked = cacheLock.lock.tryLock(guard.remaining().toNanos(), TimeUnit.NANOSECONDS);
             if (!locked) throw guard.failure();
             {
-                CacheStore.CacheHit cached = queued.auxiliary ? null
+                CacheStore.CacheHit cached = queued.auxiliary || queued.transientOutput ? null
                         : cacheStore.lookup(request, schematic, Main.VERSION, packFingerprint);
                 if (cached != null) {
                     running.outputDir = cached.directory().toAbsolutePath().normalize();
@@ -382,7 +385,7 @@ final class RenderService implements AutoCloseable {
                     cacheStore.importProjection(schematic, request.filename());
                     List<RenderModels.Image> extra = auxiliaryHit(request, fileHash, packFingerprint);
                     if (!extra.isEmpty()) return new RenderModels.Result(request.id(), extra, 0, true, "cache");
-                } else {
+                } else if (!queued.transientOutput) {
                     cacheStore.invalidateImages(fileHash);
                 }
 
@@ -391,9 +394,9 @@ final class RenderService implements AutoCloseable {
                 String id = UUID.randomUUID().toString();
                 Path task = root.resolve(id);
                 taskDirectory = task;
-                Path folder = cacheStore.directory().resolve(fileHash);
+                Path folder = queued.transientOutput ? task.resolve("projection") : cacheStore.directory().resolve(fileHash);
                 Path input = folder.resolve(CacheStore.safeProjectionFilename(request.filename()));
-                if (Files.isRegularFile(folder.resolve("about.json5"))) {
+                if (!queued.transientOutput && Files.isRegularFile(folder.resolve("about.json5"))) {
                     // 同一哈希的首次文件名必须保持稳定，CacheStore.save 会再次确认该名称。
                     try {
                         JsonObject about = Protocol.GSON.fromJson(Files.readString(folder.resolve("about.json5")), JsonObject.class);
@@ -405,7 +408,7 @@ final class RenderService implements AutoCloseable {
                 if (!Files.exists(input)) Files.write(input, schematic);
                 Path output = task.resolve("output");
                 // 任务输出只是运行时中转目录，最终文件统一落到配置的缓存目录。
-                running.outputDir = folder.toAbsolutePath().normalize();
+                running.outputDir = queued.transientOutput ? output.toAbsolutePath().normalize() : folder.toAbsolutePath().normalize();
                 Files.createDirectories(output);
 
                 Path bridge = runtime.slotBridgeDirectory(slot);
@@ -452,9 +455,15 @@ final class RenderService implements AutoCloseable {
                             images.add(new RenderModels.Image(image.id(), image.name(), image.width(), image.height(), path));
                         }
                         guard.check();
+                        List<RenderModels.Image> completeImages = requireCompleteImages(request, images);
+                        if (queued.transientOutput) {
+                            retainTaskDirectory = true;
+                            return new RenderModels.Result(request.id(), completeImages, result.elapsedMillis(), false,
+                                    result.gpu(), taskDirectory);
+                        }
                         List<RenderModels.Image> cachedImages = queued.auxiliary
-                                ? saveAuxiliary(request, requireCompleteImages(request, images), fileHash, packFingerprint)
-                                : cacheStore.save(request, requireCompleteImages(request, images), schematic, running.meta,
+                                ? saveAuxiliary(request, completeImages, fileHash, packFingerprint)
+                                : cacheStore.save(request, completeImages, schematic, running.meta,
                                         running.source, Main.VERSION, packFingerprint, result.elapsedMillis(), result.gpu());
                         running.outputDir = folder.toAbsolutePath().normalize();
                         return cacheStore.result(request, cachedImages, result.elapsedMillis(), result.cacheHit(), result.gpu());
@@ -481,7 +490,7 @@ final class RenderService implements AutoCloseable {
             }
             throw failure;
         } finally {
-            if (taskDirectory != null) deleteTreeQuietly(taskDirectory);
+            if (taskDirectory != null && !retainTaskDirectory) deleteTreeQuietly(taskDirectory);
             if (locked) cacheLock.lock.unlock();
             cacheLocks.computeIfPresent(fileHash, (key, current) -> --current.users == 0 ? null : current);
         }
@@ -492,6 +501,7 @@ final class RenderService implements AutoCloseable {
                                                                String packFingerprint, RenderTaskTimeout guard) throws Exception {
         Path temporary = Files.createTempDirectory(root, "software-fallback-");
         long started = System.nanoTime();
+        boolean retainTemporary = false;
         try {
             Path input = temporary.resolve(CacheStore.safeProjectionFilename(queued.request.filename()));
             Path output = temporary.resolve("output");
@@ -522,6 +532,12 @@ final class RenderService implements AutoCloseable {
                 }
                 long elapsed = (System.nanoTime() - started) / 1_000_000L;
                 guard.check();
+                if (queued.transientOutput) {
+                    retainTemporary = true;
+                    running.outputDir = output.toAbsolutePath().normalize();
+                    return new RenderModels.Result(queued.request.id(), images, elapsed, false,
+                            "software-fallback", temporary);
+                }
                 List<RenderModels.Image> cached = queued.auxiliary
                         ? saveAuxiliary(queued.request, images, fileHash, packFingerprint)
                         : cacheStore.save(queued.request, images, schematic, running.meta,
@@ -530,7 +546,7 @@ final class RenderService implements AutoCloseable {
                 return cacheStore.result(queued.request, cached, elapsed, false, "software-fallback");
             }
         } finally {
-            deleteTreeQuietly(temporary);
+            if (!retainTemporary) deleteTreeQuietly(temporary);
         }
     }
 
@@ -661,11 +677,9 @@ final class RenderService implements AutoCloseable {
         closed.set(true);
         timeoutTimer.shutdownNow();
         idleTimer.shutdownNow();
-        List<QueuedTask> pending = new ArrayList<>();
-        tasks.drainTo(pending);
+        List<QueuedTask> pending = tasks.close();
         for (QueuedTask task : pending) {
             task.future.completeExceptionally(new RenderFailure("CLOSED", "渲染服务已关闭"));
-            queueLength.updateAndGet(value -> Math.max(0, value - 1));
             retainedRequestBytes.addAndGet(-task.schematic.length);
         }
         for (Thread worker : workers) worker.interrupt();

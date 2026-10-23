@@ -18,6 +18,12 @@ class AgentConfigTest {
             assertEquals(2097152, config.cacheImageMinProjectionBytes);
             assertEquals(30, config.cacheImageMinCalls);
             assertEquals(15, config.nightVisionLevel);
+            assertEquals(50, config.runtimeRecycleAfterTasks);
+            assertEquals("", config.ffmpegPath);
+            assertEquals(1280, config.videoWidth);
+            assertEquals(720, config.videoHeight);
+            assertEquals(8, config.videoDurationSeconds);
+            assertEquals(24, config.videoFramesPerSecond);
             assertFalse(config.localMergeEnabled);
             assertTrue(config.showMetadataProjectionName);
             assertTrue(config.showMetadataAuthor);

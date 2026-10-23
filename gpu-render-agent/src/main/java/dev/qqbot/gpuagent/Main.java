@@ -14,7 +14,7 @@ import java.util.function.Consumer;
 
 public final class Main {
     /** 工具版本号：与 build.gradle 和预发布包名保持一致。 */
-    public static final String VERSION = "0.5.13";
+    public static final String VERSION = "0.6.0";
 
     private Main() {}
 
@@ -144,8 +144,9 @@ public final class Main {
         HttpV1Server httpServer = new HttpV1Server(config, renderer, log);
         CloudConnection cloud = new CloudConnection(config, renderer, log);
         BotManager bots = new BotManager(root, configPath, config, renderer, log);
+        MemoryWatchdog watchdog = new MemoryWatchdog(config, renderer, renderer.runtime(), log);
         WebAdminServer webServer = new WebAdminServer(root, configPath, config, renderer, bots, cloud, log);
-        MemoryWatchdog watchdog = new MemoryWatchdog(config, renderer, renderer.runtime(), root, log);
+        webServer.setMemoryWatchdog(watchdog);
         AtomicBoolean closed = new AtomicBoolean();
         Runnable close = () -> {
             if (!closed.compareAndSet(false, true)) return;

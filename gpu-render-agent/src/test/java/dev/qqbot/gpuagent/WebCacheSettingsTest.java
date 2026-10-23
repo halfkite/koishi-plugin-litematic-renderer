@@ -35,12 +35,18 @@ class WebCacheSettingsTest {
             var read = client.send(HttpRequest.newBuilder(URI.create(base + "/api/config")).header("Cookie", cookie).build(), HttpResponse.BodyHandlers.ofString());
             assertTrue(read.body().contains("cacheImageMinProjectionBytes"));
             assertTrue(read.body().contains("cacheImageMinCalls"));
+            assertTrue(read.body().contains("runtimeRecycleAfterTasks"));
             var saved = client.send(HttpRequest.newBuilder(URI.create(base + "/api/config")).header("Cookie", cookie)
                     .PUT(HttpRequest.BodyPublishers.ofString("{\"cacheImageMinProjectionBytes\":4194304,\"cacheImageMinCalls\":50}")).build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, saved.statusCode(), saved.body());
             assertFalse(Protocol.GSON.fromJson(saved.body(), com.google.gson.JsonObject.class).get("restartRequired").getAsBoolean());
             assertEquals(4194304, config.cacheImageMinProjectionBytes);
             assertEquals(50, AgentConfig.load(path).cacheImageMinCalls);
+            var runtimeSettings = client.send(HttpRequest.newBuilder(URI.create(base + "/api/config")).header("Cookie", cookie)
+                    .PUT(HttpRequest.BodyPublishers.ofString("{\"memoryRestartThresholdBytes\":3221225472,\"runtimeRecycleAfterTasks\":24}")).build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, runtimeSettings.statusCode(), runtimeSettings.body());
+            assertEquals(3L * 1024 * 1024 * 1024, config.memoryRestartThresholdBytes);
+            assertEquals(24, AgentConfig.load(path).runtimeRecycleAfterTasks);
             var invalid = client.send(HttpRequest.newBuilder(URI.create(base + "/api/config")).header("Cookie", cookie)
                     .PUT(HttpRequest.BodyPublishers.ofString("{\"cacheImageMinCalls\":-1}")).build(), HttpResponse.BodyHandlers.ofString());
             assertNotEquals(200, invalid.statusCode());
@@ -50,6 +56,7 @@ class WebCacheSettingsTest {
             assertTrue(page.body().contains("id=\"cacheImageCalls\""));
             assertTrue(page.body().contains("id=\"renderTimeoutSeconds\""));
             assertTrue(page.body().contains("id=\"userRenderLimitEnabled\""));
+            assertTrue(page.body().contains("id=\"runtimeRecycleAfterTasks\""));
             var limits = client.send(HttpRequest.newBuilder(URI.create(base + "/api/config")).header("Cookie", cookie)
                     .PUT(HttpRequest.BodyPublishers.ofString("{\"renderTimeoutMillis\":12000,\"userRenderLimitEnabled\":true,\"userRenderWindowSeconds\":30,\"userRenderMaxFiles\":2}")).build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, limits.statusCode(), limits.body());

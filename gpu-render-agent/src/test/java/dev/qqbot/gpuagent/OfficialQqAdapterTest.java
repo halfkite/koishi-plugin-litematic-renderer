@@ -164,6 +164,22 @@ class OfficialQqAdapterTest {
     }
 
     @Test
+    void detectsOfficialAtAllMarkersWithoutMatchingOrdinaryText() {
+        assertTrue(OfficialQqAdapter.isAtAllMessage(Protocol.GSON.fromJson(
+                "{\"mention_everyone\":true}", com.google.gson.JsonObject.class)));
+        assertTrue(OfficialQqAdapter.isAtAllMessage(Protocol.GSON.fromJson(
+                "{\"content\":\"<qqbot-at-everyone />\"}", com.google.gson.JsonObject.class)));
+        assertTrue(OfficialQqAdapter.isAtAllMessage(Protocol.GSON.fromJson(
+                "{\"content\":\"@everyone /帮助\"}", com.google.gson.JsonObject.class)));
+        assertTrue(OfficialQqAdapter.isAtAllMessage(Protocol.GSON.fromJson(
+                "{\"mentions\":[{\"id\":\"all\"}]}", com.google.gson.JsonObject.class)));
+        assertFalse(OfficialQqAdapter.isAtAllMessage(Protocol.GSON.fromJson(
+                "{\"content\":\"这段文字提到了@全体成员，但不是提及\"}", com.google.gson.JsonObject.class)));
+        assertFalse(OfficialQqAdapter.isAtAllMessage(Protocol.GSON.fromJson(
+                "{\"mentions\":[{\"id\":\"member-42\",\"is_you\":false}]}", com.google.gson.JsonObject.class)));
+    }
+
+    @Test
     void readsOfficialGroupQuoteIndexFromMessageSceneExtensions() {
         var event = com.google.gson.JsonParser.parseString("""
                 {"message_scene":{"ext":["msg_idx=REFIDX_CURRENT","ref_msg_idx=REFIDX_RENDER"]}}

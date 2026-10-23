@@ -106,6 +106,7 @@
           <div class="panel metric"><span class="muted">运行时</span><strong id="runtimeReady">-</strong></div>
           <div class="panel metric"><span class="muted">GPU</span><strong id="gpu">-</strong></div>
           <div class="panel metric"><span class="muted">队列</span><strong id="queue">-</strong></div>
+          <div class="panel metric"><span class="muted">内存</span><strong id="memoryUsage">-</strong></div>
           <div class="panel metric"><span class="muted">当前任务</span><strong id="currentFile">-</strong></div>
         </div>
         <div class="panel"><h2>机器人账号</h2><div id="accounts">暂无账号</div></div>
@@ -134,7 +135,8 @@
             <label>统计时间内允许投影文件数<input id="userRenderMaxFiles" type="number" min="1" max="10000" step="1"></label>
             <label>空闲关闭毫秒<input id="renderIdleStopMillis" type="number" min="0"></label>
             <label>并行客户端数<input id="maxConcurrentRenders" type="number" min="1" max="4"></label>
-             <label>内存重启阈值 GB<input id="memoryRestartGb" type="number" min="0" step="0.1"><span class="hint">0 表示关闭自动重启</span></label>
+             <label>Minecraft 内存阈值 GB<input id="memoryRestartGb" type="number" min="0" step="0.1"><span class="hint">仅统计 Minecraft 客户端进程；0 关闭此阈值</span></label>
+             <label>每客户端任务数回收<input id="runtimeRecycleAfterTasks" type="number" min="0" max="1000000" step="1"><span class="hint">完成指定任务数后轮换客户端；0 关闭</span></label>
           </div>
           <div class="subsection check-grid">
             <label class="check"><input id="localMergeEnabled" type="checkbox"><span>本地生成拼接图</span></label>
@@ -491,7 +493,7 @@
     async function loadConfig() {
       state.config = await api('/api/config');
       const c = state.config;
-      ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','userRenderWindowSeconds','userRenderMaxFiles','renderIdleStopMillis','maxConcurrentRenders','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => { if ($(id)) $(id).value = c[id] ?? ''; });
+      ['webBindHost','webPort','cacheDirectory','renderWidth','renderHeight','maxFileSizeKb','privateMaxFileSizeKb','userRenderWindowSeconds','userRenderMaxFiles','renderIdleStopMillis','maxConcurrentRenders','runtimeRecycleAfterTasks','projectionSearchResultLimit','cloudWebSocketUrl','agentId','javaPath','localMinecraftClientPath','maxClockSkewSeconds','webUsername'].forEach(id => { if ($(id)) $(id).value = c[id] ?? ''; });
       $('renderTimeoutSeconds').value = Number(c.renderTimeoutMillis ?? 240000) / 1000;
       $('userRenderLimitEnabled').checked = c.userRenderLimitEnabled !== false;
       $('newUsername').value = c.webUsername ?? '';
@@ -525,6 +527,7 @@
         const attachmentActive = !!s.attachmentDownloadActive || !!s.attachmentDownloadError;
         $('runtimeInstallProgress').value = attachmentActive ? attachmentProgress : installProgress;
         const downloaded = attachmentActive ? Number(s.attachmentDownloadCompletedBytes || 0) : Number(s.installCompletedBytes || 0), total = attachmentActive ? Number(s.attachmentDownloadTotalBytes || 0) : Number(s.installTotalBytes || 0); const formatBytes = bytes => bytes < 1048576 ? Math.round(bytes / 1024) + ' KB' : (bytes < 1073741824 ? (bytes / 1048576).toFixed(1) + ' MB' : (bytes / 1073741824).toFixed(2) + ' GB');
+        $('memoryUsage').textContent = 'Agent ' + (s.agentMemoryBytes >= 0 ? formatBytes(s.agentMemoryBytes) : '-') + ' · Minecraft ' + (s.runtimeMemoryBytes >= 0 ? formatBytes(s.runtimeMemoryBytes) : '-') + (s.memoryRestartThresholdBytes > 0 ? ' / ' + formatBytes(s.memoryRestartThresholdBytes) : '');
         if (attachmentActive) $('runtimeInstallText').textContent = '投影下载' + (s.attachmentDownloadFile ? '：' + s.attachmentDownloadFile : '') + (total ? ' ' + formatBytes(downloaded) + ' / ' + formatBytes(total) + '（' + Math.round(attachmentProgress * 100) + '%）' : '') + (s.attachmentDownloadError ? ' ' + s.attachmentDownloadError : '');
         else $('runtimeInstallText').textContent = s.installStage ? (s.installStage + (s.installFile ? '：' + s.installFile : '') + (total ? ' ' + formatBytes(downloaded) + ' / ' + formatBytes(total) + '（' + Math.round(installProgress * 100) + '%）' : '')) : '暂无客户端下载任务';
         $('runtimeDetails').textContent = JSON.stringify(s, null, 2);
@@ -550,6 +553,7 @@
         next.cacheImageMinCalls = Number($('cacheImageCalls').value);
         next.maxRequestBytes = Math.max(1, Number($('maxRequestMb').value)) * 1048576;
         next.memoryRestartThresholdBytes = Math.max(0, Number($('memoryRestartGb').value)) * 1073741824;
+        next.runtimeRecycleAfterTasks = Math.max(0, Number($('runtimeRecycleAfterTasks').value));
         next.webSessionTimeoutMillis = Math.max(0.083, Number($('webSessionHours').value)) * 3600000;
         next.webEnabled = $('webEnabled').checked;
         next.cloudEnabled = $('cloudEnabled').checked;

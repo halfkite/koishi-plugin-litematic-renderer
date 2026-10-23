@@ -26,6 +26,8 @@ import java.util.function.Consumer;
 
 /** OneBot 11 WebSocket 适配器，支持 Agent 主动连接和反向连接。 */
 final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSocketServer.Handler {
+    private static final java.util.regex.Pattern CQ_AT_ALL_MARKER = java.util.regex.Pattern.compile(
+            "\\[CQ:at,[^\\]]*\\bqq\\s*=\\s*all(?:,|\\])", java.util.regex.Pattern.CASE_INSENSITIVE);
     private final AgentConfig.BotProfile profile;
     private final BiConsumer<BotAdapter, BotMessage> receiver;
     private final Consumer<String> log;
@@ -128,6 +130,7 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
         String groupId = text(value, "group_id", "");
         String selfId = text(value, "self_id", "");
         boolean mentioned = false;
+        boolean mentionedAll = false;
         String quotedMessageId = "";
         List<BotAttachment> attachments = new ArrayList<>();
         JsonElement message = value.get("message");
@@ -137,12 +140,16 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
                 JsonObject item = segment.getAsJsonObject();
                 String segmentType = text(item, "type", "");
                 JsonObject data = item.has("data") && item.get("data").isJsonObject() ? item.getAsJsonObject("data") : item;
-                if ("at".equals(segmentType)) mentioned = true;
+                if ("at".equals(segmentType)) {
+                    mentioned = true;
+                    mentionedAll |= isAtAllTarget(data);
+                }
                 if ("reply".equals(segmentType)) quotedMessageId = text(data, "id", text(data, "message_id", ""));
                 if ("file".equals(segmentType)) attachments.add(file(data));
             }
         } else if (message != null && message.isJsonPrimitive()) {
             String raw = message.getAsString();
+            mentionedAll = containsAtAllMarker(raw);
             if (raw.contains(".litematic")) {
                 int start = raw.indexOf("[CQ:file");
                 if (start >= 0) attachments.add(parseCqFile(raw.substring(start, raw.indexOf(']', start) + 1)));
@@ -150,9 +157,19 @@ final class OneBotAdapter implements BotAdapter, WebSocket.Listener, OneBotWebSo
         }
         if (value.has("file") && value.get("file").isJsonObject()) attachments.add(file(value.getAsJsonObject("file")));
         String rawText = text(value, "raw_message", text(value, "message", ""));
+        mentionedAll |= containsAtAllMarker(rawText);
         if (quotedMessageId.isBlank()) quotedMessageId = replyIdFromRaw(rawText);
         receiver.accept(this, new BotMessage(profile.id, messageId, userId, groupId, selfId, direct, mentioned, attachments,
-                rawText, quotedMessageId));
+                rawText, new java.util.concurrent.atomic.AtomicInteger(), quotedMessageId, List.of(), List.of(), mentionedAll));
+    }
+
+    static boolean isAtAllTarget(JsonObject data) {
+        return data != null && "all".equalsIgnoreCase(text(data, "qq", text(data, "id", "")).trim());
+    }
+
+    static boolean containsAtAllMarker(String raw) {
+        if (raw == null || raw.isEmpty()) return false;
+        return CQ_AT_ALL_MARKER.matcher(raw).find();
     }
 
     static String replyIdFromRaw(String text) {
